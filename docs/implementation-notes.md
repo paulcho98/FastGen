@@ -40,3 +40,16 @@ running LoRA live during forward. This is expected bf16 precision loss and is ac
 **Decision**: Accept for now. For exact reproduction, keep LoRA active. For inference/distillation,
 merged weights are fine (mean_diff ~7.5e-3 over output range of ±1.5).
 
+### Bug 002: _build_y not slicing V2V conditioning for chunks
+**Phase**: 1D (network_causal.py)
+**Symptom**: `RuntimeError: Sizes of tensors must match except in dimension 1` when running AR mode
+**Cause**: `_build_y` used full-length `masked_video` (21 frames) but `ref_repeated` was only chunk-length (3 frames)
+**Fix**: Added `start_frame` param to `_build_y`, slice masked_video/ref_sequence to `[start_frame:start_frame+T]`
+**File**: `fastgen/networks/OmniAvatar/network_causal.py`
+
+### Bug 003: KV cache indexing in CausalSelfAttention AR mode
+**Phase**: 1D (network_causal.py)
+**Symptom**: `RuntimeError: expanded size of tensor (0) must match existing size (3072)`
+**Cause**: Shape mismatch — roped_k missing batch dim or cache indices wrong
+**Status**: Being debugged by fixer agent
+
