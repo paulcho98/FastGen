@@ -1,66 +1,60 @@
 # CLAUDE.md — FastGen (OmniAvatar Self-Forcing Distillation)
 
 ## Project Goal
-Adapt FastGen's Self-Forcing distillation framework to distill OmniAvatar's 14B V2V
-audio-driven lip sync model into a 1.3B student for fast few-step inference.
+Distill OmniAvatar's 14B V2V audio-driven lip sync model into a 1.3B student
+using FastGen's Self-Forcing framework for fast few-step inference.
 
 ## Environment
-- `conda activate fastgen` (or omniavatar for OmniAvatar-side work)
-- GPUs: 4x H200 (150GB each). Use `CUDA_VISIBLE_DEVICES=0,1,2,3`.
-- Write scope: Full read/write to `/home/work/.local/hyunbin/FastGen/`
-- **SAFETY**: Do NOT delete files outside this repo or `/home/work/.local/OmniAvatar/`
+- `conda activate omniavatar` (primary env for all work)
+- GPUs: 4x H200 (150GB). GPU 2 for testing (`CUDA_VISIBLE_DEVICES=2`).
+- Write scope: `/home/work/.local/hyunbin/FastGen/` and `/home/work/.local/OmniAvatar/`
+- **SAFETY**: Do NOT delete files outside these repos. Git commit every major change.
 
-## Implementation Plan
-See `docs/omniavatar-self-forcing-plan.md` for the full 7-phase plan.
+## Implementation Status
+All phases implemented and verified:
+- **Phase 1A-D**: Network wrappers (wan_model, audio_pack, network, network_causal) — BIT-IDENTICAL
+- **Phase 2**: Dataset adapter (29K samples, precomputed .pt files)
+- **Phase 3**: Method subclasses (OmniAvatarSelfForcingModel, OmniAvatarKDModel)
+- **Phase 4**: Experiment configs (SF + KD)
+- **Phase 5**: ODE trajectory generation script (tested with 1.3B)
+- **Phase 6**: End-to-end integration verified (teacher + student AR + VSD loss)
 
-## Key Architecture Facts
-- FastGen's Self-Forcing: `FastGenModel → DMD2Model → CausVidModel → SelfForcingModel`
-- OmniAvatar uses a CUSTOM WanModel (NOT diffusers' WanTransformer3DModel)
-- Must port OmniAvatar's DiT into `fastgen/networks/OmniAvatar/` with args singleton removed
-- Audio: Wav2Vec2 [B,81,10752] → AudioPack [B,32,21,1,1] → per-layer projections → additive residuals
-- V2V conditioning (65ch): 16 noise + 16 ref_repeated + 1 mask + 16 masked_video + 16 ref_sequence
-- Teacher: 14B bidirectional (frozen). Student: 1.3B causal (trainable). Fake score: 1.3B bidirectional (trained on DSM).
-- Reference causal impl: `/home/work/.local/Self-Forcing-OmniAvatar/Self-Forcing/wan/modules/causal_model.py`
-- Audio mixin pattern: `/home/work/.local/Self-Forcing-OmniAvatar/Self-Forcing/wan/modules/audio_mixin.py`
-- Audio conditioning is IDENTICAL everywhere — teacher, student, fake_score, ODE extraction, inference.
-- Testing: Use GPU 3 (`CUDA_VISIBLE_DEVICES=3`) with real data samples to verify numerical correctness.
-
-## Files to Create (starting from scratch)
+## Created Files
 ```
-fastgen/networks/OmniAvatar/{__init__,wan_model,audio_pack,network,network_causal}.py
-fastgen/methods/{omniavatar_self_forcing,omniavatar_kd}.py
-fastgen/datasets/omniavatar_dataloader.py
-fastgen/configs/experiments/OmniAvatar/{__init__,config_sf,config_kd}.py
-fastgen/configs/methods/{config_omniavatar_sf,config_omniavatar_kd}.py
-scripts/generate_omniavatar_ode_pairs.py
+fastgen/networks/OmniAvatar/
+  __init__.py, wan_model.py (390L), audio_pack.py (39L),
+  network.py (739L), network_causal.py (1525L)
+fastgen/methods/
+  omniavatar_self_forcing.py, omniavatar_kd.py
+fastgen/datasets/
+  omniavatar_dataloader.py (205L)
+fastgen/configs/experiments/OmniAvatar/
+  config_sf.py, config_kd.py
+fastgen/configs/methods/
+  config_omniavatar_sf.py, config_omniavatar_kd.py
+scripts/generate_omniavatar_ode_pairs.py (584L)
 ```
 
-## ODE Trajectory Generation
-- Existing code: `scripts/generate_ode_trajectories.py` (verified correct for T2V)
-- KD method: `fastgen/methods/knowledge_distillation/KD.py` (KDModel + CausalKDModel)
-- ODE format: `path.pth` [4, C, T, H, W] (noisy states) + `latent.pth` [C, T, H, W] (clean)
-- t_list: [0.999, 0.937, 0.833, 0.624, 0.0] — 4 noisy + 1 clean
-- For OmniAvatar: adapt to include audio+V2V conditioning, save as `ode_path.pt` per sample dir
-- Teacher for ODE is BIDIRECTIONAL (full sequence at once, no chunking)
-- 14B teacher ckpt: `/home/work/output_omniavatar_v2v_maskall_refseq_new_data_loss_weights_mouth_weights/step-1500.pt`
+## Architecture
+- Teacher: 14B bidirectional `OmniAvatarWan(FastGenNetwork)` — frozen
+- Student: 1.3B causal `CausalOmniAvatarWan(CausalFastGenNetwork)` — trainable
+- Fake score: 1.3B bidirectional `OmniAvatarWan` — trained on DSM loss
+- Custom WanModel (not diffusers) with args singleton removed
+- Audio: Wav2Vec2→AudioPack→per-layer additive residuals (identical everywhere)
+- V2V: 49ch (noise+ref+mask+masked_video) or 65ch (+ref_sequence)
+- Causal: FlexAttention block mask + KV cache, audio sliced per chunk
 
-## Critical Gotchas
-1. Audio slicing in causal mode: audio is [B,81,10752] in VIDEO frame space but chunks
-   operate in LATENT frame space (21 frames). Must map latent→video frames correctly.
-2. Patch embedding expansion: 16ch (base Wan) → 33ch (I2V OmniAvatar) → 65ch (V2V+refseq).
-   smart_load_weights copies existing channels, zero-inits new ones.
-3. LoRA key mapping: OmniAvatar uses `lora_A.weight`, PEFT uses `lora_A.default.weight`.
-4. The global `args` singleton in OmniAvatar's DiT must be completely removed in the port.
-5. Wav2Vec2 must stay float32 (CNN feature extractor fails on bf16).
-6. Noise schedule: OmniAvatar uses rectified flow ("rf"). Verify FastGen's RF matches exactly.
+## Key Paths
+- Teacher ckpt: `/home/work/output_omniavatar_v2v_maskall_refseq_new_data_loss_weights_mouth_weights/step-1500.pt`
+- 1.3B base: `pretrained_models/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors`
+- Training data: `/home/work/stableavatar_data/v2v_training_data/video_square_path.txt`
+- Mask: `/home/work/.local/Self-Forcing_LipSync_StableAvatar/diffsynth/utils/mask.png`
+- Verification data: `verification_data/sample_{0,1,2}_{inputs,output,output_merged}.pt`
+- Bugs/notes: `docs/implementation-notes.md`
+- Full plan: `docs/omniavatar-self-forcing-plan.md`
 
-## OmniAvatar Repo
-Located at `/home/work/.local/OmniAvatar/`. See its CLAUDE.md for full documentation.
-Key files: `OmniAvatar/models/wan_video_dit.py`, `scripts/train_v2v.py`, `scripts/inference_v2v.py`.
-
-## Training Data
-- V2V training: `/home/work/stableavatar_data/v2v_training_data/`
-- Path list: `video_square_path_combined.txt` (36K+ samples)
-- Per sample: `vae_latents_mask_all.pt`, `audio_emb_omniavatar.pt`, `text_emb.pt`, `ref_latents.pt`
-- Validation: `/home/work/stableavatar_data/v2v_validation_data/{recon,mixed}/`
-- LatentSync mask: `/home/work/.local/Self-Forcing_LipSync_StableAvatar/diffsynth/utils/mask.png`
+## Known Issues
+- sinusoidal_embedding_1d returns float32, cast to model dtype (Bug 001)
+- LoRA merge in bf16 causes ~0.19 max_diff vs live LoRA (Note 001, acceptable)
+- KV cache writes must use current_start for idempotency (Bug 003, fixed)
+- text_embeds has extra dim from .pt file, squeeze in _prepare_training_data
