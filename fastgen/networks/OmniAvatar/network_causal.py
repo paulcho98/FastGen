@@ -294,16 +294,35 @@ class CausalSelfAttention(nn.Module):
     In full-sequence mode (kv_cache=None): uses FlexAttention with block mask
     for causal attention over the entire sequence.
 
-    In AR mode (kv_cache provided): uses standard flash attention with
-    accumulated KV cache for chunk-by-chunk generation.
+    In AR mode (kv_cache provided): uses flash attention with gradient-safe
+    KV caching (detached writes, cat [detached_past | live_current]).
+
+    Supports:
+      - ``use_dynamic_rope``: cache raw K, apply window-local RoPE at attention
+        time (better positional generalisation for long contexts).
+      - ``local_attn_size``: rolling local attention window (in frames) with
+        eviction.  ``-1`` means attend to everything.
+      - ``sink_size``: number of initial frames always kept in the window
+        (attention-sink tokens, never evicted).
     """
 
-    def __init__(self, dim: int, num_heads: int, eps: float = 1e-6):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        local_attn_size: int = -1,
+        sink_size: int = 0,
+        use_dynamic_rope: bool = False,
+        eps: float = 1e-6,
+    ):
         super().__init__()
         assert dim % num_heads == 0
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        self.local_attn_size = local_attn_size
+        self.sink_size = sink_size
+        self.use_dynamic_rope = use_dynamic_rope
 
         self.q = nn.Linear(dim, dim)
         self.k = nn.Linear(dim, dim)
@@ -321,6 +340,7 @@ class CausalSelfAttention(nn.Module):
         block_mask=None,
         kv_cache: Optional[Dict[str, torch.Tensor]] = None,
         current_start: int = 0,
+        store_kv: bool = True,
     ) -> torch.Tensor:
         """
         Args:
@@ -329,8 +349,10 @@ class CausalSelfAttention(nn.Module):
             grid_sizes: [B, 3] — (F, H, W)
             freqs: 3D RoPE freq tables
             block_mask: FlexAttention block mask (for full-sequence causal mode)
-            kv_cache: dict with 'k', 'v', 'end_index' tensors (for AR mode)
+            kv_cache: dict with 'k', 'v', 'global_end_index', 'local_end_index'
             current_start: token offset for causal RoPE in AR mode
+            store_kv: if True, write to cache and update metadata; if False,
+                      use existing cache + live K/V for attention only.
         """
         b, s, n, d = x.shape[0], x.shape[1], self.num_heads, self.head_dim
 
@@ -376,33 +398,125 @@ class CausalSelfAttention(nn.Module):
                 # Standard flash attention (no causal mask — fully bidirectional)
                 x = _flash_attention(roped_q, roped_k, v)
         else:
-            # ----- AR mode with KV cache -----
+            # ----- AR mode with KV cache (FastGen-style gradient-safe) -----
             frame_seqlen = math.prod(grid_sizes[0][1:]).item()
             current_start_frame = current_start // frame_seqlen
+            num_new_tokens = q.shape[1]
+            current_end = current_start + num_new_tokens
+            sink_tokens = self.sink_size * frame_seqlen
 
-            roped_q = causal_rope_apply(q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
-            roped_k = causal_rope_apply(k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+            # 1. Prepare K for caching (mode-dependent)
+            if not self.use_dynamic_rope:
+                roped_q = causal_rope_apply(
+                    q, grid_sizes, freqs, start_frame=current_start_frame
+                ).type_as(v)
+                roped_k = causal_rope_apply(
+                    k, grid_sizes, freqs, start_frame=current_start_frame
+                ).type_as(v)
+                k_to_cache = roped_k
+            else:
+                k_to_cache = k  # cache raw keys; RoPE applied later
 
-            # Cache write position is determined by `current_start` (the
-            # token offset), NOT by an ever-incrementing counter.  This makes
-            # the write idempotent: two calls with the same current_start
-            # (e.g. store_kv=False then store_kv=True) overwrite the same
-            # positions instead of appending.
-            num_new_tokens = roped_q.shape[1]
-            cache_end = current_start + num_new_tokens
-            kv_cache["k"][:, current_start:cache_end] = roped_k
-            kv_cache["v"][:, current_start:cache_end] = v
+            # 2. Read cache metadata
+            kv_cache_size = kv_cache["k"].shape[1]
+            global_end = kv_cache["global_end_index"].item()
+            local_end = kv_cache["local_end_index"].item()
 
-            # Attend over full accumulated cache (up to the furthest point).
-            # Clone to prevent in-place cache writes from invalidating
-            # flash attention's saved tensors during backward.
-            attend_end = max(kv_cache["end_index"].item(), cache_end)
-            k_full = kv_cache["k"][:, :attend_end].clone()
-            v_full = kv_cache["v"][:, :attend_end].clone()
-            x = _flash_attention(roped_q, k_full, v_full)
+            # 3. Handle eviction (only when store_kv=True and cache overflows)
+            if (
+                store_kv
+                and self.local_attn_size > 0
+                and current_end > global_end
+                and num_new_tokens + local_end > kv_cache_size
+            ):
+                # Rolling eviction needed
+                num_evicted = num_new_tokens + local_end - kv_cache_size
+                num_rolled = local_end - num_evicted - sink_tokens
+                kv_cache["k"][:, sink_tokens:sink_tokens + num_rolled] = \
+                    kv_cache["k"][:, sink_tokens + num_evicted:sink_tokens + num_evicted + num_rolled].clone()
+                kv_cache["v"][:, sink_tokens:sink_tokens + num_rolled] = \
+                    kv_cache["v"][:, sink_tokens + num_evicted:sink_tokens + num_evicted + num_rolled].clone()
+                new_local_end = local_end + (current_end - global_end) - num_evicted
+                new_local_start = new_local_end - num_new_tokens
+            else:
+                # No eviction: simple append
+                new_local_end = local_end + max(0, current_end - global_end)
+                new_local_start = new_local_end - num_new_tokens
 
-            # Track the high-water mark of the cache
-            kv_cache["end_index"].fill_(attend_end)
+            # 4. Write to cache (detached, only if store_kv)
+            if store_kv:
+                kv_cache["k"][:, new_local_start:new_local_end] = k_to_cache.detach()
+                kv_cache["v"][:, new_local_start:new_local_end] = v.detach()
+
+            # 5. Build attention window
+            max_attn_tokens = (
+                self.local_attn_size * frame_seqlen
+                if self.local_attn_size > 0
+                else new_local_end
+            )
+            k_win_start = max(0, new_local_end - max_attn_tokens)
+
+            if sink_tokens > 0 and k_win_start > 0:
+                # Sink + rolling window (non-contiguous)
+                available_rolling = max_attn_tokens - sink_tokens
+                rolling_start = max(sink_tokens, new_local_end - available_rolling)
+
+                with torch.no_grad():
+                    k_past = torch.cat(
+                        [kv_cache["k"][:, :sink_tokens],
+                         kv_cache["k"][:, rolling_start:new_local_start]],
+                        dim=1,
+                    )
+                    v_past = torch.cat(
+                        [kv_cache["v"][:, :sink_tokens],
+                         kv_cache["v"][:, rolling_start:new_local_start]],
+                        dim=1,
+                    )
+                k_win = torch.cat([k_past, k_to_cache], dim=1)
+                v_win = torch.cat([v_past, v], dim=1)
+
+                # Query position within the attention window
+                query_offset_in_win = sink_tokens + (new_local_start - rolling_start)
+            else:
+                # Simple contiguous case
+                if new_local_start == 0:
+                    k_win = k_to_cache
+                    v_win = v
+                else:
+                    with torch.no_grad():
+                        k_past = kv_cache["k"][:, k_win_start:new_local_start]
+                        v_past = kv_cache["v"][:, k_win_start:new_local_start]
+                    k_win = torch.cat([k_past, k_to_cache], dim=1)
+                    v_win = torch.cat([v_past, v], dim=1)
+
+                query_offset_in_win = new_local_start - k_win_start
+
+            # 6. Apply RoPE (mode-dependent)
+            if not self.use_dynamic_rope:
+                # Original mode: Q already roped, k_win contains roped keys
+                roped_query = roped_q
+                roped_key = k_win
+            else:
+                # Dynamic mode: apply window-local RoPE
+                F_window = k_win.shape[1] // frame_seqlen
+                k_grid = grid_sizes.clone()
+                k_grid[:, 0] = F_window
+                roped_key = causal_rope_apply(
+                    k_win, k_grid, freqs, start_frame=0
+                ).type_as(v)
+
+                q_frame_start = query_offset_in_win // frame_seqlen
+                roped_query = causal_rope_apply(
+                    q, grid_sizes, freqs, start_frame=q_frame_start
+                ).type_as(v)
+
+            # 7. Attention
+            x = _flash_attention(roped_query, roped_key, v_win)
+
+            # 8. Update metadata (only if store_kv)
+            if store_kv:
+                kv_cache["global_end_index"].fill_(current_end)
+                kv_cache["local_end_index"].fill_(new_local_end)
 
         # Output projection
         x = x.flatten(2)
@@ -476,14 +590,29 @@ class CausalDiTBlock(nn.Module):
         norm1 = self-attention, norm3 = cross-attention (learnable), norm2 = FFN
     """
 
-    def __init__(self, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        ffn_dim: int,
+        eps: float = 1e-6,
+        local_attn_size: int = -1,
+        sink_size: int = 0,
+        use_dynamic_rope: bool = False,
+    ):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.ffn_dim = ffn_dim
 
         # Self-attention (causal)
-        self.self_attn = CausalSelfAttention(dim, num_heads, eps)
+        self.self_attn = CausalSelfAttention(
+            dim, num_heads,
+            local_attn_size=local_attn_size,
+            sink_size=sink_size,
+            use_dynamic_rope=use_dynamic_rope,
+            eps=eps,
+        )
 
         # Norms: norm1=self-attn, norm3=cross-attn (learnable), norm2=FFN
         self.norm1 = LayerNorm(dim, eps)
@@ -516,6 +645,7 @@ class CausalDiTBlock(nn.Module):
         kv_cache: Optional[Dict] = None,
         crossattn_cache: Optional[Dict] = None,
         current_start: int = 0,
+        store_kv: bool = True,
     ) -> torch.Tensor:
         """
         Args:
@@ -530,6 +660,7 @@ class CausalDiTBlock(nn.Module):
             kv_cache: self-attention KV cache dict
             crossattn_cache: cross-attention KV cache dict
             current_start: token offset for causal RoPE
+            store_kv: whether to update KV cache (passed to self_attn)
         """
         num_frames = e.shape[1]
         frame_seqlen = x.shape[1] // num_frames
@@ -549,6 +680,7 @@ class CausalDiTBlock(nn.Module):
             block_mask,
             kv_cache,
             current_start,
+            store_kv=store_kv,
         )
 
         x = x + (
@@ -640,6 +772,9 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         schedule_type: str = "rf",
         mask_all_frames: bool = True,
         dtype: str = "bf16",
+        local_attn_size: int = -1,
+        sink_size: int = 0,
+        use_dynamic_rope: bool = False,
         **kwargs,
     ):
         """
@@ -684,6 +819,9 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
         self.mask_all_frames = mask_all_frames
+        self.local_attn_size = local_attn_size
+        self.sink_size = sink_size
+        self.use_dynamic_rope = use_dynamic_rope
 
         dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
         self._default_dtype = dtype_map.get(dtype, torch.bfloat16)
@@ -727,9 +865,15 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         )
 
         # --- Transformer blocks ---
-        self.blocks = nn.ModuleList(
-            [CausalDiTBlock(dim, num_heads, ffn_dim, eps) for _ in range(num_layers)]
-        )
+        self.blocks = nn.ModuleList([
+            CausalDiTBlock(
+                dim, num_heads, ffn_dim, eps,
+                local_attn_size=local_attn_size,
+                sink_size=sink_size,
+                use_dynamic_rope=use_dynamic_rope,
+            )
+            for _ in range(num_layers)
+        ])
 
         # --- Output head ---
         self.head = CausalHead(dim, out_dim, patch_size, eps)
@@ -978,20 +1122,33 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         self,
         batch_size: int,
         total_tokens: int,
+        frame_seqlen: int,
         device: torch.device,
         dtype: torch.dtype,
     ) -> None:
-        """Allocate KV caches for all transformer blocks."""
+        """Allocate KV caches for all transformer blocks.
+
+        When ``local_attn_size > 0``, the cache is sized to hold exactly
+        ``local_attn_size * frame_seqlen`` tokens (the rolling window).
+        Otherwise it is sized for the full sequence (``total_tokens``).
+        """
         n = self._num_heads
         d = self._dim // n
+
+        if self.local_attn_size > 0:
+            cache_tokens = self.local_attn_size * frame_seqlen
+        else:
+            cache_tokens = total_tokens
+
         self._kv_caches = []
         self._crossattn_caches = []
         for _ in self.blocks:
             self._kv_caches.append(
                 {
-                    "k": torch.zeros(batch_size, total_tokens, n, d, device=device, dtype=dtype),
-                    "v": torch.zeros(batch_size, total_tokens, n, d, device=device, dtype=dtype),
-                    "end_index": torch.tensor(0, device=device, dtype=torch.long),
+                    "k": torch.zeros(batch_size, cache_tokens, n, d, device=device, dtype=dtype),
+                    "v": torch.zeros(batch_size, cache_tokens, n, d, device=device, dtype=dtype),
+                    "global_end_index": torch.tensor(0, device=device, dtype=torch.long),
+                    "local_end_index": torch.tensor(0, device=device, dtype=torch.long),
                 }
             )
             self._crossattn_caches.append({"is_init": False})
@@ -1002,7 +1159,8 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
             for cache in self._kv_caches:
                 cache["k"].zero_()
                 cache["v"].zero_()
-                cache["end_index"].fill_(0)
+                cache["global_end_index"].fill_(0)
+                cache["local_end_index"].fill_(0)
         if self._crossattn_caches is not None:
             for cache in self._crossattn_caches:
                 cache["is_init"] = False
@@ -1132,6 +1290,7 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         y: Optional[torch.Tensor] = None,
         audio_emb: Optional[torch.Tensor] = None,
         current_start: int = 0,
+        store_kv: bool = True,
         use_gradient_checkpointing: bool = False,
     ) -> torch.Tensor:
         """Chunk-based autoregressive forward with KV cache.
@@ -1146,6 +1305,7 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
             y: [B, C_y, chunk_frames, H, W]  V2V conditioning for this chunk
             audio_emb: [B, num_video_frames, 10752]  FULL audio (not sliced)
             current_start: token offset (= frame_offset * h * w)
+            store_kv: whether to write to KV cache and update metadata
             use_gradient_checkpointing: enable gradient checkpointing
 
         Returns:
@@ -1174,7 +1334,7 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         frame_seqlen = h * w
         total_tokens = self.total_num_frames * frame_seqlen
         if self._kv_caches is None:
-            self._init_caches(x.shape[0], total_tokens, device, x.dtype)
+            self._init_caches(x.shape[0], total_tokens, frame_seqlen, device, x.dtype)
 
         # Time embedding
         t_emb = self.time_embedding(
@@ -1219,6 +1379,7 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
                 kv_cache=self._kv_caches[block_index],
                 crossattn_cache=self._crossattn_caches[block_index],
                 current_start=current_start,
+                store_kv=store_kv,
             )
 
             if self.training and use_gradient_checkpointing:
@@ -1318,6 +1479,7 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
                 y=y,
                 audio_emb=audio_emb,
                 current_start=current_start,
+                store_kv=store_kv,
                 use_gradient_checkpointing=use_gradient_checkpointing,
             )
         else:
