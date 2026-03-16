@@ -341,6 +341,7 @@ class CausalSelfAttention(nn.Module):
         kv_cache: Optional[Dict[str, torch.Tensor]] = None,
         current_start: int = 0,
         store_kv: bool = True,
+        cache_local_end_override: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -417,10 +418,18 @@ class CausalSelfAttention(nn.Module):
             else:
                 k_to_cache = k  # cache raw keys; RoPE applied later
 
-            # 2. Read cache metadata
+            # 2. Read cache metadata.
+            # IMPORTANT: Use the explicit override (frozen before the block loop)
+            # to ensure gradient-checkpointing recomputation sees the same state.
+            # This follows FastGen's CausalWan pattern: proper_cache_len is computed
+            # OUTSIDE the block loop and passed in, never read from mutable cache.
             kv_cache_size = kv_cache["k"].shape[1]
-            global_end = kv_cache["global_end_index"].item()
-            local_end = kv_cache["local_end_index"].item()
+            if cache_local_end_override is not None:
+                local_end = cache_local_end_override
+                global_end = cache_local_end_override  # In no-eviction mode, they're equal
+            else:
+                global_end = kv_cache["global_end_index"].item()
+                local_end = kv_cache["local_end_index"].item()
 
             # 3. Handle eviction (only when store_kv=True and cache overflows)
             if (
@@ -646,6 +655,7 @@ class CausalDiTBlock(nn.Module):
         crossattn_cache: Optional[Dict] = None,
         current_start: int = 0,
         store_kv: bool = True,
+        cache_local_end_override: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -661,6 +671,8 @@ class CausalDiTBlock(nn.Module):
             crossattn_cache: cross-attention KV cache dict
             current_start: token offset for causal RoPE
             store_kv: whether to update KV cache (passed to self_attn)
+            cache_local_end_override: if set, use this as local_end instead of
+                reading from cache (for gradient checkpointing determinism)
         """
         num_frames = e.shape[1]
         frame_seqlen = x.shape[1] // num_frames
@@ -681,6 +693,7 @@ class CausalDiTBlock(nn.Module):
             kv_cache,
             current_start,
             store_kv=store_kv,
+            cache_local_end_override=cache_local_end_override,
         )
 
         x = x + (
@@ -1368,6 +1381,15 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
                 x, processed_audio, block_index, len(self.blocks), grid_sizes
             )
 
+            # Compute cache read position from current_start (immutable),
+            # following FastGen's pattern (proper_cache_len = cur_start_frame * frame_seqlen).
+            # This is deterministic and gradient-checkpointing safe.
+            kv_cache_i = self._kv_caches[block_index]
+            if self.local_attn_size <= 0:
+                cache_local_end = current_start  # no eviction: local == global
+            else:
+                cache_local_end = kv_cache_i["local_end_index"].item()
+
             kwargs = dict(
                 e=t_mod,
                 seq_lens=seq_lens,
@@ -1376,10 +1398,11 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
                 context=context,
                 context_lens=None,
                 block_mask=None,  # No FlexAttention in AR mode
-                kv_cache=self._kv_caches[block_index],
+                kv_cache=kv_cache_i,
                 crossattn_cache=self._crossattn_caches[block_index],
                 current_start=current_start,
                 store_kv=store_kv,
+                cache_local_end_override=cache_local_end,
             )
 
             if self.training and use_gradient_checkpointing:
