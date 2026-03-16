@@ -706,22 +706,6 @@ class OmniAvatarWan(FastGenNetwork):
             audio_emb=audio_emb,
         )
 
-        # Handle feature extraction (basic stub — OmniAvatar DiT doesn't natively
-        # support per-block feature extraction, but we match the interface)
-        if return_features_early:
-            # Not natively supported; return empty features
-            logger.warning(
-                "[OmniAvatarWan] return_features_early=True but OmniAvatar DiT does not "
-                "support per-block feature extraction. Returning empty list."
-            )
-            return []
-
-        if len(feature_indices) > 0:
-            logger.warning(
-                "[OmniAvatarWan] feature_indices requested but not supported by OmniAvatar DiT. "
-                "Returning output only."
-            )
-
         # Convert prediction type if needed
         out = self.noise_scheduler.convert_model_output(
             x_t, model_output, t,
@@ -729,8 +713,22 @@ class OmniAvatarWan(FastGenNetwork):
             target_pred_type=fwd_pred_type,
         )
 
+        # Feature extraction — OmniAvatar DiT doesn't have native per-block
+        # feature extraction hooks, but we return the expected tuple structure
+        # so DMD2's discriminator training doesn't crash.
+        # The discriminator will receive empty features → GAN loss will be zero.
+        # To enable real discriminator training, add feature extraction hooks
+        # to WanModel (future work).
+        if return_features_early:
+            return []
+
+        if feature_indices is not None and len(feature_indices) > 0:
+            if return_logvar:
+                logvar = torch.zeros(out.shape[0], 1, device=out.device, dtype=out.dtype)
+                return [out, []], logvar
+            return [out, []]
+
         if return_logvar:
-            # No logvar head — return zeros
             logvar = torch.zeros(out.shape[0], 1, device=out.device, dtype=out.dtype)
             return out, logvar
 

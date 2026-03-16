@@ -50,6 +50,36 @@ merged weights are fine (mean_diff ~7.5e-3 over output range of ±1.5).
 ### Bug 003: KV cache indexing in CausalSelfAttention AR mode
 **Phase**: 1D (network_causal.py)
 **Symptom**: `RuntimeError: expanded size of tensor (0) must match existing size (3072)`
-**Cause**: Shape mismatch — roped_k missing batch dim or cache indices wrong
-**Status**: Being debugged by fixer agent
+**Cause**: Cache write used `end_index` (ever-incrementing) instead of `current_start` (position-based).
+Self-Forcing calls student twice at same cur_start_frame (denoise then cache), so end_index doubled.
+**Fix**: Use `current_start` for cache write position (idempotent). High-water mark via max().
+
+### Bug 004: Flash attention backward fails after KV cache in-place write
+**Phase**: Self-Forcing training step
+**Symptom**: `RuntimeError: variable needed for gradient has been modified by inplace operation`
+**Cause**: store_kv=True call writes to cache positions that flash attention's backward saved refs to.
+**Fix**: `.clone()` KV cache contents before passing to flash attention in AR mode.
+**File**: `network_causal.py` line 399-400
+
+### Bug 005: Feature extraction return type incompatible with DMD2
+**Phase**: Compatibility audit
+**Symptom**: `ValueError: not enough values to unpack (expected 2, got 1)` in DMD2's discriminator training
+**Cause**: DMD2 expects `teacher_x0, fake_feat = self.teacher(..., feature_indices=...)` (tuple of 2).
+Our OmniAvatarWan returned just the x0 tensor, not `[x0, features]`.
+**Fix**: Return `[out, []]` when `feature_indices` is non-empty. Empty features means
+GAN loss is effectively disabled. Full feature extraction requires adding hooks to WanModel
+(future work).
+**Files**: `network.py`, `network_causal.py`
+
+### Note 003: frame_offset for CausVid extrapolation
+CausVid passes `frame_offset` for long-form generation. Our implementation absorbs it
+into `**fwd_kwargs` but doesn't use it. Not a blocker for Self-Forcing training (which
+uses `cur_start_frame` instead), but would need fixing for CausVid-style inference.
+
+### Note 002: Memory for Self-Forcing with 3x 1.3B models
+- 3 models loaded: 8.5 GB
+- Rollout with gradient (start_gradient_frame=15, last 2 chunks): 40.5 GB peak
+- After backward: 41.3 GB
+- Fake score DSM update OOMs at ~83 GB limit on GPU 2 — needs separate GPU or cleanup
+- With 14B teacher, expect ~70 GB additional → need multi-GPU or FSDP
 

@@ -1515,20 +1515,22 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
                 use_gradient_checkpointing=use_gradient_checkpointing,
             )
 
-        # Handle feature extraction
-        if return_features_early:
-            return []
-        if len(feature_indices) > 0:
-            logger.warning(
-                "[CausalOmniAvatarWan] feature_indices not supported, returning output only."
-            )
-
         # Convert prediction type
         out = self.noise_scheduler.convert_model_output(
             x_t, model_output, t,
             src_pred_type=self.net_pred_type,
             target_pred_type=fwd_pred_type,
         )
+
+        # Feature extraction — return expected tuple structure for DMD2 compatibility
+        if return_features_early:
+            return []
+
+        if feature_indices is not None and len(feature_indices) > 0:
+            if return_logvar:
+                logvar = torch.zeros(out.shape[0], 1, device=out.device, dtype=out.dtype)
+                return [out, []], logvar
+            return [out, []]
 
         if return_logvar:
             logvar = torch.zeros(out.shape[0], 1, device=out.device, dtype=out.dtype)
