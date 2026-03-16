@@ -76,6 +76,44 @@ CausVid passes `frame_offset` for long-form generation. Our implementation absor
 into `**fwd_kwargs` but doesn't use it. Not a blocker for Self-Forcing training (which
 uses `cur_start_frame` instead), but would need fixing for CausVid-style inference.
 
+### Bug 007: fake_score instantiated as 14B (same as teacher) instead of 1.3B
+**Phase**: Cross-implementation comparison
+**Symptom**: Would OOM when running SF training with 14B teacher
+**Cause**: `dmd2.py:build_model()` always instantiated fake_score from `self.teacher_config` (14B).
+No support for a separate `fake_score_net` config.
+**Fix**: Added `fake_score_net` field to `BaseModelConfig`, updated `dmd2.py` to use it,
+set `config.model.fake_score_net = OmniAvatar_V2V_1_3B_FakeScore` in SF config.
+**Files**: `config.py`, `dmd2.py`, `config_sf.py`
+
+### Bug 008: Dataloader missing ODE path loading for KD training
+**Phase**: Cross-implementation comparison
+**Symptom**: KD training would crash with `KeyError: 'path'`
+**Cause**: `OmniAvatarDataset` never loaded `ode_path.pt` / `path.pth`
+**Fix**: Added `load_ode_path` parameter; loads `ode_path.pt` or `path.pth` when set
+**File**: `omniavatar_dataloader.py`
+
+### Bug 009: No DistributedSampler / not infinite iterator
+**Phase**: Cross-implementation comparison
+**Symptom**: Multi-GPU DDP training would see duplicate data; trainer would crash after one epoch
+**Cause**: Plain DataLoader with `shuffle=True`, no DDP awareness, finite iteration
+**Fix**: Created `OmniAvatarDataLoader` wrapper with `DistributedSampler` and infinite `while True` loop
+**File**: `omniavatar_dataloader.py`
+
+### Bug 010: Audio reprocessed every chunk in causal AR mode
+**Phase**: Cross-implementation comparison
+**Symptom**: Wasted compute during AR rollout (full audio processed per chunk)
+**Cause**: `_forward_ar` called `_process_audio_embeddings()` on every chunk
+**Fix**: Cache processed audio in `self._cached_audio`, clear in `clear_caches()`
+**File**: `network_causal.py`
+
+### Bug 011: No inhomogeneous per-frame timestep support in full-sequence mode
+**Phase**: Cross-implementation comparison
+**Symptom**: CausalKD with `t_inhom [B, T]` would crash (sinusoidal_embedding_1d expects 1D)
+**Cause**: `_forward_full_sequence` only handled scalar `t [B]`
+**Fix**: Auto-detect `t.dim() == 2` in `forward()`, route to full-sequence mode with per-frame
+time embedding computation. Also handle 2D t in prediction type conversion.
+**File**: `network_causal.py`
+
 ### Note 002: Memory for Self-Forcing with 3x 1.3B models
 - 3 models loaded: 8.5 GB
 - Rollout with gradient (start_gradient_frame=15, last 2 chunks): 40.5 GB peak

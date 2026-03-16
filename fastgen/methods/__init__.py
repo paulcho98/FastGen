@@ -20,3 +20,7 @@ from fastgen.methods.fine_tuning.sft import CausalSFTModel as CausalSFTModel
 
 from fastgen.methods.knowledge_distillation.KD import KDModel as KDModel
 from fastgen.methods.knowledge_distillation.KD import CausalKDModel as CausalKDModel
+
+from fastgen.methods.omniavatar_kd import OmniAvatarKDModel as OmniAvatarKDModel
+from fastgen.methods.omniavatar_self_forcing import OmniAvatarSelfForcingModel as OmniAvatarSelfForcingModel
+from fastgen.methods.omniavatar_diffusion_forcing import OmniAvatarDiffusionForcingModel as OmniAvatarDiffusionForcingModel

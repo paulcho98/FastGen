@@ -334,6 +334,7 @@ class OmniAvatarWan(FastGenNetwork):
         net_pred_type: str = "flow",
         schedule_type: str = "rf",
         mask_all_frames: bool = True,
+        disable_grad_ckpt: bool = False,
         dtype: str = "bf16",
         **kwargs,
     ):
@@ -401,6 +402,9 @@ class OmniAvatarWan(FastGenNetwork):
             audio_hidden_size=audio_hidden_size,
             has_image_input=False,  # OmniAvatar always uses T2V base, not I2V
         )
+
+        # Gradient checkpointing: enabled by default (like T2V's Wan network)
+        self._use_gradient_checkpointing = not disable_grad_ckpt
 
         # Load weights (unless we are in meta device context for FSDP)
         if not self._is_in_meta_context():
@@ -694,7 +698,7 @@ class OmniAvatarWan(FastGenNetwork):
         timestep = self.noise_scheduler.rescale_t(t)
 
         # Forward through the DiT
-        use_gradient_checkpointing = fwd_kwargs.get("use_gradient_checkpointing", False)
+        use_gradient_checkpointing = fwd_kwargs.get("use_gradient_checkpointing", self._use_gradient_checkpointing)
         has_features = feature_indices is not None and len(feature_indices) > 0
 
         model_output = self.model(

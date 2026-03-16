@@ -9,6 +9,7 @@ Each sample directory contains precomputed .pt files:
     - audio_emb_omniavatar.pt: {audio_emb [N,10752]} where N >= 81
     - text_emb.pt: tensor [1,512,4096]
     - ref_latents.pt: {ref_sequence_latents [16,21,64,64], metadata}
+    - ode_path.pt: [4, 16, 21, 64, 64] (ODE trajectories for KD, optional)
 """
 
 import os
@@ -16,9 +17,10 @@ import warnings
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 
 class OmniAvatarDataset(Dataset):
@@ -33,6 +35,7 @@ class OmniAvatarDataset(Dataset):
         ref_sequence: [16, 21, 64, 64] — reference sequence latents (bf16, optional)
         mask: [64, 64] — spatial mask, LatentSync convention: 1=keep, 0=mask (float32)
         neg_text_embeds: [1, 512, 4096] — negative text embedding for CFG (bf16)
+        path: [4, 16, 21, 64, 64] — ODE trajectory (bf16, optional, for KD training)
     """
 
     def __init__(
@@ -41,11 +44,13 @@ class OmniAvatarDataset(Dataset):
         latentsync_mask_path: str,
         neg_text_emb_path: str = None,
         use_ref_sequence: bool = True,
+        load_ode_path: bool = False,
         num_video_frames: int = 81,
         latent_h: int = 64,
         latent_w: int = 64,
     ):
         self.use_ref_sequence = use_ref_sequence
+        self.load_ode_path = load_ode_path
         self.num_video_frames = num_video_frames
         self.latent_h = latent_h
         self.latent_w = latent_w
@@ -154,6 +159,21 @@ class OmniAvatarDataset(Dataset):
                     # Fallback: zeros with same shape as real latents
                     result["ref_sequence"] = torch.zeros_like(real)
 
+            # --- ODE trajectory (optional, for KD training) ---
+            if self.load_ode_path:
+                ode_path_file = os.path.join(sample_dir, "ode_path.pt")
+                if os.path.exists(ode_path_file):
+                    result["path"] = torch.load(ode_path_file, map_location="cpu", weights_only=False).to(
+                        torch.bfloat16
+                    )
+                else:
+                    # Also check path.pth (alternative filename)
+                    alt_path_file = os.path.join(sample_dir, "path.pth")
+                    if os.path.exists(alt_path_file):
+                        result["path"] = torch.load(alt_path_file, map_location="cpu", weights_only=False).to(
+                            torch.bfloat16
+                        )
+
             return result
 
         except Exception as e:
@@ -162,6 +182,78 @@ class OmniAvatarDataset(Dataset):
             return None
 
 
+class OmniAvatarDataLoader:
+    """Infinite-iterator DataLoader wrapper with DistributedSampler support.
+
+    FastGen's trainer expects an infinite iterator. This class wraps a standard
+    DataLoader and yields batches indefinitely, cycling through the dataset.
+    """
+
+    def __init__(
+        self,
+        data_list_path: str = None,
+        datatags: list = None,
+        latentsync_mask_path: str = None,
+        batch_size: int = 1,
+        num_workers: int = 4,
+        load_ode_path: bool = False,
+        **kwargs,
+    ):
+        # Support both data_list_path and datatags (list of paths)
+        if data_list_path is None and datatags is not None:
+            data_list_path = datatags[0] if isinstance(datatags, list) else datatags
+        assert data_list_path is not None, "Must provide data_list_path or datatags"
+        assert latentsync_mask_path is not None, "Must provide latentsync_mask_path"
+
+        self.dataset = OmniAvatarDataset(
+            data_list_path=data_list_path,
+            latentsync_mask_path=latentsync_mask_path,
+            load_ode_path=load_ode_path,
+            **kwargs,
+        )
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+
+        # Use DistributedSampler for multi-GPU training
+        if dist.is_initialized():
+            self._sampler = DistributedSampler(self.dataset, shuffle=True)
+            shuffle = False
+        else:
+            self._sampler = None
+            shuffle = True
+
+        def collate_fn(batch):
+            """Filter out None samples from failed loads."""
+            valid = [s for s in batch if s is not None]
+            if not valid:
+                return {}
+            return torch.utils.data.default_collate(valid)
+
+        self._dataloader = DataLoader(
+            self.dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            sampler=self._sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+            collate_fn=collate_fn,
+            drop_last=True,
+        )
+
+    def __iter__(self):
+        """Infinite iterator — cycles through the dataset."""
+        epoch = 0
+        while True:
+            if self._sampler is not None:
+                self._sampler.set_epoch(epoch)
+            yield from self._dataloader
+            epoch += 1
+
+    def __len__(self):
+        return len(self.dataset)
+
+
+# Keep the simple function for backward compatibility
 def create_omniavatar_dataloader(
     data_list_path: str,
     latentsync_mask_path: str,
@@ -169,17 +261,10 @@ def create_omniavatar_dataloader(
     num_workers: int = 4,
     **kwargs,
 ) -> DataLoader:
-    """Create a DataLoader for OmniAvatar training data.
+    """Create a DataLoader for OmniAvatar training data (non-infinite, no DDP support).
 
-    Args:
-        data_list_path: Path to text file with one sample directory per line.
-        latentsync_mask_path: Path to LatentSync spatial mask PNG.
-        batch_size: Batch size (default 1, as OmniAvatar training is batch_size=1).
-        num_workers: Number of data loading workers.
-        **kwargs: Additional arguments passed to OmniAvatarDataset.
-
-    Returns:
-        DataLoader wrapping the OmniAvatarDataset.
+    For training, prefer OmniAvatarDataLoader which provides infinite iteration
+    and DistributedSampler support.
     """
     dataset = OmniAvatarDataset(
         data_list_path=data_list_path,

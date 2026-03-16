@@ -25,6 +25,7 @@ V2V audio-driven lip sync model (14B teacher → 1.3B student).
 |------|-------|---------|
 | `omniavatar_self_forcing.py` | 86 | `OmniAvatarSelfForcingModel(SelfForcingModel)` — overrides `_prepare_training_data()` to build OmniAvatar condition dicts (text, audio, ref_latent, mask, masked_video, ref_sequence) and negative condition (null audio + negative text). |
 | `omniavatar_kd.py` | 127 | `OmniAvatarKDModel(CausalKDModel)` — overrides `single_train_step()` for causal KD with OmniAvatar conditions and inhomogeneous timesteps. |
+| `omniavatar_diffusion_forcing.py` | 113 | `OmniAvatarDiffusionForcingModel(KDModel)` — alternative Stage 1: diffusion forcing on real data with inhomogeneous block-wise timesteps. No ODE trajectory generation needed. |
 
 ### Dataset Layer (`fastgen/datasets/`)
 
@@ -38,7 +39,9 @@ V2V audio-driven lip sync model (14B teacher → 1.3B student).
 |------|-------|---------|
 | `experiments/OmniAvatar/config_sf.py` | 127 | Self-Forcing experiment config: 14B teacher, 1.3B causal student, 1.3B bidirectional fake_score, discriminator, all hyperparams. |
 | `experiments/OmniAvatar/config_kd.py` | 66 | Causal KD experiment config for Stage 1 ODE initialization. |
+| `experiments/OmniAvatar/config_df.py` | 65 | Diffusion Forcing experiment config for Stage 1 (alternative to ODE KD). |
 | `methods/config_omniavatar_sf.py` | 51 | Self-Forcing method config (model class registration). |
+| `methods/config_omniavatar_df.py` | 48 | Diffusion Forcing method config (model class registration). |
 | `methods/config_omniavatar_kd.py` | 43 | Causal KD method config. |
 
 ### Scripts (`scripts/`)

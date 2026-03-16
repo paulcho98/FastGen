@@ -788,6 +788,7 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         local_attn_size: int = -1,
         sink_size: int = 0,
         use_dynamic_rope: bool = False,
+        disable_grad_ckpt: bool = False,
         **kwargs,
     ):
         """
@@ -911,6 +912,9 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         # --- KV caches (lazily allocated) ---
         self._kv_caches: Optional[List[Dict[str, torch.Tensor]]] = None
         self._crossattn_caches: Optional[List[Dict]] = None
+
+        # Gradient checkpointing: enabled by default (like T2V's CausalWan)
+        self._use_gradient_checkpointing = not disable_grad_ckpt
 
         # --- Load weights ---
         if not self._is_in_meta_context():
@@ -1182,6 +1186,7 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         self._kv_caches = None
         self._crossattn_caches = None
         self.block_mask = None
+        self._cached_audio = None
 
     # ------------------------------------------------------------------
     # Internal forward (full-sequence mode)
@@ -1199,11 +1204,12 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         """Full-sequence forward — like bidirectional but with causal block mask.
 
         This mode processes ALL frames at once. Used for verification against
-        the bidirectional model and for teacher-forcing training.
+        the bidirectional model, teacher-forcing training, and CausalKD with
+        inhomogeneous per-frame timesteps.
 
         Args:
             x: [B, 16, T, H, W]  noisy latent
-            timestep: [B]  timestep values (already rescaled)
+            timestep: [B] scalar timestep or [B, T] per-frame inhomogeneous timesteps (already rescaled)
             context: [B, 512, 4096]  text embeddings
             y: [B, C_y, T, H, W]  V2V conditioning
             audio_emb: [B, num_video_frames, 10752]  or None
@@ -1231,13 +1237,30 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         x = x.flatten(2).transpose(1, 2)  # [B, f*h*w, dim]
         seq_lens = torch.tensor([x.shape[1]] * x.shape[0], dtype=torch.long, device=device)
 
-        # Time embedding
-        t_emb = self.time_embedding(
-            sinusoidal_embedding_1d(self._freq_dim, timestep).type_as(x)
-        )
-        t_mod = self.time_projection(t_emb).unflatten(1, (6, self._dim))
-        # Expand to per-frame: [B, 6, dim] -> [B, F, 6, dim]
-        t_mod = t_mod.unsqueeze(1).expand(-1, f, -1, -1)
+        # Time embedding — supports both scalar [B] and per-frame [B, T_latent] timesteps
+        if timestep.dim() == 2:
+            # Inhomogeneous per-frame timesteps [B, T_latent]
+            # Compute time embedding per frame, expand to per-token
+            B_t, T_t = timestep.shape
+            t_flat = timestep.reshape(-1)  # [B * T_latent]
+            t_emb_flat = self.time_embedding(
+                sinusoidal_embedding_1d(self._freq_dim, t_flat).type_as(x)
+            )  # [B * T_latent, dim]
+            t_emb = t_emb_flat.reshape(B_t, T_t, -1)  # [B, T_latent, dim]
+            t_mod_flat = self.time_projection(t_emb_flat)  # [B * T_latent, 6*dim]
+            t_mod = t_mod_flat.reshape(B_t, T_t, 6, self._dim)  # [B, T_latent, 6, dim]
+            # t_emb for head: use per-frame, expand to [B, F, dim]
+            t_emb = t_emb[:, :f, :]  # [B, F, dim]
+        else:
+            # Scalar timestep [B] — standard path
+            t_emb = self.time_embedding(
+                sinusoidal_embedding_1d(self._freq_dim, timestep).type_as(x)
+            )
+            t_mod = self.time_projection(t_emb).unflatten(1, (6, self._dim))
+            # Expand to per-frame: [B, 6, dim] -> [B, F, 6, dim]
+            t_mod = t_mod.unsqueeze(1).expand(-1, f, -1, -1)
+            # t_emb for head: [B, dim] -> [B, F, dim]
+            t_emb = t_emb.unsqueeze(1).expand(-1, f, -1)
 
         # Text embedding
         context = self.text_embedding(context)
@@ -1283,8 +1306,8 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
             else:
                 x = block(x, **kwargs)
 
-        # Head: t_emb is [B, dim], need [B, F, 1, dim]
-        head_e = t_emb.unsqueeze(1).unsqueeze(2).expand(-1, f, -1, -1)
+        # Head: t_emb is [B, F, dim], need [B, F, 1, dim]
+        head_e = t_emb.unsqueeze(2)  # [B, F, 1, dim]
         x = self.head(x, head_e)
 
         # Unpatchify
@@ -1359,8 +1382,10 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         # Text embedding
         context = self.text_embedding(context)
 
-        # Audio processing (full sequence first, then slice)
-        processed_audio = self._process_audio_embeddings(audio_emb, x.shape)
+        # Audio processing: cache once, slice per chunk
+        if not hasattr(self, "_cached_audio") or self._cached_audio is None:
+            self._cached_audio = self._process_audio_embeddings(audio_emb, x.shape)
+        processed_audio = self._cached_audio
         if processed_audio is not None:
             current_frame_start = current_start // frame_seqlen
             current_video_frames = grid_sizes[0][0].item()
@@ -1440,7 +1465,7 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         cur_start_frame: int = 0,
         store_kv: bool = False,
         is_ar: bool = True,
-        use_gradient_checkpointing: bool = False,
+        use_gradient_checkpointing: Optional[bool] = None,
         **fwd_kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
         """Forward pass — dispatches to full-sequence or AR mode.
@@ -1471,6 +1496,10 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
                 f"Unsupported fwd_pred_type '{fwd_pred_type}'. Supported: {NET_PRED_TYPES}"
             )
 
+        # Gradient checkpointing: default to constructor setting
+        if use_gradient_checkpointing is None:
+            use_gradient_checkpointing = self._use_gradient_checkpointing
+
         # Unpack condition
         assert isinstance(condition, dict), f"condition must be a dict, got {type(condition)}"
         text_embeds = condition["text_embeds"]
@@ -1494,7 +1523,18 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         h_patches, w_patches = H_lat // p_h, W_lat // p_w
         current_start = cur_start_frame * h_patches * w_patches
 
-        if is_ar:
+        # Auto-detect inhomogeneous per-frame timesteps [B, T] -> full-sequence mode
+        # This is needed for CausalKD training with sample_t_inhom
+        if timestep.dim() == 2:
+            model_output = self._forward_full_sequence(
+                x=x_t,
+                timestep=timestep,
+                context=text_embeds,
+                y=y,
+                audio_emb=audio_emb,
+                use_gradient_checkpointing=use_gradient_checkpointing,
+            )
+        elif is_ar:
             model_output = self._forward_ar(
                 x=x_t,
                 timestep=timestep,
@@ -1516,8 +1556,12 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
             )
 
         # Convert prediction type
+        # For inhomogeneous t [B, T_latent], expand to match model output [B, C, T, H, W]
+        t_for_convert = t
+        if t.dim() == 2:
+            t_for_convert = t[:, None, :, None, None]  # [B, 1, T, 1, 1]
         out = self.noise_scheduler.convert_model_output(
-            x_t, model_output, t,
+            x_t, model_output, t_for_convert,
             src_pred_type=self.net_pred_type,
             target_pred_type=fwd_pred_type,
         )

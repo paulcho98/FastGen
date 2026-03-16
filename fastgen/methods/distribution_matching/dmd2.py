@@ -42,16 +42,24 @@ class DMD2Model(FastGenModel):
         self.build_teacher()
         self.load_student_weights_and_ema()
 
-        # instantiate the fake_score and load weights from teacher
-        logger.info("Instantiating the fake_score")
+        # instantiate the fake_score — use separate config if provided (e.g. 1.3B critic with 14B teacher)
+        fake_score_cfg = getattr(self.config, "fake_score_net", None)
+        if fake_score_cfg is not None:
+            logger.info("Instantiating the fake_score (custom architecture, different from teacher)")
+        else:
+            fake_score_cfg = self.teacher_config
+            logger.info("Instantiating the fake_score (same architecture as teacher)")
         with self._get_meta_init_context():
-            self.fake_score = instantiate(self.teacher_config)
+            self.fake_score = instantiate(fake_score_cfg)
         model_path = self.config.pretrained_model_path
         if model_path is not None and len(model_path) > 0:
-            if (not self.config.fsdp_meta_init) or is_rank0():
-                # Only rank 0 loads weights if using meta initialization
-                self.fake_score.load_state_dict(self.teacher.state_dict())
-            synchronize()
+            if getattr(self.config, "fake_score_net", None) is not None:
+                logger.warning("Skipping teacher->fake_score weight copy (fake_score uses a different architecture)")
+            else:
+                if (not self.config.fsdp_meta_init) or is_rank0():
+                    # Only rank 0 loads weights if using meta initialization
+                    self.fake_score.load_state_dict(self.teacher.state_dict())
+                synchronize()
 
         if self.config.gan_loss_weight_gen > 0:
             logger.info(f"gan_loss_weight_gen: {self.config.gan_loss_weight_gen}")

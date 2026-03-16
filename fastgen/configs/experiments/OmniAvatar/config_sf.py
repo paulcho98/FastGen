@@ -8,7 +8,7 @@ Experiment config for OmniAvatar Self-Forcing distillation.
 """
 
 import os
-from fastgen.configs.discriminator import Discriminator_Wan_1_3B_Config
+from fastgen.configs.discriminator import Discriminator_Wan_14B_Config
 import fastgen.configs.methods.config_omniavatar_sf as config_sf_default
 
 from fastgen.configs.net import CKPT_ROOT_DIR
@@ -94,15 +94,19 @@ def create_config():
     config.model.net = CausalOmniAvatar_V2V_1_3B_Student
     config.model.net.total_num_frames = config.model.input_shape[1]
     config.model.teacher = OmniAvatar_V2V_14B_Teacher
+    config.model.fake_score_net = OmniAvatar_V2V_1_3B_FakeScore
 
-    # GAN settings
+    # GAN settings — discriminator matches 14B teacher (inner_dim=5120//4=1280, 40 blocks)
     config.model.gan_loss_weight_gen = 0.003
-    config.model.discriminator = Discriminator_Wan_1_3B_Config
+    config.model.discriminator = Discriminator_Wan_14B_Config
     config.model.discriminator.disc_type = "multiscale_down_mlp_large"
-    config.model.discriminator.feature_indices = [15, 22, 29]
+    config.model.discriminator.feature_indices = [21, 30, 39]  # For 40-layer 14B teacher
     config.model.gan_use_same_t_noise = True
 
-    # Pretrained student from KD Stage 1
+    # Student weights: let the network's own __init__ handle loading (base + omniavatar ckpt).
+    # Do NOT copy 14B teacher weights onto 1.3B student (architecture mismatch).
+    config.model.load_student_weights = False
+    # Pretrained student from KD Stage 1 (uncomment when available):
     # config.model.pretrained_student_net_path = f"{CKPT_ROOT_DIR}/OmniAvatar/checkpoints/ode_init.pt"
 
     # Timestep schedule
