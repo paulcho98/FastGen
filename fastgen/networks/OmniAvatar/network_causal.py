@@ -393,10 +393,12 @@ class CausalSelfAttention(nn.Module):
             kv_cache["k"][:, current_start:cache_end] = roped_k
             kv_cache["v"][:, current_start:cache_end] = v
 
-            # Attend over full accumulated cache (up to the furthest point)
+            # Attend over full accumulated cache (up to the furthest point).
+            # Clone to prevent in-place cache writes from invalidating
+            # flash attention's saved tensors during backward.
             attend_end = max(kv_cache["end_index"].item(), cache_end)
-            k_full = kv_cache["k"][:, :attend_end]
-            v_full = kv_cache["v"][:, :attend_end]
+            k_full = kv_cache["k"][:, :attend_end].clone()
+            v_full = kv_cache["v"][:, :attend_end].clone()
             x = _flash_attention(roped_q, k_full, v_full)
 
             # Track the high-water mark of the cache
