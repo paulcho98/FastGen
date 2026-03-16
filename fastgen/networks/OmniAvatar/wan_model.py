@@ -325,6 +325,18 @@ class WanModel(torch.nn.Module):
             x=self.patch_size[0], y=self.patch_size[1], z=self.patch_size[2]
         )
 
+    def _unpatchify_features(self, features, f, h, w):
+        """Convert patched token features [B, N, dim] → video [B, dim, T, H, W]."""
+        results = []
+        p_t, p_h, p_w = self.patch_size
+        for feat in features:
+            feat = rearrange(
+                feat, 'b (f h w) (x y z c) -> b c (f x) (h y) (w z)',
+                f=f, h=h, w=w, x=p_t, y=p_h, z=p_w
+            )
+            results.append(feat)
+        return results
+
     def forward(self,
                 x: torch.Tensor,
                 timestep: torch.Tensor,
@@ -333,6 +345,8 @@ class WanModel(torch.nn.Module):
                 y: Optional[torch.Tensor] = None,
                 use_gradient_checkpointing: bool = False,
                 audio_emb: Optional[torch.Tensor] = None,
+                feature_indices: Optional[set] = None,
+                return_features_early: bool = False,
                 **kwargs,
                 ):
         t = self.time_embedding(
@@ -366,6 +380,7 @@ class WanModel(torch.nn.Module):
         if audio_emb is not None and self.use_audio:
             audio_emb = audio_emb.reshape(x.shape[0], audio_emb.shape[0] // x.shape[0], -1, *audio_emb.shape[2:])
 
+        features = []
         for layer_i, block in enumerate(self.blocks):
             # audio cond
             if self.use_audio:
@@ -384,7 +399,17 @@ class WanModel(torch.nn.Module):
             else:
                 x = block(x, context, t_mod, freqs)
 
-        x = self.head(x, t)
+            # Feature extraction at requested block indices
+            if feature_indices and layer_i in feature_indices:
+                features.append(x)
 
+            # Early exit: return features without running head
+            if return_features_early and feature_indices and len(features) == len(feature_indices):
+                return self._unpatchify_features(features, f, h, w)
+
+        x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))
+
+        if features:
+            return x, self._unpatchify_features(features, f, h, w)
         return x

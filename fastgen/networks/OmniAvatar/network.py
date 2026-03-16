@@ -695,6 +695,7 @@ class OmniAvatarWan(FastGenNetwork):
 
         # Forward through the DiT
         use_gradient_checkpointing = fwd_kwargs.get("use_gradient_checkpointing", False)
+        has_features = feature_indices is not None and len(feature_indices) > 0
 
         model_output = self.model(
             x=x_t,
@@ -704,29 +705,32 @@ class OmniAvatarWan(FastGenNetwork):
             y=y,
             use_gradient_checkpointing=use_gradient_checkpointing,
             audio_emb=audio_emb,
+            feature_indices=feature_indices if has_features else None,
+            return_features_early=return_features_early,
         )
 
-        # Convert prediction type if needed
+        # Early exit: model returned just the unpatchified features
+        if return_features_early and has_features:
+            return model_output  # List of [B, dim, T, H, W] feature tensors
+
+        # Unpack if model returned (output, features) tuple
+        features = None
+        if has_features and isinstance(model_output, tuple):
+            model_output, features = model_output
+
+        # Convert prediction type
         out = self.noise_scheduler.convert_model_output(
             x_t, model_output, t,
             src_pred_type=self.net_pred_type,
             target_pred_type=fwd_pred_type,
         )
 
-        # Feature extraction — OmniAvatar DiT doesn't have native per-block
-        # feature extraction hooks, but we return the expected tuple structure
-        # so DMD2's discriminator training doesn't crash.
-        # The discriminator will receive empty features → GAN loss will be zero.
-        # To enable real discriminator training, add feature extraction hooks
-        # to WanModel (future work).
-        if return_features_early:
-            return []
-
-        if feature_indices is not None and len(feature_indices) > 0:
+        # Return format depends on what was requested
+        if features is not None:
             if return_logvar:
                 logvar = torch.zeros(out.shape[0], 1, device=out.device, dtype=out.dtype)
-                return [out, []], logvar
-            return [out, []]
+                return [out, features], logvar
+            return [out, features]
 
         if return_logvar:
             logvar = torch.zeros(out.shape[0], 1, device=out.device, dtype=out.dtype)
