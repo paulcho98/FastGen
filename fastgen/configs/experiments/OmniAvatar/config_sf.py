@@ -5,6 +5,7 @@
 Experiment config for OmniAvatar Self-Forcing distillation.
 
 14B teacher (bidirectional) → 1.3B student (causal) using Self-Forcing Stage 2.
+Follows the T2V config_sf_14b_teacher.py pattern (14B teacher + 1.3B student/fake_score).
 """
 
 import os
@@ -78,30 +79,34 @@ def create_config():
 
     # Learning rates
     config.model.net_optimizer.lr = 5e-6
-    config.model.discriminator_optimizer.lr = 5e-6
     config.model.fake_score_optimizer.lr = 5e-6
 
-    # Precision
+    # Precision (following T2V 14B teacher config: bfloat16 for FSDP too)
     config.model.precision = "bfloat16"
-    config.model.precision_fsdp = "float32"
+    config.model.precision_fsdp = "bfloat16"
 
     # Input shape: 512x512 @ 81 frames → latent [16, 21, 64, 64]
     config.model.input_shape = [16, 21, 64, 64]
     config.model.fake_score_pred_type = "x0"
     config.model.guidance_scale = 4.5
 
-    # Networks
+    # Networks: 14B teacher + 1.3B student + 1.3B fake_score
     config.model.net = CausalOmniAvatar_V2V_1_3B_Student
     config.model.net.total_num_frames = config.model.input_shape[1]
     config.model.teacher = OmniAvatar_V2V_14B_Teacher
     config.model.fake_score_net = OmniAvatar_V2V_1_3B_FakeScore
 
-    # GAN settings — discriminator matches 14B teacher (inner_dim=5120//4=1280, 40 blocks)
-    config.model.gan_loss_weight_gen = 0.003
-    config.model.discriminator = Discriminator_Wan_14B_Config
-    config.model.discriminator.disc_type = "multiscale_down_mlp_large"
-    config.model.discriminator.feature_indices = [21, 30, 39]  # For 40-layer 14B teacher
-    config.model.gan_use_same_t_noise = True
+    # GAN disabled by default to save ~35 GB VRAM (matching T2V 14B teacher config).
+    # Enable later for quality improvement if memory allows.
+    config.model.gan_loss_weight_gen = 0
+    config.model.student_update_freq = 2  # More frequent student updates (matching T2V 14B teacher)
+    # To enable GAN, uncomment:
+    # config.model.gan_loss_weight_gen = 0.003
+    # config.model.discriminator = Discriminator_Wan_14B_Config
+    # config.model.discriminator.disc_type = "multiscale_down_mlp_large"
+    # config.model.discriminator.feature_indices = [21, 30, 39]
+    # config.model.discriminator_optimizer.lr = 5e-6
+    # config.model.gan_use_same_t_noise = True
 
     # Student weights: let the network's own __init__ handle loading (base + omniavatar ckpt).
     # Do NOT copy 14B teacher weights onto 1.3B student (architecture mismatch).
