@@ -7,6 +7,8 @@ import attrs
 from omegaconf import DictConfig
 
 from fastgen.utils import LazyCall as L
+from typing import Optional
+
 from fastgen.configs.methods.config_self_forcing import (
     Config as SFConfig,
     ModelConfig as SFModelConfig,
@@ -23,7 +25,14 @@ from fastgen.configs.callbacks import (
 
 
 @attrs.define(slots=False)
+class OmniAvatarModelConfig(SFModelConfig):
+    # Separate fake_score config (allows 1.3B fake_score with 14B teacher)
+    fake_score: Optional[DictConfig] = None
+
+
+@attrs.define(slots=False)
 class Config(SFConfig):
+    model: OmniAvatarModelConfig = attrs.field(factory=OmniAvatarModelConfig)
     model_class: DictConfig = L(OmniAvatarSelfForcingModel)(
         config=None,
     )

@@ -12,9 +12,11 @@ import fastgen.configs.methods.config_omniavatar_kd as config_kd_default
 
 from fastgen.utils import LazyCall as L
 from fastgen.networks.OmniAvatar.network_causal import CausalOmniAvatarWan
+from fastgen.datasets.omniavatar_dataloader import create_omniavatar_dataloader
 
 # ---- Paths ----
 OMNIAVATAR_ROOT = os.getenv("OMNIAVATAR_ROOT", "/home/work/.local/OmniAvatar")
+DATA_ROOT = os.getenv("OMNIAVATAR_DATA_ROOT", "/home/work/stableavatar_data/v2v_training_data")
 STUDENT_CKPT = os.getenv("OMNIAVATAR_STUDENT_CKPT", None)
 
 # ---- Student network config ----
@@ -48,7 +50,9 @@ def create_config():
     config.model.net.total_num_frames = config.model.input_shape[1]
 
     # Timestep schedule (must match ODE trajectory generation)
+    # shift=3.0 matches the OmniAvatar teacher's training distribution
     config.model.sample_t_cfg.time_dist_type = "shifted"
+    config.model.sample_t_cfg.shift = 3.0
     config.model.sample_t_cfg.min_t = 0.001
     config.model.sample_t_cfg.max_t = 0.999
     config.model.sample_t_cfg.t_list = [0.999, 0.937, 0.833, 0.624, 0.0]
@@ -56,8 +60,21 @@ def create_config():
     # KD settings
     config.model.student_sample_steps = 4
 
+    # Dataloader — KD uses ODE trajectory data (includes "path" key)
+    config.dataloader_train = L(create_omniavatar_dataloader)(
+        data_list_path=f"{DATA_ROOT}/video_square_path.txt",
+        latentsync_mask_path=os.getenv(
+            "LATENTSYNC_MASK_PATH",
+            "/home/work/.local/Self-Forcing_LipSync_StableAvatar/diffsynth/utils/mask.png",
+        ),
+        batch_size=1,
+        num_workers=4,
+        neg_text_emb_path=os.getenv("NEG_TEXT_EMB_PATH", None),
+        use_ref_sequence=True,
+        load_ode_path=True,
+    )
+
     # Training
-    config.dataloader_train.batch_size = 1
     config.trainer.max_iter = 5000
     config.trainer.logging_iter = 10
     config.trainer.save_ckpt_iter = 500

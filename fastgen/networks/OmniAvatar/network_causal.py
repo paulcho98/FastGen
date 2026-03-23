@@ -1094,24 +1094,41 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         device: torch.device,
         num_frames: int,
         frame_seqlen: int,
+        chunk_size: int = None,
     ) -> Optional[BlockMask]:
-        """Build a blockwise causal attention mask for full-sequence mode.
+        """Build a chunk-wise causal attention mask for full-sequence mode.
 
-        Each frame's tokens can attend to all tokens in current and previous frames.
+        Tokens within the same chunk attend bidirectionally. Tokens can attend
+        to all previous chunks. Matches CausalWan's _prepare_blockwise_causal_attn_mask.
         """
         if not FLEX_ATTENTION_AVAILABLE:
             return None
+
+        if chunk_size is None:
+            chunk_size = self.chunk_size
 
         total_length = num_frames * frame_seqlen
         pad_len = math.ceil(total_length / 128) * 128 - total_length
 
         ends = torch.zeros(total_length + pad_len, device=device, dtype=torch.long)
 
-        # Fill: each frame block's tokens can attend up to end of their frame
-        for frame_idx in range(num_frames):
-            start = frame_idx * frame_seqlen
-            end = (frame_idx + 1) * frame_seqlen
-            ends[start:end] = end
+        # Build chunk boundaries — front-load remainder into first chunk
+        num_chunks = num_frames // chunk_size
+        remaining_size = num_frames % chunk_size
+
+        frame_counts = []
+        if num_frames > 0:
+            if num_chunks == 0:
+                frame_counts.append(remaining_size)
+            else:
+                frame_counts.append(chunk_size + remaining_size)
+                frame_counts.extend([chunk_size] * max(num_chunks - 1, 0))
+
+        current_start = 0
+        for frames_in_chunk in frame_counts:
+            chunk_len_tokens = frames_in_chunk * frame_seqlen
+            ends[current_start : current_start + chunk_len_tokens] = current_start + chunk_len_tokens
+            current_start += chunk_len_tokens
 
         def attention_mask(b, h, q_idx, kv_idx):
             return (kv_idx < ends[q_idx]) | (q_idx == kv_idx)
@@ -1231,13 +1248,24 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         x = x.flatten(2).transpose(1, 2)  # [B, f*h*w, dim]
         seq_lens = torch.tensor([x.shape[1]] * x.shape[0], dtype=torch.long, device=device)
 
-        # Time embedding
-        t_emb = self.time_embedding(
-            sinusoidal_embedding_1d(self._freq_dim, timestep).type_as(x)
-        )
-        t_mod = self.time_projection(t_emb).unflatten(1, (6, self._dim))
-        # Expand to per-frame: [B, 6, dim] -> [B, F, 6, dim]
-        t_mod = t_mod.unsqueeze(1).expand(-1, f, -1, -1)
+        # Time embedding — handle both scalar [B] and per-frame [B, num_frames]
+        if timestep.ndim == 2:
+            # Per-frame timesteps (from sample_t_inhom in CausalKD)
+            B_t, T_t = timestep.shape
+            flat_t = timestep.reshape(-1)  # [B * num_frames]
+            flat_sinusoidal = sinusoidal_embedding_1d(self._freq_dim, flat_t).type_as(x)
+            flat_emb = self.time_embedding(flat_sinusoidal)  # [B * num_frames, dim]
+            t_emb = flat_emb.reshape(B_t, T_t, -1)  # [B, num_frames, dim]
+            flat_proj = self.time_projection(flat_emb)  # [B * num_frames, 6 * dim]
+            t_mod = flat_proj.reshape(B_t, T_t, 6, self._dim)  # [B, num_frames, 6, dim]
+        else:
+            # Scalar timestep [B] — broadcast to all frames
+            t_emb = self.time_embedding(
+                sinusoidal_embedding_1d(self._freq_dim, timestep).type_as(x)
+            )
+            t_mod = self.time_projection(t_emb).unflatten(1, (6, self._dim))
+            t_mod = t_mod.unsqueeze(1).expand(-1, f, -1, -1)  # [B, f, 6, dim]
+            t_emb = t_emb.unsqueeze(1).expand(-1, f, -1)  # [B, f, dim]
 
         # Text embedding
         context = self.text_embedding(context)
@@ -1245,10 +1273,10 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         # Audio processing
         processed_audio = self._process_audio_embeddings(audio_emb, x.shape)
 
-        # Build block mask (causal, per-frame)
+        # Build block mask (chunk-wise causal, matching CausalWan)
         if self.block_mask is None and FLEX_ATTENTION_AVAILABLE:
             frame_seqlen = h * w
-            self.block_mask = self._build_block_mask(device, f, frame_seqlen)
+            self.block_mask = self._build_block_mask(device, f, frame_seqlen, self.chunk_size)
 
         # Create custom forward for gradient checkpointing
         def create_custom_forward(module):
@@ -1283,8 +1311,8 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
             else:
                 x = block(x, **kwargs)
 
-        # Head: t_emb is [B, dim], need [B, F, 1, dim]
-        head_e = t_emb.unsqueeze(1).unsqueeze(2).expand(-1, f, -1, -1)
+        # Head: t_emb is [B, f, dim] (per-frame or expanded), need [B, f, 1, dim]
+        head_e = t_emb.unsqueeze(2)
         x = self.head(x, head_e)
 
         # Unpatchify
@@ -1439,7 +1467,7 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         fwd_pred_type: Optional[str] = None,
         cur_start_frame: int = 0,
         store_kv: bool = False,
-        is_ar: bool = True,
+        is_ar: bool = False,
         use_gradient_checkpointing: bool = False,
         **fwd_kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
@@ -1447,11 +1475,12 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
 
         Args:
             x_t: Noisy latent [B, 16, T, H, W].
-            t: Timestep in [0, 1) range, shape [B].
+            t: Timestep in [0, 1) range, shape [B] or [B, num_frames].
             condition: Dict with text_embeds, audio_emb, ref_latent, mask, etc.
             cur_start_frame: Frame offset for AR generation.
             store_kv: Whether to update KV cache (always True in AR mode).
-            is_ar: If True, use AR mode with KV cache; if False, full-sequence.
+            is_ar: If True, use AR mode with KV cache; if False, full-sequence
+                   with FlexAttention causal mask. Default False to match CausalWan.
             use_gradient_checkpointing: Enable gradient checkpointing.
             **fwd_kwargs: Additional kwargs.
 
@@ -1515,9 +1544,10 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
                 use_gradient_checkpointing=use_gradient_checkpointing,
             )
 
-        # Convert prediction type
+        # Convert prediction type — handle both scalar [B] and per-frame [B, T] timesteps
+        t_converted = t[:, None, :, None, None] if t.ndim == 2 else t
         out = self.noise_scheduler.convert_model_output(
-            x_t, model_output, t,
+            x_t, model_output, t_converted,
             src_pred_type=self.net_pred_type,
             target_pred_type=fwd_pred_type,
         )

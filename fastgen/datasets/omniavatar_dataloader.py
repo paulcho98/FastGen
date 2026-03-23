@@ -41,11 +41,13 @@ class OmniAvatarDataset(Dataset):
         latentsync_mask_path: str,
         neg_text_emb_path: str = None,
         use_ref_sequence: bool = True,
+        load_ode_path: bool = False,
         num_video_frames: int = 81,
         latent_h: int = 64,
         latent_w: int = 64,
     ):
         self.use_ref_sequence = use_ref_sequence
+        self.load_ode_path = load_ode_path
         self.num_video_frames = num_video_frames
         self.latent_h = latent_h
         self.latent_w = latent_w
@@ -154,6 +156,17 @@ class OmniAvatarDataset(Dataset):
                     # Fallback: zeros with same shape as real latents
                     result["ref_sequence"] = torch.zeros_like(real)
 
+            # --- ODE trajectory path (for KD Stage 1) ---
+            if self.load_ode_path:
+                ode_path_file = os.path.join(sample_dir, "ode_path.pt")
+                if os.path.exists(ode_path_file):
+                    result["path"] = torch.load(
+                        ode_path_file, map_location="cpu", weights_only=False
+                    ).to(torch.bfloat16)  # [num_steps, 16, 21, 64, 64]
+                else:
+                    warnings.warn(f"Missing ode_path.pt in {sample_dir}")
+                    return None
+
             return result
 
         except Exception as e:
@@ -167,6 +180,7 @@ def create_omniavatar_dataloader(
     latentsync_mask_path: str,
     batch_size: int = 1,
     num_workers: int = 4,
+    load_ode_path: bool = False,
     **kwargs,
 ) -> DataLoader:
     """Create a DataLoader for OmniAvatar training data.
@@ -184,6 +198,7 @@ def create_omniavatar_dataloader(
     dataset = OmniAvatarDataset(
         data_list_path=data_list_path,
         latentsync_mask_path=latentsync_mask_path,
+        load_ode_path=load_ode_path,
         **kwargs,
     )
 
