@@ -5,7 +5,7 @@ Distill OmniAvatar's 14B V2V audio-driven lip sync model into a 1.3B student
 using FastGen's Self-Forcing framework for fast few-step inference.
 
 ## Environment
-- Python: `/home/work/.local/miniconda3/envs/fastgen/bin/python` (fastgen env for imports/tests)
+- Python: `/home/work/.local/miniconda3/envs/hb_fastgen/bin/python` (hb_fastgen env)
 - GPUs: 4x H200 (150GB). GPU 2 for testing (`CUDA_VISIBLE_DEVICES=2`).
 - Write scope: `/home/work/.local/hyunbin/FastGen/` and `/home/work/.local/OmniAvatar/`
 - **SAFETY**: Do NOT delete files outside these repos. Git commit every major change.

@@ -81,9 +81,9 @@ def create_config():
     config.model.net_optimizer.lr = 5e-6
     config.model.fake_score_optimizer.lr = 5e-6
 
-    # Precision (following T2V 14B teacher config: bfloat16 for FSDP too)
+    # Precision
     config.model.precision = "bfloat16"
-    config.model.precision_fsdp = "bfloat16"
+    config.model.precision_fsdp = "float32"  # Official T2V configs use float32 for FSDP
 
     # Input shape: 512x512 @ 81 frames → latent [16, 21, 64, 64]
     config.model.input_shape = [16, 21, 64, 64]
