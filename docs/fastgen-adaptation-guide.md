@@ -33,14 +33,28 @@ framework. Based on the OmniAvatar adaptation as reference implementation.
 FastGen's Self-Forcing distillation trains a fast few-step student from a slow
 multi-step teacher. The pipeline has two stages:
 
-### Stage 1: Causal KD (ODE Initialization)
+### Stage 1: Initialization (two options)
+
+**Option A: Causal KD (ODE Initialization)**
 ```
 Pre-generated ODE trajectories (from teacher) → CausalKD training
-    Student: causal network, full-sequence mode (is_ar=False)
+    Student: causal network, full-sequence mode (auto-detected via 2D timestep)
     FlexAttention chunk-wise causal mask
     Per-chunk timesteps via sample_t_inhom
     Loss: L2(student_output, clean_data)
     Output: ode_init.pt checkpoint
+```
+
+**Option B: Diffusion Forcing (No ODE needed)**
+```
+Real training data + Gaussian noise → Diffusion Forcing training
+    Student: causal network, full-sequence mode (auto-detected via 2D timestep)
+    FlexAttention chunk-wise causal mask
+    Per-chunk timesteps via sample_t_inhom
+    Noise added to real data at inhomogeneous timesteps
+    Loss: L2(student_output, real_data)
+    Output: df_init.pt checkpoint
+    Advantage: No teacher ODE generation step needed
 ```
 
 ### Stage 2: Self-Forcing DMD
@@ -68,10 +82,18 @@ requires `config.model.fake_score` config support (see gotchas).
 
 ---
 
-## 2. What FastGen Provides (DO NOT MODIFY)
+## 2. What FastGen Provides (Minimal Modifications Only)
 
-These files are the core training infrastructure. They must remain byte-identical
-to the original. Your adaptation works by subclassing and configuring, never patching.
+These files are the core training infrastructure. Your adaptation works primarily
+by subclassing and configuring. Only 3 base files were modified:
+
+**Modified base files:**
+- `config.py`: Added `fake_score_net: Optional[dict] = None` to `BaseModelConfig`
+  (allows separate fake_score architecture from teacher)
+- `dmd2.py`: `build_model()` checks `config.fake_score_net` before falling back to
+  `self.teacher_config` for fake_score instantiation
+- `methods/__init__.py`: Registered OmniAvatar model classes
+- `noise_schedule.py`: Added `dtype` parameter to `sample_t_inhom` signature
 
 ### Training Loop
 - `fastgen/trainer.py` — Main training loop, gradient accumulation, checkpointing
@@ -330,17 +352,40 @@ def clear_caches(self):
 Same 3-stage pipeline as the bidirectional wrapper. The causal model uses
 identical parameter names to the bidirectional DiT, so weights transfer directly.
 
-### CRITICAL: `is_ar` default must be `False`
+### CRITICAL: Auto-detect per-frame timesteps for KD routing
 
 ```python
-def forward(self, x_t, t, condition, is_ar=False, ...):
+def forward(self, x_t, t, condition, is_ar=True, ...):
+    # Auto-detect: if t is [B, T] (per-frame), route to full-sequence mode
+    if timestep.dim() == 2:
+        return self._forward_full_sequence(...)
+    elif is_ar:
+        return self._forward_ar(...)
+    else:
+        return self._forward_full_sequence(...)
 ```
 
-The default MUST be `False` to match `CausalWan.forward()`. Reason:
-- `CausalKDModel.single_train_step()` calls `gen_data_from_net()` which calls
-  `self.net(input, t, condition=cond, fwd_pred_type="x0")` — no `is_ar` passed
-- With default `False`: routes to `_forward_full_sequence` (correct for KD)
-- Self-Forcing explicitly passes `is_ar=True` in `rollout_with_gradient()`
+The `is_ar` default is `True` (for Self-Forcing AR rollout). CausalKD passes
+per-frame timesteps `t_inhom` of shape `[B, num_frames]`, which the forward
+method auto-detects and routes to `_forward_full_sequence` regardless of `is_ar`.
+This avoids relying on callers to pass the correct `is_ar` flag.
+
+### Audio caching in AR mode
+
+In AR mode, audio is processed once and cached:
+```python
+if self._cached_audio is None:
+    self._cached_audio = self._process_audio_embeddings(audio_emb, x.shape)
+processed_audio = self._cached_audio
+# Then slice per chunk
+```
+Cache is cleared in `clear_caches()`.
+
+### Gradient checkpointing default
+
+Both bidirectional and causal networks now default to gradient checkpointing
+enabled (controlled by `disable_grad_ckpt` constructor param). The `forward()`
+`use_gradient_checkpointing` parameter defaults to `None` (uses constructor setting).
 
 ---
 
@@ -375,7 +420,21 @@ For OmniAvatar:
 - Shared tensors (mask, neg_text_embeds) loaded once in `__init__`
 - `collate_fn` filters `None` returns from failed loads
 - `load_ode_path` parameter controls whether to load ODE trajectories
-- Must wrap in `create_<your>_dataloader()` function for LazyCall configs
+- Two wrapper options:
+  - `create_<your>_dataloader()` — simple DataLoader, no DDP, finite iteration
+  - `YourDataLoader` class — infinite iterator with `DistributedSampler` for multi-GPU
+    (FastGen's trainer expects an infinite iterator; this is the recommended approach)
+- The infinite DataLoader class wraps a standard DataLoader and yields indefinitely:
+  ```python
+  class YourDataLoader:
+      def __iter__(self):
+          epoch = 0
+          while True:
+              if self._sampler is not None:
+                  self._sampler.set_epoch(epoch)
+              yield from self._dataloader
+              epoch += 1
+  ```
 
 ---
 
@@ -405,13 +464,20 @@ def _prepare_training_data(self, data):
     return real_data, condition, neg_condition
 ```
 
-**`build_model()`** — Re-instantiate fake_score if teacher≠fake_score architecture
+**`build_model()`** — Override only if base `dmd2.py` doesn't handle your case.
+The base `dmd2.py` now checks `config.fake_score_net` natively:
 ```python
-def build_model(self):
-    super().build_model()  # Creates fake_score from teacher_config (wrong size)
-    if getattr(self.config, "fake_score", None) is not None:
-        self.fake_score = instantiate(self.config.fake_score)  # Correct size
+# In dmd2.py (already modified):
+fake_score_cfg = getattr(self.config, "fake_score_net", None)
+if fake_score_cfg is not None:
+    self.fake_score = instantiate(fake_score_cfg)  # Uses separate config
+else:
+    self.fake_score = instantiate(self.teacher_config)  # Same as teacher
 ```
+So you just need `config.model.fake_score_net = YourFakeScoreConfig` in the
+experiment config. No `build_model()` override needed unless you have additional
+initialization logic. The OmniAvatar SF method still has the override for backward
+compatibility but it's redundant with the base `dmd2.py` change.
 
 ### 5b: KD method
 
@@ -447,6 +513,38 @@ def single_train_step(self, data, iteration):
     loss = 0.5 * F.mse_loss(gen_data, denoised_data)
     return loss_map, outputs
 ```
+
+### 5c: Diffusion Forcing method (Stage 1 alternative)
+
+**OmniAvatar file:** `fastgen/methods/omniavatar_diffusion_forcing.py` (129 lines)
+**Parent:** `KDModel` → `FastGenModel`
+
+Alternative to CausalKD that doesn't require pre-computed ODE trajectories.
+Adds Gaussian noise to real data at inhomogeneous block-wise timesteps.
+
+```python
+class YourDiffusionForcingModel(KDModel):
+    def single_train_step(self, data, iteration):
+        real_data = data["real"]
+        condition = self._build_condition(data)
+
+        # Sample per-chunk timesteps (same as CausalKD)
+        t_inhom, _ = self.net.noise_scheduler.sample_t_inhom(...)  # [B, T]
+
+        # Add noise to real data (NOT from ODE path)
+        eps = torch.randn_like(real_data)
+        t_expanded = t_inhom[:, None, :, None, None]  # [B, 1, T, 1, 1]
+        noisy_data = self.net.noise_scheduler.forward_process(real_data, eps, t_expanded)
+
+        # Student denoise
+        gen_data = self.gen_data_from_net(noisy_data, t_inhom, condition=condition)
+
+        # L2 loss vs clean data (not ODE target)
+        loss = 0.5 * F.mse_loss(gen_data, real_data)
+```
+
+Key difference from CausalKD: no `data["path"]` needed, no teacher ODE generation step.
+The dataset only needs `real` data + conditioning. Simpler to set up.
 
 ---
 
@@ -490,11 +588,16 @@ Student_Config = L(YourCausalNetwork)(model_size="1.3B", chunk_size=3, ...)
 def create_config():
     config.model.net = Student_Config
     config.model.teacher = Teacher_Config
-    config.model.fake_score = FakeScore_Config
+    config.model.fake_score_net = FakeScore_Config  # NOTE: fake_score_net, not fake_score
 
-    # Discriminator must match TEACHER feature dim, not student
-    config.model.discriminator = Discriminator_Wan_14B_Config  # inner_dim = teacher_dim // 4
-    config.model.discriminator.feature_indices = [15, 22, 29]  # valid block indices for teacher
+    # Prevent copying 14B teacher weights onto 1.3B student (architecture mismatch)
+    config.model.load_student_weights = False
+
+    # GAN disabled by default to save VRAM. Uncomment to enable:
+    config.model.gan_loss_weight_gen = 0  # Set to 0.003 to enable
+    config.model.student_update_freq = 2  # More frequent student updates without GAN
+    # config.model.discriminator = Discriminator_Wan_14B_Config  # inner_dim must match teacher
+    # config.model.discriminator.feature_indices = [21, 30, 39]  # valid for 40-block 14B
 
     # shift must match YOUR teacher's training distribution
     config.model.sample_t_cfg.shift = 3.0  # OmniAvatar used 3.0, Wan2.1 base uses 5.0
@@ -561,18 +664,22 @@ Step 1: Precompute data (offline)
     - Extract text embeddings → .pt files
     - Generate spatial masks
 
-Step 2: Generate ODE trajectories
-    $ torchrun --nproc_per_node=4 scripts/generate_your_ode_pairs.py \
-        --data_list /path/to/video_list.txt \
-        --output_dir /path/to/data/ \
-        --guidance_scale 4.5
+Step 2: Stage 1 initialization (choose one):
 
-Step 3: KD training (Stage 1)
-    $ torchrun --nproc_per_node=4 train.py \
-        --config fastgen/configs/experiments/YourModel/config_kd.py
+    Option A — ODE KD (requires teacher):
+        $ torchrun --nproc_per_node=4 scripts/generate_your_ode_pairs.py \
+            --data_list /path/to/video_list.txt \
+            --output_dir /path/to/data/ \
+            --guidance_scale 4.5
+        $ torchrun --nproc_per_node=4 train.py \
+            --config fastgen/configs/experiments/YourModel/config_kd.py
 
-Step 4: Self-Forcing training (Stage 2)
-    # Uncomment pretrained_student_net_path in config_sf.py pointing to KD output
+    Option B — Diffusion Forcing (no teacher needed):
+        $ torchrun --nproc_per_node=4 train.py \
+            --config fastgen/configs/experiments/YourModel/config_df.py
+
+Step 3: Self-Forcing training (Stage 2)
+    # Set pretrained_student_net_path in config_sf.py pointing to Stage 1 output
     $ torchrun --nproc_per_node=4 train.py \
         --config fastgen/configs/experiments/YourModel/config_sf.py
 ```
@@ -586,13 +693,21 @@ Step 4: Self-Forcing training (Stage 2)
 1. **Dataloader MUST be explicitly assigned.** The default is `CIFAR10_Loader_Config`.
    If you only set `config.dataloader_train.batch_size = 1`, you're still using CIFAR-10.
 
-2. **Fake score defaults to teacher architecture.** `DMD2Model.build_model()` creates
-   fake_score from `self.teacher_config`. If teacher is 14B and you want 1.3B fake_score,
-   you must override `build_model()` and add a `config.model.fake_score` field.
+2. **Fake score defaults to teacher architecture.** `DMD2Model.build_model()` now
+   checks `config.fake_score_net` first. If set, uses that config; otherwise falls
+   back to `self.teacher_config`. Set `config.model.fake_score_net = YourFakeScoreConfig`
+   in the experiment config. The base `config.py` and `dmd2.py` were modified to
+   support this natively (no longer needs `build_model()` override in the method class).
 
 3. **Discriminator inner_dim must match TEACHER, not student.** Features are extracted
    from the teacher. If teacher is 14B (dim=5120), use `Discriminator_Wan_14B_Config`
    (inner_dim=1280), not `Discriminator_Wan_1_3B_Config` (inner_dim=384).
+   Note: GAN is optional — can be disabled (`gan_loss_weight_gen=0`) to save ~35GB VRAM.
+
+3b. **`load_student_weights = False` when teacher≠student architecture.** By default,
+   FastGen copies teacher weights to student. When they have different sizes (14B→1.3B),
+   set `config.model.load_student_weights = False`. Let the network's own `__init__`
+   handle weight loading via `base_model_paths` + `omniavatar_ckpt_path`.
 
 4. **shift parameter must match your teacher's training distribution.** FastGen defaults
    to shift=5.0. If your teacher was trained with shift=3.0, set it explicitly.
@@ -602,9 +717,10 @@ Step 4: Self-Forcing training (Stage 2)
 
 ### Network gotchas
 
-6. **`is_ar` default MUST be `False`.** CausalKD calls `gen_data_from_net()` without
-   passing `is_ar`. Default `False` routes to full-sequence mode (correct). Default
-   `True` would route to AR mode (wrong for KD — no chunk-by-chunk, no KV cache during KD).
+6. **Per-frame timestep auto-detection.** The causal network's `forward()` auto-detects
+   `t.dim() == 2` (per-frame timesteps from `sample_t_inhom`) and routes to
+   `_forward_full_sequence` regardless of `is_ar`. This means `is_ar` can default to
+   `True` for Self-Forcing without breaking KD. You don't need to change the default.
 
 7. **Per-frame timestep support in `_forward_full_sequence`.** CausalKD uses
    `sample_t_inhom` which returns `[B, num_frames]`. Your full-sequence forward must
@@ -636,30 +752,39 @@ Step 4: Self-Forcing training (Stage 2)
 
 ## 13. File Inventory
 
-### Files created (OmniAvatar adaptation): 15 files, ~5000 lines
+### Files created (OmniAvatar adaptation): 19 files, ~6000+ lines
 
 | File | Lines | Purpose |
 |------|-------|---------|
 | `networks/OmniAvatar/__init__.py` | 4 | Package exports |
 | `networks/OmniAvatar/wan_model.py` | 415 | Standalone DiT (from OmniAvatar) |
 | `networks/OmniAvatar/audio_pack.py` | 39 | Audio conditioning module |
-| `networks/OmniAvatar/network.py` | 739 | Bidirectional FastGenNetwork wrapper |
-| `networks/OmniAvatar/network_causal.py` | 1750 | Causal CausalFastGenNetwork wrapper |
+| `networks/OmniAvatar/network.py` | ~745 | Bidirectional FastGenNetwork wrapper |
+| `networks/OmniAvatar/network_causal.py` | ~1830 | Causal CausalFastGenNetwork wrapper |
 | `methods/omniavatar_self_forcing.py` | 105 | SF method (overrides _prepare_training_data + build_model) |
 | `methods/omniavatar_kd.py` | 128 | KD method (overrides _build_condition + single_train_step) |
-| `datasets/omniavatar_dataloader.py` | 221 | Dataset + DataLoader factory |
+| `methods/omniavatar_diffusion_forcing.py` | 129 | DF method (Stage 1 alt: noise real data, no ODE needed) |
+| `datasets/omniavatar_dataloader.py` | 293 | Dataset + DataLoader (simple) + DataLoader (infinite+DDP) |
 | `configs/methods/config_omniavatar_sf.py` | 61 | SF method config (adds fake_score field) |
 | `configs/methods/config_omniavatar_kd.py` | 52 | KD method config (inherits CausalKDConfig) |
+| `configs/methods/config_omniavatar_df.py` | 50 | DF method config |
 | `configs/experiments/OmniAvatar/__init__.py` | 0 | Package |
-| `configs/experiments/OmniAvatar/config_sf.py` | 143 | SF experiment (3 networks + hyperparams) |
+| `configs/experiments/OmniAvatar/config_sf.py` | 151 | SF experiment (3 networks + hyperparams) |
 | `configs/experiments/OmniAvatar/config_kd.py` | 84 | KD experiment (1 network + hyperparams) |
+| `configs/experiments/OmniAvatar/config_df.py` | 67 | DF experiment (1 network, no teacher) |
 | `scripts/generate_omniavatar_ode_pairs.py` | 584 | ODE trajectory generation |
 | `scripts/create_verification_samples.py` | 422 | Dev/testing utility |
+| `scripts/test_e2e_real_data.py` | 535 | End-to-end test with real data |
+| `scripts/test_t2v_memory_baseline.py` | 363 | Memory baseline test |
 
-### Files NOT modified from original FastGen: ~140+
+### Base FastGen files modified: 4 files
 
-All core training logic, loss functions, callbacks, utilities, and noise schedules
-remain byte-identical. The adaptation is purely additive.
+| File | Change |
+|------|--------|
+| `configs/config.py` | Added `fake_score_net: Optional[dict] = None` to `BaseModelConfig` |
+| `methods/distribution_matching/dmd2.py` | `build_model()` uses `fake_score_net` when set |
+| `methods/__init__.py` | Registered OmniAvatar model classes |
+| `networks/noise_schedule.py` | Added `dtype` parameter to `sample_t_inhom` |
 
 ### Original FastGen reference configs (for comparison)
 
