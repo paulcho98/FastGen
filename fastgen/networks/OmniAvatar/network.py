@@ -297,7 +297,9 @@ def _merge_lora_into_model(
 
         param = model_sd[weight_key]
         # LoRA: W' = W + scaling * B @ A
-        delta = scaling * (B.to(param.dtype) @ A.to(param.dtype))
+        # Do matmul on GPU for speed (14B LoRA merge takes 40+ min on CPU)
+        merge_device = torch.device("cuda") if torch.cuda.is_available() else param.device
+        delta = scaling * (B.to(device=merge_device, dtype=param.dtype) @ A.to(device=merge_device, dtype=param.dtype))
         param.data.add_(delta.to(param.device))
         merged_count += 1
 
