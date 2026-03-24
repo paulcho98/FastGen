@@ -1098,24 +1098,41 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         device: torch.device,
         num_frames: int,
         frame_seqlen: int,
+        chunk_size: int = None,
     ) -> Optional[BlockMask]:
-        """Build a blockwise causal attention mask for full-sequence mode.
+        """Build a chunk-wise causal attention mask for full-sequence mode.
 
-        Each frame's tokens can attend to all tokens in current and previous frames.
+        Tokens within the same chunk attend bidirectionally. Tokens can attend
+        to all previous chunks. Matches CausalWan's _prepare_blockwise_causal_attn_mask.
         """
         if not FLEX_ATTENTION_AVAILABLE:
             return None
+
+        if chunk_size is None:
+            chunk_size = self.chunk_size
 
         total_length = num_frames * frame_seqlen
         pad_len = math.ceil(total_length / 128) * 128 - total_length
 
         ends = torch.zeros(total_length + pad_len, device=device, dtype=torch.long)
 
-        # Fill: each frame block's tokens can attend up to end of their frame
-        for frame_idx in range(num_frames):
-            start = frame_idx * frame_seqlen
-            end = (frame_idx + 1) * frame_seqlen
-            ends[start:end] = end
+        # Build chunk boundaries — front-load remainder into first chunk
+        num_chunks = num_frames // chunk_size
+        remaining_size = num_frames % chunk_size
+
+        frame_counts = []
+        if num_frames > 0:
+            if num_chunks == 0:
+                frame_counts.append(remaining_size)
+            else:
+                frame_counts.append(chunk_size + remaining_size)
+                frame_counts.extend([chunk_size] * max(num_chunks - 1, 0))
+
+        current_start = 0
+        for frames_in_chunk in frame_counts:
+            chunk_len_tokens = frames_in_chunk * frame_seqlen
+            ends[current_start : current_start + chunk_len_tokens] = current_start + chunk_len_tokens
+            current_start += chunk_len_tokens
 
         def attention_mask(b, h, q_idx, kv_idx):
             return (kv_idx < ends[q_idx]) | (q_idx == kv_idx)
@@ -1268,10 +1285,10 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         # Audio processing
         processed_audio = self._process_audio_embeddings(audio_emb, x.shape)
 
-        # Build block mask (causal, per-frame)
+        # Build block mask (chunk-wise causal, matching CausalWan)
         if self.block_mask is None and FLEX_ATTENTION_AVAILABLE:
             frame_seqlen = h * w
-            self.block_mask = self._build_block_mask(device, f, frame_seqlen)
+            self.block_mask = self._build_block_mask(device, f, frame_seqlen, self.chunk_size)
 
         # Create custom forward for gradient checkpointing
         def create_custom_forward(module):
@@ -1472,11 +1489,12 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
 
         Args:
             x_t: Noisy latent [B, 16, T, H, W].
-            t: Timestep in [0, 1) range, shape [B].
+            t: Timestep in [0, 1) range, shape [B] or [B, num_frames].
             condition: Dict with text_embeds, audio_emb, ref_latent, mask, etc.
             cur_start_frame: Frame offset for AR generation.
             store_kv: Whether to update KV cache (always True in AR mode).
-            is_ar: If True, use AR mode with KV cache; if False, full-sequence.
+            is_ar: If True, use AR mode with KV cache; if False, full-sequence
+                   with FlexAttention causal mask. Default False to match CausalWan.
             use_gradient_checkpointing: Enable gradient checkpointing.
             **fwd_kwargs: Additional kwargs.
 

@@ -259,6 +259,7 @@ def create_omniavatar_dataloader(
     latentsync_mask_path: str,
     batch_size: int = 1,
     num_workers: int = 4,
+    load_ode_path: bool = False,
     **kwargs,
 ) -> DataLoader:
     """Create a DataLoader for OmniAvatar training data (non-infinite, no DDP support).
@@ -269,6 +270,7 @@ def create_omniavatar_dataloader(
     dataset = OmniAvatarDataset(
         data_list_path=data_list_path,
         latentsync_mask_path=latentsync_mask_path,
+        load_ode_path=load_ode_path,
         **kwargs,
     )
 

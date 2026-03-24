@@ -15,6 +15,8 @@ from typing import Any, Dict, TYPE_CHECKING
 import torch
 
 from fastgen.methods.distribution_matching.self_forcing import SelfForcingModel
+from fastgen.utils import instantiate
+from fastgen.utils.distributed import synchronize, is_rank0
 import fastgen.utils.logging_utils as logger
 
 if TYPE_CHECKING:
@@ -26,12 +28,28 @@ class OmniAvatarSelfForcingModel(SelfForcingModel):
 
     Inherits the full Self-Forcing training loop (rollout_with_gradient, VSD loss,
     fake_score/discriminator updates). Only overrides data preparation to handle
-    OmniAvatar's condition dict format.
+    OmniAvatar's condition dict format, and build_model to support a separate
+    fake_score architecture (1.3B) from the teacher (14B).
     """
 
     def __init__(self, config: ModelConfig):
         super().__init__(config)
-        self._latentsync_mask = None
+
+    def build_model(self):
+        """Override to instantiate fake_score from config.fake_score if provided.
+
+        The base DMD2Model.build_model() always creates fake_score from
+        self.teacher_config (= config.teacher), which is 14B. When
+        config.fake_score is set, we use that instead (1.3B bidirectional).
+        """
+        super().build_model()
+
+        fake_score_config = getattr(self.config, "fake_score", None)
+        if fake_score_config is not None:
+            logger.info("Re-instantiating fake_score from config.fake_score (1.3B)")
+            with self._get_meta_init_context():
+                self.fake_score = instantiate(fake_score_config)
+            synchronize()
 
     def _prepare_training_data(self, data: Dict[str, Any]) -> tuple[torch.Tensor, Any, Any]:
         """Build OmniAvatar condition and neg_condition dicts from dataset output.

@@ -17,6 +17,7 @@ from fastgen.utils import LazyCall as L
 
 from fastgen.networks.OmniAvatar.network import OmniAvatarWan
 from fastgen.networks.OmniAvatar.network_causal import CausalOmniAvatarWan
+from fastgen.datasets.omniavatar_dataloader import create_omniavatar_dataloader
 
 # ---- Paths (override via CLI or env) ----
 OMNIAVATAR_ROOT = os.getenv("OMNIAVATAR_ROOT", "/home/work/.local/OmniAvatar")
@@ -114,8 +115,9 @@ def create_config():
     # Pretrained student from KD Stage 1 (uncomment when available):
     # config.model.pretrained_student_net_path = f"{CKPT_ROOT_DIR}/OmniAvatar/checkpoints/ode_init.pt"
 
-    # Timestep schedule
+    # Timestep schedule — shift=3.0 matches the OmniAvatar teacher's training distribution
     config.model.sample_t_cfg.time_dist_type = "shifted"
+    config.model.sample_t_cfg.shift = 3.0
     config.model.sample_t_cfg.min_t = 0.001
     config.model.sample_t_cfg.max_t = 0.999
     config.model.sample_t_cfg.t_list = [0.999, 0.937, 0.833, 0.624, 0.0]
@@ -126,8 +128,20 @@ def create_config():
     config.model.same_step_across_blocks = True
     config.model.context_noise = 0.0
 
+    # Dataloader
+    config.dataloader_train = L(create_omniavatar_dataloader)(
+        data_list_path=f"{DATA_ROOT}/video_square_path.txt",
+        latentsync_mask_path=os.getenv(
+            "LATENTSYNC_MASK_PATH",
+            "/home/work/.local/Self-Forcing_LipSync_StableAvatar/diffsynth/utils/mask.png",
+        ),
+        batch_size=1,
+        num_workers=4,
+        neg_text_emb_path=os.getenv("NEG_TEXT_EMB_PATH", None),
+        use_ref_sequence=True,
+    )
+
     # Training
-    config.dataloader_train.batch_size = 1
     config.trainer.max_iter = 5000
     config.trainer.logging_iter = 10
     config.trainer.save_ckpt_iter = 500
