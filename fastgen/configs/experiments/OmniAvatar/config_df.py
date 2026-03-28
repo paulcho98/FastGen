@@ -48,11 +48,13 @@ def create_config():
     config.model.net = CausalOmniAvatar_V2V_1_3B_Config
     config.model.net.total_num_frames = config.model.input_shape[1]
 
-    # Timestep schedule (same as ODE KD for consistency)
+    # Timestep schedule — shift=3.0 matches OmniAvatar's default scheduler
     config.model.sample_t_cfg.time_dist_type = "shifted"
+    config.model.sample_t_cfg.shift = 3.0
     config.model.sample_t_cfg.min_t = 0.001
     config.model.sample_t_cfg.max_t = 0.999
-    config.model.sample_t_cfg.t_list = [0.999, 0.937, 0.833, 0.624, 0.0]
+    # t_list derived from shift=3.0: new_t = 3*t / (1 + 2*t) applied to linspace(1,0,5)
+    config.model.sample_t_cfg.t_list = [0.999, 0.900, 0.750, 0.500, 0.0]
 
     # Diffusion forcing settings
     config.model.student_sample_steps = 4

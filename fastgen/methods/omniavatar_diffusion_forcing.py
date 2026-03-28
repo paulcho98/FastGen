@@ -38,8 +38,20 @@ class OmniAvatarDiffusionForcingModel(KDModel):
     def __init__(self, config: ModelConfig):
         super().__init__(config)
 
+    # Use CausVidModel's AR sample loop for visualization (chunk-by-chunk with KV cache).
+    # Without this, FastGenModel._student_sample_loop processes the entire video as one
+    # bidirectional pass, which doesn't reflect actual AR inference behavior.
+    _student_sample_loop = CausVidModel._student_sample_loop
+
     def _build_condition(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Build OmniAvatar condition dict from data batch.
+
+        Expected shapes (after collation, with batch dim):
+            text_embeds:    [B, 1, 512, 4096] or [B, 512, 4096]
+            audio_emb:      [B, 81, audio_dim]
+            mask:           [B, H, W] or [H, W]
+            masked_video:   [B, 16, T, H, W]
+            ref_sequence:   [B, 16, T, H, W] (optional)
 
         Args:
             data: Batch from OmniAvatarDataset.
@@ -47,6 +59,9 @@ class OmniAvatarDiffusionForcingModel(KDModel):
         Returns:
             Condition dict for OmniAvatar networks.
         """
+        for key in ("real", "text_embeds", "audio_emb", "mask", "masked_video"):
+            assert key in data, f"Missing required key '{key}' in data batch"
+
         real_data = data["real"]
         ref_latent = real_data[:, :, :1, :, :]  # [B, 16, 1, H, W]
 
@@ -54,8 +69,15 @@ class OmniAvatarDiffusionForcingModel(KDModel):
         if mask.dim() == 3:
             mask = mask[0]
 
+        text_embeds = data["text_embeds"]
+        if text_embeds.dim() == 4:
+            assert text_embeds.shape[1] == 1, (
+                f"text_embeds dim 1 must be 1 for squeeze, got shape {list(text_embeds.shape)}"
+            )
+            text_embeds = text_embeds.squeeze(1)
+
         condition = {
-            "text_embeds": data["text_embeds"].squeeze(1) if data["text_embeds"].dim() == 4 else data["text_embeds"],
+            "text_embeds": text_embeds,
             "audio_emb": data["audio_emb"],
             "ref_latent": ref_latent,
             "mask": mask,
@@ -84,7 +106,7 @@ class OmniAvatarDiffusionForcingModel(KDModel):
             context_noise=context_noise,
             precision_amp=self.precision_amp_infer,
         )
-        return {"gen_rand": gen_rand_func, "input_rand": noise, "gen_rand_train": gen_data}
+        return {"gen_rand": gen_rand_func, "input_rand": noise, "gen_rand_train": gen_data.detach()}
 
     def single_train_step(
         self, data: Dict[str, Any], iteration: int
@@ -122,7 +144,8 @@ class OmniAvatarDiffusionForcingModel(KDModel):
         # L2 loss
         loss = 0.5 * F.mse_loss(gen_data, real_data, reduction="mean")
 
-        loss_map = {"total_loss": loss, "recon_loss": loss}
-        outputs = self._get_outputs(gen_data, condition=condition)
+        # Outputs for logging (detached to avoid holding autograd references)
+        outputs = self._get_outputs(gen_data.detach(), condition=condition)
 
+        loss_map = {"total_loss": loss, "recon_loss": loss.detach()}
         return loss_map, outputs
