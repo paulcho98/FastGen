@@ -6,6 +6,9 @@ Experiment config for OmniAvatar Diffusion Forcing (Stage 1 alternative to ODE K
 
 Trains the causal 1.3B student on real data with inhomogeneous block-wise timesteps.
 No pre-computed ODE trajectories from the teacher are needed.
+
+Default: 4 GPU DDP, bs=16/GPU (effective 64), lr=5e-5, 5000 iters.
+Max per-GPU batch: 36 on H200 (143GB). Adjust via CLI if needed.
 """
 
 import os
@@ -15,7 +18,7 @@ from fastgen.utils import LazyCall as L
 from fastgen.networks.OmniAvatar.network_causal import CausalOmniAvatarWan
 from fastgen.datasets.omniavatar_dataloader import OmniAvatarDataLoader
 
-# ---- Paths ----
+# ---- Paths (override via env vars) ----
 OMNIAVATAR_ROOT = os.getenv("OMNIAVATAR_ROOT", "/home/work/.local/OmniAvatar")
 DATA_ROOT = os.getenv("OMNIAVATAR_DATA_ROOT", "/home/work/stableavatar_data/v2v_training_data")
 STUDENT_CKPT = os.getenv(
@@ -51,6 +54,9 @@ CausalOmniAvatar_V2V_1_3B_Config: dict = L(CausalOmniAvatarWan)(
 def create_config():
     config = config_df_default.create_config()
 
+    # Learning rate — matches OmniAvatar native training (5e-5)
+    config.model.net_optimizer.lr = 5e-5
+
     # Precision
     config.model.precision = "bfloat16"
     config.model.precision_fsdp = "float32"
@@ -77,20 +83,21 @@ def create_config():
     config.dataloader_train = L(OmniAvatarDataLoader)(
         data_list_path=DATA_LIST,
         latentsync_mask_path=MASK_PATH,
-        batch_size=1,
+        batch_size=16,
         num_workers=4,
         neg_text_emb_path=os.getenv("NEG_TEXT_EMB_PATH", None),
         use_ref_sequence=True,
         load_ode_path=False,
     )
 
-    # VAE for visual logging (optional — decodes latents to video for wandb)
+    # VAE for visual logging (decodes latents to video for wandb)
     config.model.vae_path = VAE_PATH
 
     # Training
     config.trainer.max_iter = 5000
-    config.trainer.logging_iter = 10
+    config.trainer.logging_iter = 1
     config.trainer.save_ckpt_iter = 500
+    config.trainer.callbacks.wandb.sample_logging_iter = 500
 
     config.log_config.group = "omniavatar_df"
     return config
