@@ -21,6 +21,7 @@ from fastgen.configs.callbacks import (
 @attrs.define(slots=False)
 class ModelConfig(BaseModelConfig):
     context_noise: float = 0.0
+    vae_path: str = ""  # Path to WanVAE for visual logging (optional)
 
 
 @attrs.define(slots=False)

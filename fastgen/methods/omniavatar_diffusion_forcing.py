@@ -44,29 +44,60 @@ class OmniAvatarDiffusionForcingModel(KDModel):
     def build_model(self):
         """Build model and optionally load VAE for visual logging."""
         super().build_model()
-        vae_path = getattr(self.config, "vae_path", None)
+        vae_path = getattr(self.config, "vae_path", "") or ""
         if vae_path and os.path.exists(vae_path):
             self._load_vae(vae_path)
 
     def _load_vae(self, vae_path: str):
-        """Load WanVAE for decoding generated samples in wandb visual logging."""
-        # wan.modules.vae needs the OmniAvatar-Train repo on sys.path
-        omni_train_root = os.environ.get("OMNIAVATAR_ROOT", "")
-        if omni_train_root and omni_train_root not in sys.path:
-            sys.path.insert(0, omni_train_root)
+        """Load WanVideoVAE for decoding generated samples in wandb visual logging.
+
+        The wandb callback calls model.net.vae.decode(tensor) with a single [B,C,T,H,W] tensor.
+        WanVideoVAE.decode expects (hidden_states_list, device). We wrap it for compatibility.
+        """
+        omni_root = os.environ.get("OMNIAVATAR_ROOT", "")
+        if omni_root:
+            omni_model_dir = os.path.join(omni_root, "OmniAvatar", "models")
+            if omni_model_dir not in sys.path:
+                sys.path.insert(0, os.path.join(omni_root, "OmniAvatar"))
+            if omni_root not in sys.path:
+                sys.path.insert(0, omni_root)
 
         try:
-            from wan.modules.vae import WanVAE
+            from models.wan_video_vae import WanVideoVAE
         except ImportError:
             logger.warning(
-                f"Could not import WanVAE — visual logging disabled. "
-                f"Set OMNIAVATAR_ROOT to the OmniAvatar-Train repo root."
+                "Could not import WanVideoVAE — visual logging disabled. "
+                "Set OMNIAVATAR_ROOT to the OmniAvatar repo root."
             )
             return
 
+        # Load VAE weights — checkpoint keys lack "model." prefix, use converter
+        raw_vae = WanVideoVAE(z_dim=16)
+        vae_state = torch.load(vae_path, map_location="cpu", weights_only=False)
+        # Add "model." prefix to match WanVideoVAE's self.model attribute
+        if any(k.startswith("encoder.") for k in vae_state):
+            vae_state = {f"model.{k}": v for k, v in vae_state.items()}
+        raw_vae.load_state_dict(vae_state)
         device_str = f"cuda:{self.device}" if isinstance(self.device, int) else str(self.device)
-        self.net.vae = WanVAE(vae_pth=vae_path, device=device_str)
-        logger.info(f"Loaded WanVAE from {vae_path} for visual logging")
+        raw_vae = raw_vae.to(device_str).eval()
+
+        # Wrap decode to match wandb callback's expected interface: decode(tensor) -> tensor
+        class VAEWrapper:
+            def __init__(self, vae, device):
+                self._vae = vae
+                self._device = device
+
+            def decode(self, x):
+                """Decode [B, C, T, H, W] latent to [B, 3, T*4, H*8, W*8] pixel video."""
+                with torch.no_grad():
+                    # WanVideoVAE.decode expects list of [C,T,H,W] tensors in float32
+                    return self._vae.decode([xi.float() for xi in x], self._device)
+
+            def to(self, *args, **kwargs):
+                return self
+
+        self.net.vae = VAEWrapper(raw_vae, device_str)
+        logger.info(f"Loaded WanVideoVAE from {vae_path} for visual logging")
 
     # Use CausVidModel's AR sample loop for visualization (chunk-by-chunk with KV cache).
     # Without this, FastGenModel._student_sample_loop processes the entire video as one

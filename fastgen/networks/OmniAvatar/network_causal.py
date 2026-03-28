@@ -921,6 +921,14 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
             self._load_weights(base_model_paths, omniavatar_ckpt_path)
             self.to(self._default_dtype)
 
+    def init_preprocessors(self):
+        """No-op — VAE loaded by build_model, no text encoder needed.
+
+        This method's existence signals to the wandb callback that
+        this network supports VAE decode for visual logging.
+        """
+        pass
+
     # ------------------------------------------------------------------
     # Unpatchify
     # ------------------------------------------------------------------

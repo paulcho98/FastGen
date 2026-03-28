@@ -17,11 +17,12 @@ from fastgen.datasets.omniavatar_dataloader import OmniAvatarDataLoader
 
 # ---- Paths ----
 OMNIAVATAR_ROOT = os.getenv("OMNIAVATAR_ROOT", "/home/work/.local/OmniAvatar")
+DATA_ROOT = os.getenv("OMNIAVATAR_DATA_ROOT", "/home/work/stableavatar_data/v2v_training_data")
 STUDENT_CKPT = os.getenv("OMNIAVATAR_STUDENT_CKPT", None)
-DATA_LIST = os.getenv("OMNIAVATAR_DATA_LIST", "")
+DATA_LIST = os.getenv("OMNIAVATAR_DATA_LIST", f"{DATA_ROOT}/video_square_path.txt")
 MASK_PATH = os.getenv(
     "OMNIAVATAR_MASK_PATH",
-    os.path.join(OMNIAVATAR_ROOT, "OmniAvatar/utils/latentsync/mask.png"),
+    "/home/work/.local/Self-Forcing_LipSync_StableAvatar/diffsynth/utils/mask.png",
 )
 VAE_PATH = os.getenv(
     "OMNIAVATAR_VAE_PATH",
@@ -74,12 +75,13 @@ def create_config():
         data_list_path=DATA_LIST,
         latentsync_mask_path=MASK_PATH,
         batch_size=1,
-        num_workers=2,
+        num_workers=4,
+        neg_text_emb_path=os.getenv("NEG_TEXT_EMB_PATH", None),
         use_ref_sequence=True,
         load_ode_path=False,
     )
 
-    # VAE for visual logging (optional — set OMNIAVATAR_VAE_PATH)
+    # VAE for visual logging (optional — decodes latents to video for wandb)
     config.model.vae_path = VAE_PATH
 
     # Training
