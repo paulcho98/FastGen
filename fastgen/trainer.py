@@ -173,7 +173,9 @@ class Trainer:
         self.callbacks.on_train_begin(model, iteration=iter_start)
         logger.info(f"iter_start: {iter_start}")
 
-        if iter_start == 0 and dataloader_val is not None:
+        if iter_start == 0 and dataloader_val is not None and not getattr(
+            self.config.trainer, "skip_initial_validation", False
+        ):
             # validation before first training step
             self.validate(model_ddp, model, dataloader_val, iteration=iter_start)
 

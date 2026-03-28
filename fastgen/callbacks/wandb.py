@@ -323,6 +323,8 @@ class WandbCallback(Callback):
         self.validation_logging_step = validation_logging_step
         self.sample_logging_iter = sample_logging_iter
         self.val_sample_map = None
+        self._val_gen_videos: list[torch.Tensor] = []
+        self._val_gt_videos: list[torch.Tensor] = []
         self.vid_format = vid_format
         self.fps = fps
         self.loss_dict_record = _LossDictRecord()
@@ -337,6 +339,35 @@ class WandbCallback(Callback):
             self.offload_module_in_decoding = False
         if self.sample_logging_iter is None:
             self.sample_logging_iter = self.config.trainer.logging_iter
+        synchronize()
+
+    @rank0_only
+    def on_dataloader_init_end(
+        self, model: FastGenModel, dataloader_train, dataloader_val, iteration: int = 0
+    ) -> None:
+        """Upload GT validation videos at the start so they're always available for comparison."""
+        if dataloader_val is None or not wandb.run:
+            return
+        if not hasattr(model.net, "vae"):
+            logger.info("No VAE loaded — skipping GT val video upload")
+            return
+
+        logger.info("Uploading GT validation videos to wandb...")
+        device = model.device
+        try:
+            gt_videos = []
+            with torch.no_grad(), basic_utils.inference_mode(
+                precision_amp=model.precision_amp_enc, device_type=device.type
+            ):
+                for step, data in enumerate(dataloader_val):
+                    real = data["real"].to(device)  # [1, 16, 21, 64, 64]
+                    decoded = model.net.vae.decode(real[:1])  # [1, C, T, H, W]
+                    gt_videos.append(self._to_uint8_video(decoded))
+            gt_list = [wandb.Video(v[0].numpy(), fps=self.fps, format="mp4") for v in gt_videos]
+            wandb.log({"val_gt/videos": gt_list}, step=0)
+            logger.info(f"Uploaded {len(gt_videos)} GT validation videos to wandb")
+        except Exception as e:
+            logger.warning(f"Failed to upload GT val videos: {e}")
         synchronize()
 
     @rank0_only
@@ -533,6 +564,16 @@ class WandbCallback(Callback):
             time_taken = time.perf_counter() - time_start
             logger.info(f"WandB logging complete after {time_taken:.2f} seconds")
 
+    @staticmethod
+    def _to_uint8_video(tensor: torch.Tensor, normalized: bool = False) -> torch.Tensor:
+        """Convert [B, C, T, H, W] float video to [B, T, C, H, W] uint8 on CPU."""
+        t = tensor.permute(0, 2, 1, 3, 4)  # [B, C, T, H, W] -> [B, T, C, H, W]
+        if normalized:
+            t = t.mul(255.0)
+        else:
+            t = t.mul(127.5).add(127.5)
+        return t.clamp(0, 255).to(torch.uint8).cpu()
+
     def on_validation_step_end(
         self,
         model: FastGenModel,
@@ -546,9 +587,42 @@ class WandbCallback(Callback):
         self.val_loss_dict_record.add(loss_dict)
 
         if step % self.validation_logging_step == 0:
-            self.log_sample_map(
-                model, data_batch, output_batch, suffix=f"_{step}", iteration=iteration, group=f"val{idx}"
-            )
+            has_vae = hasattr(model.net, "vae")
+            if not has_vae:
+                return
+
+            # AR-generate the video
+            gen_rand = output_batch.get("gen_rand")
+            if gen_rand is not None and isinstance(gen_rand, Callable):
+                synchronize()
+                gen_rand = gen_rand()
+                synchronize()
+
+            if gen_rand is None:
+                return
+
+            device = model.device
+            with torch.no_grad(), basic_utils.inference_mode(
+                precision_amp=model.precision_amp_enc, device_type=device.type
+            ):
+                gen_decoded = model.net.vae.decode(gen_rand[:1])
+                gt_decoded = model.net.vae.decode(data_batch["real"][:1].to(device))
+
+            self._val_gen_videos.append(self._to_uint8_video(gen_decoded))
+            self._val_gt_videos.append(self._to_uint8_video(gt_decoded))
+
+            gc.collect()
+            torch.cuda.empty_cache()
 
     def on_validation_end(self, model: FastGenModel, iteration: int = 0, idx: int = 0) -> None:
         self.log_stats(self.val_loss_dict_record, iteration=iteration, group=f"val{idx}")
+        if wandb.run and self._val_gen_videos:
+            gen_list = [wandb.Video(v[0].numpy(), fps=self.fps, format="mp4") for v in self._val_gen_videos]
+            gt_list = [wandb.Video(v[0].numpy(), fps=self.fps, format="mp4") for v in self._val_gt_videos]
+            wandb.log({
+                f"val{idx}/generated": gen_list,
+                f"val{idx}/reconstructed": gt_list,
+            }, step=iteration)
+            logger.info(f"Logged {len(self._val_gen_videos)} val videos at iteration {iteration}")
+        self._val_gen_videos = []
+        self._val_gt_videos = []

@@ -10,7 +10,8 @@
 # Effective batch size: 16 * 4 GPUs = 64
 # LR: 5e-5 (matching OmniAvatar native training)
 # Loss logging: every step
-# Video visualization: every 500 steps (10 samples, 25fps with audio)
+# Video visualization: every 500 steps (25fps with audio)
+# Validation: 10 fixed samples, every 500 steps (AR generation + VAE decode)
 # Checkpoints: every 500 steps
 #
 # Memory: ~48 GB peak per GPU (bs=16 on H200 143GB)
@@ -46,6 +47,7 @@ echo "  Max iterations:  ${MAX_ITER}"
 echo "  Checkpoint:      ${OMNIAVATAR_STUDENT_CKPT:-/home/work/output_omniavatar_v2v_1.3B_phase2/step-19500.pt}"
 echo "  Save every:      ${SAVE_EVERY} steps"
 echo "  Visualize every: ${VIZ_EVERY} steps"
+echo "  Validate every:  ${SAVE_EVERY} steps (10 fixed samples)"
 echo "  Run name:        ${RUN_NAME}"
 echo "============================================="
 echo ""

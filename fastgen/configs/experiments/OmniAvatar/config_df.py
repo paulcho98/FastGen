@@ -16,7 +16,7 @@ import fastgen.configs.methods.config_omniavatar_df as config_df_default
 
 from fastgen.utils import LazyCall as L
 from fastgen.networks.OmniAvatar.network_causal import CausalOmniAvatarWan
-from fastgen.datasets.omniavatar_dataloader import OmniAvatarDataLoader
+from fastgen.datasets.omniavatar_dataloader import OmniAvatarDataLoader, create_omniavatar_dataloader
 
 # ---- Paths (override via env vars) ----
 OMNIAVATAR_ROOT = os.getenv("OMNIAVATAR_ROOT", "/home/work/.local/OmniAvatar")
@@ -26,6 +26,7 @@ STUDENT_CKPT = os.getenv(
     "/home/work/output_omniavatar_v2v_1.3B_phase2/step-19500.pt",
 )
 DATA_LIST = os.getenv("OMNIAVATAR_DATA_LIST", f"{DATA_ROOT}/video_square_path.txt")
+VAL_LIST = os.getenv("OMNIAVATAR_VAL_LIST", f"{DATA_ROOT}/video_square_val10.txt")
 MASK_PATH = os.getenv(
     "OMNIAVATAR_MASK_PATH",
     "/home/work/.local/Self-Forcing_LipSync_StableAvatar/diffsynth/utils/mask.png",
@@ -90,6 +91,17 @@ def create_config():
         load_ode_path=False,
     )
 
+    # Validation dataloader — 10 fixed samples, finite iterator, batch_size=1
+    config.dataloader_val = L(create_omniavatar_dataloader)(
+        data_list_path=VAL_LIST,
+        latentsync_mask_path=MASK_PATH,
+        batch_size=1,
+        num_workers=2,
+        neg_text_emb_path=os.getenv("NEG_TEXT_EMB_PATH", None),
+        use_ref_sequence=True,
+        load_ode_path=False,
+    )
+
     # VAE for visual logging (decodes latents to video for wandb)
     config.model.vae_path = VAE_PATH
 
@@ -97,6 +109,8 @@ def create_config():
     config.trainer.max_iter = 10000
     config.trainer.logging_iter = 1
     config.trainer.save_ckpt_iter = 500
+    config.trainer.validation_iter = 500
+    config.trainer.skip_initial_validation = True
     config.trainer.callbacks.wandb.sample_logging_iter = 500
 
     config.log_config.group = "omniavatar_df"

@@ -189,6 +189,8 @@ class BaseTrainerConfig:
     save_ckpt_iter: int = 5000
     # test on validation set frequency
     validation_iter: int = 1000
+    # skip validation before first training step (avoids compilation hang with FlexAttention)
+    skip_initial_validation: bool = False
     # logging frequency
     logging_iter: int = 1000
     # maximum training iteration
