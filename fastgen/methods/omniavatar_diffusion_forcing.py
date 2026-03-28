@@ -12,6 +12,8 @@ No teacher model or ODE generation needed.
 
 from __future__ import annotations
 
+import os
+import sys
 from typing import Any, Dict, TYPE_CHECKING, Callable
 from functools import partial
 
@@ -37,6 +39,34 @@ class OmniAvatarDiffusionForcingModel(KDModel):
 
     def __init__(self, config: ModelConfig):
         super().__init__(config)
+        self._vae_load_attempted = False
+
+    def build_model(self):
+        """Build model and optionally load VAE for visual logging."""
+        super().build_model()
+        vae_path = getattr(self.config, "vae_path", None)
+        if vae_path and os.path.exists(vae_path):
+            self._load_vae(vae_path)
+
+    def _load_vae(self, vae_path: str):
+        """Load WanVAE for decoding generated samples in wandb visual logging."""
+        # wan.modules.vae needs the OmniAvatar-Train repo on sys.path
+        omni_train_root = os.environ.get("OMNIAVATAR_ROOT", "")
+        if omni_train_root and omni_train_root not in sys.path:
+            sys.path.insert(0, omni_train_root)
+
+        try:
+            from wan.modules.vae import WanVAE
+        except ImportError:
+            logger.warning(
+                f"Could not import WanVAE — visual logging disabled. "
+                f"Set OMNIAVATAR_ROOT to the OmniAvatar-Train repo root."
+            )
+            return
+
+        device_str = f"cuda:{self.device}" if isinstance(self.device, int) else str(self.device)
+        self.net.vae = WanVAE(vae_pth=vae_path, device=device_str)
+        logger.info(f"Loaded WanVAE from {vae_path} for visual logging")
 
     # Use CausVidModel's AR sample loop for visualization (chunk-by-chunk with KV cache).
     # Without this, FastGenModel._student_sample_loop processes the entire video as one
@@ -94,19 +124,24 @@ class OmniAvatarDiffusionForcingModel(KDModel):
         input_student: torch.Tensor = None,
         condition: Any = None,
     ) -> Dict[str, torch.Tensor | Callable]:
-        noise = torch.randn_like(gen_data, dtype=self.precision)
-        context_noise = getattr(self.config, "context_noise", 0)
-        gen_rand_func = partial(
-            CausVidModel.generator_fn,
-            net=self.net_inference,
-            noise=noise,
-            condition=condition,
-            student_sample_steps=self.config.student_sample_steps,
-            t_list=self.config.sample_t_cfg.t_list,
-            context_noise=context_noise,
-            precision_amp=self.precision_amp_infer,
-        )
-        return {"gen_rand": gen_rand_func, "input_rand": noise, "gen_rand_train": gen_data.detach()}
+        has_vae = hasattr(self.net, "vae")
+        if not has_vae:
+            logger.debug("No VAE loaded on net — visual logging disabled")
+        if has_vae and condition is not None:
+            noise = torch.randn_like(gen_data, dtype=self.precision)
+            context_noise = getattr(self.config, "context_noise", 0)
+            gen_rand_func = partial(
+                CausVidModel.generator_fn,
+                net=self.net_inference,
+                noise=noise,
+                condition=condition,
+                student_sample_steps=self.config.student_sample_steps,
+                t_list=self.config.sample_t_cfg.t_list,
+                context_noise=context_noise,
+                precision_amp=self.precision_amp_infer,
+            )
+            return {"gen_rand": gen_rand_func, "input_rand": noise, "gen_rand_train": gen_data.detach()}
+        return {"gen_rand_train": gen_data.detach()}
 
     def single_train_step(
         self, data: Dict[str, Any], iteration: int

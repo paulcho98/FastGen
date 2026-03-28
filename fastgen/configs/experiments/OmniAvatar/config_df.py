@@ -13,10 +13,20 @@ import fastgen.configs.methods.config_omniavatar_df as config_df_default
 
 from fastgen.utils import LazyCall as L
 from fastgen.networks.OmniAvatar.network_causal import CausalOmniAvatarWan
+from fastgen.datasets.omniavatar_dataloader import OmniAvatarDataLoader
 
 # ---- Paths ----
 OMNIAVATAR_ROOT = os.getenv("OMNIAVATAR_ROOT", "/home/work/.local/OmniAvatar")
 STUDENT_CKPT = os.getenv("OMNIAVATAR_STUDENT_CKPT", None)
+DATA_LIST = os.getenv("OMNIAVATAR_DATA_LIST", "")
+MASK_PATH = os.getenv(
+    "OMNIAVATAR_MASK_PATH",
+    os.path.join(OMNIAVATAR_ROOT, "OmniAvatar/utils/latentsync/mask.png"),
+)
+VAE_PATH = os.getenv(
+    "OMNIAVATAR_VAE_PATH",
+    os.path.join(OMNIAVATAR_ROOT, "pretrained_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth"),
+)
 
 # ---- Student network config ----
 CausalOmniAvatar_V2V_1_3B_Config: dict = L(CausalOmniAvatarWan)(
@@ -59,8 +69,20 @@ def create_config():
     # Diffusion forcing settings
     config.model.student_sample_steps = 4
 
+    # Dataloader
+    config.dataloader_train = L(OmniAvatarDataLoader)(
+        data_list_path=DATA_LIST,
+        latentsync_mask_path=MASK_PATH,
+        batch_size=1,
+        num_workers=2,
+        use_ref_sequence=True,
+        load_ode_path=False,
+    )
+
+    # VAE for visual logging (optional — set OMNIAVATAR_VAE_PATH)
+    config.model.vae_path = VAE_PATH
+
     # Training
-    config.dataloader_train.batch_size = 1
     config.trainer.max_iter = 5000
     config.trainer.logging_iter = 10
     config.trainer.save_ckpt_iter = 500
