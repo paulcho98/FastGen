@@ -222,7 +222,8 @@ def init_wandb(config: BaseConfig):
     logger.info(f"wandb_config.save_path: {wandb_config.save_path}")
     os.makedirs(wandb_config.save_path, exist_ok=True)
     wandb_id_path = f"{wandb_config.save_path}/wandb_id.txt"
-    if os.path.isfile(wandb_id_path):
+    resuming = getattr(config.trainer, "resume", True)
+    if os.path.isfile(wandb_id_path) and resuming:
         wandb_id = open(wandb_id_path, encoding="utf-8").read().strip()
         logger.info(f"Resuming with an existing wandb id: {wandb_id}")
     else:
