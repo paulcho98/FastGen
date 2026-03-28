@@ -54,8 +54,8 @@ CausalOmniAvatar_V2V_1_3B_Config: dict = L(CausalOmniAvatarWan)(
 def create_config():
     config = config_df_default.create_config()
 
-    # Learning rate — matches OmniAvatar native training (5e-5)
-    config.model.net_optimizer.lr = 5e-5
+    # Learning rate
+    config.model.net_optimizer.lr = 1e-5
 
     # Precision
     config.model.precision = "bfloat16"
@@ -94,7 +94,7 @@ def create_config():
     config.model.vae_path = VAE_PATH
 
     # Training
-    config.trainer.max_iter = 5000
+    config.trainer.max_iter = 10000
     config.trainer.logging_iter = 1
     config.trainer.save_ckpt_iter = 500
     config.trainer.callbacks.wandb.sample_logging_iter = 500

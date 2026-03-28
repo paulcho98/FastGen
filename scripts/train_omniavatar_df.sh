@@ -24,7 +24,7 @@
 set -euo pipefail
 
 NGPU="${NGPU:-4}"
-MAX_ITER="${MAX_ITER:-5000}"
+MAX_ITER="${MAX_ITER:-10000}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 SAVE_EVERY="${SAVE_EVERY:-500}"
 VIZ_EVERY="${VIZ_EVERY:-500}"
@@ -34,14 +34,14 @@ export WANDB_API_KEY="${WANDB_API_KEY:-wandb_v1_BbStOJ2ik6OQaZB4DfoNAu5XKZn_IUpI
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 EFFECTIVE_BS=$((BATCH_SIZE * NGPU))
-RUN_NAME="df_${NGPU}gpu_bs${BATCH_SIZE}_lr5e5_${MAX_ITER}iter"
+RUN_NAME="df_${NGPU}gpu_bs${BATCH_SIZE}_lr1e5_${MAX_ITER}iter"
 
 echo "============================================="
 echo "  OmniAvatar Diffusion Forcing Training"
 echo "============================================="
 echo "  GPUs:            ${NGPU}"
 echo "  Batch size:      ${BATCH_SIZE}/GPU × ${NGPU} = ${EFFECTIVE_BS}"
-echo "  Learning rate:   5e-5"
+echo "  Learning rate:   1e-5"
 echo "  Max iterations:  ${MAX_ITER}"
 echo "  Checkpoint:      ${OMNIAVATAR_STUDENT_CKPT:-/home/work/output_omniavatar_v2v_1.3B_phase2/step-19500.pt}"
 echo "  Save every:      ${SAVE_EVERY} steps"
