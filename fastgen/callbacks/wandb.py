@@ -348,6 +348,9 @@ class WandbCallback(Callback):
         """Upload GT validation videos at the start so they're always available for comparison."""
         if dataloader_val is None or not wandb.run:
             return
+        if iteration > 0:
+            logger.info("Resuming from checkpoint — skipping GT val video upload (already logged)")
+            return
         if not hasattr(model.net, "vae"):
             logger.info("No VAE loaded — skipping GT val video upload")
             return

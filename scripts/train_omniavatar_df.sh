@@ -29,6 +29,7 @@ MAX_ITER="${MAX_ITER:-10000}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 SAVE_EVERY="${SAVE_EVERY:-500}"
 VIZ_EVERY="${VIZ_EVERY:-500}"
+RESUME="${RESUME:-False}"
 
 export OMNIAVATAR_ROOT="${OMNIAVATAR_ROOT:-/home/work/.local/OmniAvatar}"
 export WANDB_API_KEY="${WANDB_API_KEY:-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}"
@@ -60,6 +61,7 @@ echo ""
     trainer.ddp=True \
     trainer.max_iter=${MAX_ITER} \
     trainer.save_ckpt_iter=${SAVE_EVERY} \
+    trainer.resume=${RESUME} \
     log_config.group="omniavatar_df" \
     log_config.name="${RUN_NAME}" \
     log_config.project="OmniAvatar-FastGen"
