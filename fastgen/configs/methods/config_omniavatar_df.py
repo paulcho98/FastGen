@@ -9,6 +9,7 @@ from omegaconf import DictConfig
 from fastgen.utils import LazyCall as L
 from fastgen.configs.config import BaseConfig, BaseModelConfig
 from fastgen.methods.omniavatar_diffusion_forcing import OmniAvatarDiffusionForcingModel
+from fastgen.callbacks.wandb import WandbCallback
 from fastgen.configs.callbacks import (
     WANDB_CALLBACK,
     GradClip_CALLBACK,
@@ -34,13 +35,15 @@ class Config(BaseConfig):
 
 def create_config():
     config = Config()
+    # OmniAvatar uses 25fps video
+    OMNIAVATAR_WANDB = dict(wandb=L(WandbCallback)(sample_logging_iter=None, fps=25))
     config.trainer.callbacks = DictConfig(
         {
             **GradClip_CALLBACK,
             **GPUStats_CALLBACK,
             **TrainProfiler_CALLBACK,
             **ParamCount_CALLBACK,
-            **WANDB_CALLBACK,
+            **OMNIAVATAR_WANDB,
         }
     )
 

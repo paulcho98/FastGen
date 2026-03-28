@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 import os
+import subprocess
+import tempfile
 from dataclasses import dataclass, field
 import time
 from typing import Optional, Dict, Callable, TYPE_CHECKING
@@ -26,6 +28,81 @@ from fastgen.utils import logging_utils as logger
 if TYPE_CHECKING:
     from fastgen.configs.config import BaseConfig
     from fastgen.methods import FastGenModel
+
+
+def tensor_to_wandb_video_with_audio(
+    video_tensor: torch.Tensor,
+    audio_path: str,
+    fps: int = 25,
+    vid_format: str = "mp4",
+    caption: str | None = None,
+) -> wandb.Video:
+    """Convert a [B, T, C, H, W] uint8 video tensor + audio file to wandb.Video with audio.
+
+    Takes the first sample in the batch. Writes video to a temp file, muxes audio
+    with ffmpeg, and returns a wandb.Video from the muxed output.
+
+    Args:
+        video_tensor: uint8 tensor of shape [B, T, C, H, W] (already in 0-255 range).
+        audio_path: Path to the audio .wav file.
+        fps: Video frame rate (default 25 for OmniAvatar).
+        vid_format: Video format (default "mp4").
+        caption: Optional caption for wandb.Video.
+
+    Returns:
+        wandb.Video with muxed audio, or silent video if muxing fails.
+    """
+    try:
+        # Take first sample: [T, C, H, W]
+        vid = video_tensor[0] if video_tensor.dim() == 5 else video_tensor
+        # Convert to [T, H, W, C] uint8 on CPU
+        vid = vid.permute(0, 2, 3, 1).cpu()
+
+        tmpdir = tempfile.mkdtemp()
+        silent_path = os.path.join(tmpdir, f"silent.{vid_format}")
+        muxed_path = os.path.join(tmpdir, f"muxed.{vid_format}")
+
+        # Write silent video — try torchvision.io first, fall back to raw ffmpeg pipe
+        T, H, W, C = vid.shape
+        try:
+            torchvision.io.write_video(silent_path, vid, fps=fps, video_codec="libx264")
+        except Exception:
+            # Fallback: pipe raw frames to ffmpeg
+            write_cmd = [
+                "ffmpeg", "-y",
+                "-f", "rawvideo", "-pix_fmt", "rgb24",
+                "-s", f"{W}x{H}", "-r", str(fps),
+                "-i", "pipe:0",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-loglevel", "error",
+                silent_path,
+            ]
+            proc = subprocess.run(write_cmd, input=vid.numpy().tobytes(), capture_output=True, timeout=60)
+            if proc.returncode != 0:
+                raise RuntimeError(f"ffmpeg raw write failed: {proc.stderr.decode()}")
+
+        # Mux audio with ffmpeg
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", silent_path,
+            "-i", audio_path,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-shortest",
+            "-loglevel", "error",
+            muxed_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=30)
+
+        if result.returncode == 0 and os.path.exists(muxed_path):
+            return wandb.Video(muxed_path, fps=fps, format=vid_format, caption=caption)
+        else:
+            logger.warning(f"ffmpeg muxing failed (rc={result.returncode}): {result.stderr.decode()}")
+            return wandb.Video(video_tensor[:1].cpu().numpy(), fps=fps, format=vid_format, caption=caption)
+
+    except Exception as e:
+        logger.warning(f"Audio muxing failed, falling back to silent video: {e}")
+        return wandb.Video(video_tensor[:1].cpu().numpy(), fps=fps, format=vid_format, caption=caption)
 
 
 def to_wandb(
@@ -84,6 +161,51 @@ def to_wandb(
         image_grid = torchvision.utils.make_grid(tensor, nrow=4, pad_value=1)
         image_grid = tv_F.to_pil_image(image_grid)
         return wandb.Image(image_grid, caption=caption)
+
+
+def _to_wandb_with_audio(
+    tensor: torch.Tensor,
+    audio_path: str,
+    fps: int = 25,
+    rgb_range: float = 255.0,
+    normalized: bool = False,
+    vid_format: str = "mp4",
+    caption: str | None = None,
+    channel_before_time: bool = True,
+) -> wandb.Video:
+    """Convert a video tensor to wandb.Video with audio muxed in.
+
+    Handles the same normalization as to_wandb, then delegates to
+    tensor_to_wandb_video_with_audio for ffmpeg muxing.
+
+    Args:
+        tensor: [B, C, T, H, W] or [B, T, C, H, W] video tensor in [-1,1] or [0,1] range.
+        audio_path: Path to audio .wav file.
+        fps: Frame rate for the output video.
+        rgb_range: Target RGB range (255).
+        normalized: Whether tensor is in [0,1] (True) or [-1,1] (False).
+        vid_format: Video file format.
+        caption: Optional caption.
+        channel_before_time: Whether tensor is [B,C,T,H,W] (True) or [B,T,C,H,W] (False).
+
+    Returns:
+        wandb.Video with audio.
+    """
+    if channel_before_time:
+        tensor = tensor.permute(0, 2, 1, 3, 4)  # [B,C,T,H,W] -> [B,T,C,H,W]
+
+    # Normalize to uint8
+    if normalized:
+        factor = rgb_range
+        offset = 0.0
+    else:
+        factor = rgb_range / 2.0
+        offset = rgb_range / 2.0
+    tensor = tensor[:1].mul(factor).add(offset).clip_(0, rgb_range).to(torch.uint8)
+
+    return tensor_to_wandb_video_with_audio(
+        tensor, audio_path, fps=fps, vid_format=vid_format, caption=caption,
+    )
 
 
 @rank0_only
@@ -193,6 +315,7 @@ class WandbCallback(Callback):
         validation_logging_step: int = 1,
         sample_logging_iter: Optional[int] = None,
         vid_format: str = "mp4",
+        fps: int = 16,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -201,6 +324,7 @@ class WandbCallback(Callback):
         self.sample_logging_iter = sample_logging_iter
         self.val_sample_map = None
         self.vid_format = vid_format
+        self.fps = fps
         self.loss_dict_record = _LossDictRecord()
         self.val_loss_dict_record = _LossDictRecord()
 
@@ -313,15 +437,41 @@ class WandbCallback(Callback):
                 caption = "\n".join(data_batch["condition_raw"][: len(gen_rand)])
             else:
                 caption = None
+
+            # Check for audio path (from OmniAvatar dataloader) for audio-muxed video logging.
+            # The dataloader sets audio_path="" when audio.wav doesn't exist.
+            audio_path = None
+            if "audio_path" in data_batch:
+                ap = data_batch["audio_path"]
+                # default_collate turns strings into a list
+                if isinstance(ap, (list, tuple)) and len(ap) > 0:
+                    audio_path = ap[0] if ap[0] else None
+                elif isinstance(ap, str):
+                    audio_path = ap if ap else None
+                # Verify the file actually exists
+                if audio_path and not os.path.isfile(audio_path):
+                    logger.warning(f"audio_path does not exist, logging silent video: {audio_path}")
+                    audio_path = None
+
             if isinstance(gen_rand, dict):
                 for k in gen_rand:
                     sample_map[f"student/generation/{k}"] = to_wandb(
                         gen_rand[k], caption=caption, vid_format=self.vid_format
                     )
             else:
-                sample_map["student/generation"] = to_wandb(gen_rand, caption=caption, vid_format=self.vid_format)
+                if audio_path and gen_rand.ndim == 5:
+                    sample_map["student/generation"] = _to_wandb_with_audio(
+                        gen_rand, audio_path, fps=self.fps, vid_format=self.vid_format, caption=caption,
+                    )
+                else:
+                    sample_map["student/generation"] = to_wandb(gen_rand, caption=caption, vid_format=self.vid_format, fps=self.fps)
             if "real" in data_batch:
-                sample_map["data/real"] = to_wandb(data_batch["real"], caption=caption, vid_format=self.vid_format)
+                if audio_path and data_batch["real"].ndim == 5:
+                    sample_map["data/real"] = _to_wandb_with_audio(
+                        data_batch["real"], audio_path, fps=self.fps, vid_format=self.vid_format, caption=caption,
+                    )
+                else:
+                    sample_map["data/real"] = to_wandb(data_batch["real"], caption=caption, vid_format=self.vid_format, fps=self.fps)
             if "gen_teacher" in output_batch:
                 sample_map["teacher/generation"] = to_wandb(
                     output_batch["gen_teacher"], caption=caption, vid_format=self.vid_format

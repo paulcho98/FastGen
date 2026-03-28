@@ -18,7 +18,10 @@ from fastgen.datasets.omniavatar_dataloader import OmniAvatarDataLoader
 # ---- Paths ----
 OMNIAVATAR_ROOT = os.getenv("OMNIAVATAR_ROOT", "/home/work/.local/OmniAvatar")
 DATA_ROOT = os.getenv("OMNIAVATAR_DATA_ROOT", "/home/work/stableavatar_data/v2v_training_data")
-STUDENT_CKPT = os.getenv("OMNIAVATAR_STUDENT_CKPT", None)
+STUDENT_CKPT = os.getenv(
+    "OMNIAVATAR_STUDENT_CKPT",
+    "/home/work/output_omniavatar_v2v_1.3B_phase2/step-19500.pt",
+)
 DATA_LIST = os.getenv("OMNIAVATAR_DATA_LIST", f"{DATA_ROOT}/video_square_path.txt")
 MASK_PATH = os.getenv(
     "OMNIAVATAR_MASK_PATH",

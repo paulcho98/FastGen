@@ -149,6 +149,11 @@ class OmniAvatarDataset(Dataset):
                 "neg_text_embeds": self.neg_text_embeds.clone(),
             }
 
+            # Audio file path for wandb video logging with audio muxing.
+            # Always include key so default_collate doesn't fail on mixed-key batches.
+            audio_wav_path = os.path.join(sample_dir, "audio.wav")
+            result["audio_path"] = audio_wav_path if os.path.exists(audio_wav_path) else ""
+
             # --- Reference sequence latents (optional) ---
             if self.use_ref_sequence:
                 ref_path = os.path.join(sample_dir, "ref_latents.pt")
