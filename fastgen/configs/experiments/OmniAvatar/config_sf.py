@@ -84,6 +84,9 @@ def create_config():
     config.model.fake_score_optimizer.lr = 2e-6
     config.model.fake_score_optimizer.betas = (0.0, 0.999)
 
+    # Multi-GPU: FSDP required (DDP OOMs on student update at ~79GB/GPU)
+    config.trainer.fsdp = True
+
     # Precision
     config.model.precision = "bfloat16"
     config.model.precision_fsdp = "float32"  # Official T2V configs use float32 for FSDP

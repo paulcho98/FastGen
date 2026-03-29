@@ -23,6 +23,8 @@ import torch
 import torch.nn as nn
 from safetensors import safe_open
 
+from torch.distributed.fsdp import fully_shard
+
 from fastgen.networks.network import FastGenNetwork
 from fastgen.networks.noise_schedule import NET_PRED_TYPES
 from fastgen.networks.OmniAvatar.wan_model import WanModel
@@ -743,3 +745,28 @@ class OmniAvatarWan(FastGenNetwork):
             return out, logvar
 
         return out
+
+    def fully_shard(self, **kwargs):
+        """Fully shard the network for FSDP2.
+
+        Shards ``self.model`` (WanModel) instead of ``self`` because the wrapper
+        class inherits from ABC, which causes issues with FSDP2's ``__class__``
+        assignment (same pattern as FastGen's ``Wan/network.py``).
+
+        We keep manual gradient checkpointing (``torch.utils.checkpoint.checkpoint``
+        in ``WanModel.forward``) rather than ``apply_fsdp_checkpointing`` because
+        audio conditioning is injected between blocks in the parent forward — the
+        ``checkpoint_wrapper`` boundary around DiTBlock can't account for these
+        inter-block audio tensors, causing tensor-count mismatches during recompute.
+        Manual checkpointing wraps exactly ``block(x, context, t_mod, freqs)`` after
+        audio injection, keeping the checkpoint boundary clean.
+        """
+        if self._use_gradient_checkpointing:
+            logger.info(
+                "OmniAvatarWan: keeping manual gradient checkpointing "
+                "(checkpoint_wrapper incompatible with inter-block audio injection)"
+            )
+
+        for block in self.model.blocks:
+            fully_shard(block, **kwargs)
+        fully_shard(self.model, **kwargs)

@@ -36,6 +36,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from torch.distributed.fsdp import fully_shard
+
 from fastgen.networks.network import CausalFastGenNetwork
 from fastgen.networks.noise_schedule import NET_PRED_TYPES
 from fastgen.networks.OmniAvatar.audio_pack import AudioPack
@@ -859,27 +861,34 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         self._num_layers = num_layers
         self._num_heads = num_heads
 
+        # --- All nn.Module components live in self._core (a plain nn.Module) ---
+        # This allows FSDP2's fully_shard to wrap self._core without hitting
+        # the ABC __class__ assignment issue on the outer CausalOmniAvatarWan.
+        # We expose shortcut properties (self.blocks, self.patch_embedding, etc.)
+        # so that forward methods can reference them directly without change.
+        self._core = nn.Module()
+
         # --- Embeddings ---
-        self.patch_embedding = nn.Conv3d(
+        self._core.patch_embedding = nn.Conv3d(
             in_dim, dim, kernel_size=patch_size, stride=patch_size
         )
-        self.text_embedding = nn.Sequential(
+        self._core.text_embedding = nn.Sequential(
             nn.Linear(text_dim, dim),
             nn.GELU(approximate="tanh"),
             nn.Linear(dim, dim),
         )
-        self.time_embedding = nn.Sequential(
+        self._core.time_embedding = nn.Sequential(
             nn.Linear(freq_dim, dim),
             nn.SiLU(),
             nn.Linear(dim, dim),
         )
-        self.time_projection = nn.Sequential(
+        self._core.time_projection = nn.Sequential(
             nn.SiLU(),
             nn.Linear(dim, dim * 6),
         )
 
         # --- Transformer blocks ---
-        self.blocks = nn.ModuleList([
+        self._core.blocks = nn.ModuleList([
             CausalDiTBlock(
                 dim, num_heads, ffn_dim, eps,
                 local_attn_size=local_attn_size,
@@ -890,21 +899,21 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         ])
 
         # --- Output head ---
-        self.head = CausalHead(dim, out_dim, patch_size, eps)
+        self._core.head = CausalHead(dim, out_dim, patch_size, eps)
 
         # --- RoPE frequencies ---
         head_dim = dim // num_heads
-        self.freqs = _precompute_freqs_cis_3d(head_dim)
+        self._core.freqs = _precompute_freqs_cis_3d(head_dim)
 
         # --- Audio ---
         if self.use_audio:
             audio_input_dim = 10752  # OmniAvatar constant
-            self.audio_proj = AudioPack(
+            self._core.audio_proj = AudioPack(
                 audio_input_dim, [4, 1, 1], audio_hidden_size, layernorm=True
             )
-            self.audio_cond_projs = nn.ModuleList()
+            self._core.audio_cond_projs = nn.ModuleList()
             for _ in range(num_layers // 2 - 1):
-                self.audio_cond_projs.append(nn.Linear(audio_hidden_size, dim))
+                self._core.audio_cond_projs.append(nn.Linear(audio_hidden_size, dim))
 
         # --- FlexAttention block mask (lazily constructed) ---
         self.block_mask = None
@@ -917,9 +926,68 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         self._use_gradient_checkpointing = not disable_grad_ckpt
 
         # --- Load weights ---
+        self._finish_init(base_model_paths, omniavatar_ckpt_path)
+
+    # --- Shortcut properties to _core submodules (avoid changing forward code) ---
+    @property
+    def blocks(self):
+        return self._core.blocks
+
+    @property
+    def patch_embedding(self):
+        return self._core.patch_embedding
+
+    @property
+    def text_embedding(self):
+        return self._core.text_embedding
+
+    @property
+    def time_embedding(self):
+        return self._core.time_embedding
+
+    @property
+    def time_projection(self):
+        return self._core.time_projection
+
+    @property
+    def head(self):
+        return self._core.head
+
+    @property
+    def freqs(self):
+        return self._core.freqs
+
+    @freqs.setter
+    def freqs(self, value):
+        self._core.freqs = value
+
+    @property
+    def audio_proj(self):
+        return self._core.audio_proj if hasattr(self._core, 'audio_proj') else None
+
+    @property
+    def audio_cond_projs(self):
+        return self._core.audio_cond_projs if hasattr(self._core, 'audio_cond_projs') else None
+
+    def _finish_init(self, base_model_paths, omniavatar_ckpt_path):
+        """Load weights and cast to default dtype (called at end of __init__)."""
         if not self._is_in_meta_context():
             self._load_weights(base_model_paths, omniavatar_ckpt_path)
             self.to(self._default_dtype)
+
+    def load_state_dict(self, state_dict, strict=True, **kwargs):
+        """Override to handle legacy checkpoints without ``_core.`` prefix.
+
+        FastGen checkpoints and DF Stage 1 checkpoints have keys like
+        ``blocks.0.self_attn.q.weight``.  After the _core refactor, the model
+        expects ``_core.blocks.0.self_attn.q.weight``.  This override
+        transparently adds the prefix when needed.
+        """
+        # Check if keys already have _core. prefix
+        sample_key = next(iter(state_dict.keys()), "")
+        if sample_key and not sample_key.startswith("_core."):
+            state_dict = {"_core." + k: v for k, v in state_dict.items()}
+        return super().load_state_dict(state_dict, strict=strict, **kwargs)
 
     def init_preprocessors(self):
         """No-op — VAE loaded by build_model, no text encoder needed.
@@ -1667,7 +1735,7 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
                     cleaned[clean_k] = v
                 base_sd = cleaned
 
-            missing, unexpected = _smart_load_weights(self, base_sd)
+            missing, unexpected = _smart_load_weights(self._core, base_sd)
             loaded = len(base_sd) - len(unexpected)
             logger.info(
                 f"[CausalOmniAvatarWan] Base weights: {loaded} loaded, "
@@ -1737,9 +1805,9 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
                     new_bias[: non_lora_sd[pe_bias_key].shape[0]] = non_lora_sd[pe_bias_key]
                     non_lora_sd[pe_bias_key] = new_bias
 
-            # Load non-LoRA weights
+            # Load non-LoRA weights (into _core which owns all parameters)
             if non_lora_sd:
-                missing, unexpected = self.load_state_dict(non_lora_sd, strict=False)
+                missing, unexpected = self._core.load_state_dict(non_lora_sd, strict=False)
                 loaded = len(non_lora_sd) - len(unexpected)
                 logger.info(
                     f"[CausalOmniAvatarWan] Non-LoRA weights: {loaded} loaded, "
@@ -1751,7 +1819,7 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
                 if self.merge_lora:
                     logger.info("[CausalOmniAvatarWan] Merging LoRA weights into base model")
                     _merge_lora_into_model(
-                        self,
+                        self._core,
                         lora_sd,
                         lora_rank=self.lora_rank,
                         lora_alpha=self.lora_alpha,
@@ -1771,9 +1839,9 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
                             init_lora_weights=True,
                             target_modules=LORA_TARGET_MODULES,
                         )
-                        # Note: inject_adapter_in_model modifies self in-place
-                        inject_adapter_in_model(lora_config, self)
-                        missing, unexpected = self.load_state_dict(
+                        # Note: inject_adapter_in_model modifies _core in-place
+                        inject_adapter_in_model(lora_config, self._core)
+                        missing, unexpected = self._core.load_state_dict(
                             mapped_lora_sd, strict=False
                         )
                         logger.info(
@@ -1788,3 +1856,35 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
             logger.info(
                 "[CausalOmniAvatarWan] No omniavatar_ckpt_path, using base/random init only"
             )
+
+    def fully_shard(self, **kwargs):
+        """Fully shard the network for FSDP2.
+
+        Shards ``self._core`` (a plain ``nn.Module``) instead of ``self`` because
+        the wrapper class inherits from ``ABC`` via
+        ``CausalFastGenNetwork -> FastGenNetwork(ABC)``, which causes FSDP2's
+        ``__class__`` assignment to fail.  This is the same pattern as FastGen's
+        ``Wan/network.py`` which shards ``self.transformer``.
+
+        We do NOT use ``apply_fsdp_checkpointing`` (checkpoint_wrapper) because
+        the causal blocks have dynamic KV cache / FlexAttention state that causes
+        tensor-count mismatches between forward and recomputation.  Instead, the
+        existing manual ``torch.utils.checkpoint.checkpoint`` calls in
+        ``_forward_full_sequence`` and ``_forward_ar`` handle activation
+        checkpointing correctly by controlling which kwargs reach each block.
+        This matches the reference Self-Forcing implementation's approach.
+        """
+        if self._use_gradient_checkpointing:
+            logger.info(
+                "CausalOmniAvatarWan: keeping manual gradient checkpointing "
+                "(not using apply_fsdp_checkpointing due to KV cache dynamics)"
+            )
+
+        # Shard each CausalDiTBlock (>95% of params). We do NOT shard self._core
+        # as a whole because FSDP2 converts all params to DTensor, which breaks
+        # the property-based access pattern (self.patch_embedding, etc.) that
+        # forward methods use — the input Tensor and DTensor weight mix causes
+        # "mixed Tensor and DTensor" errors.  Block-level sharding is sufficient
+        # for memory savings (same as reference Self-Forcing FSDP1 pattern).
+        for block in self._core.blocks:
+            fully_shard(block, **kwargs)
