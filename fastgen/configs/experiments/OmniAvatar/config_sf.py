@@ -17,7 +17,7 @@ from fastgen.utils import LazyCall as L
 
 from fastgen.networks.OmniAvatar.network import OmniAvatarWan
 from fastgen.networks.OmniAvatar.network_causal import CausalOmniAvatarWan
-from fastgen.datasets.omniavatar_dataloader import create_omniavatar_dataloader
+from fastgen.datasets.omniavatar_dataloader import OmniAvatarDataLoader
 
 # ---- Paths (override via CLI or env) ----
 OMNIAVATAR_ROOT = os.getenv("OMNIAVATAR_ROOT", "/home/work/.local/OmniAvatar")
@@ -78,9 +78,11 @@ CausalOmniAvatar_V2V_1_3B_Student: dict = L(CausalOmniAvatarWan)(
 def create_config():
     config = config_sf_default.create_config()
 
-    # Learning rates
-    config.model.net_optimizer.lr = 5e-6
-    config.model.fake_score_optimizer.lr = 5e-6
+    # Learning rates and optimizer (beta1=0.0 matches reference Self-Forcing implementation)
+    config.model.net_optimizer.lr = 1e-5
+    config.model.net_optimizer.betas = (0.0, 0.999)
+    config.model.fake_score_optimizer.lr = 2e-6
+    config.model.fake_score_optimizer.betas = (0.0, 0.999)
 
     # Precision
     config.model.precision = "bfloat16"
@@ -100,7 +102,7 @@ def create_config():
     # GAN disabled by default to save ~35 GB VRAM (matching T2V 14B teacher config).
     # Enable later for quality improvement if memory allows.
     config.model.gan_loss_weight_gen = 0
-    config.model.student_update_freq = 2  # More frequent student updates (matching T2V 14B teacher)
+    config.model.student_update_freq = 5  # Generator updates every 5th step, critic updates every step
     # To enable GAN, uncomment:
     # config.model.gan_loss_weight_gen = 0.003
     # config.model.discriminator = Discriminator_Wan_14B_Config
@@ -109,11 +111,14 @@ def create_config():
     # config.model.discriminator_optimizer.lr = 5e-6
     # config.model.gan_use_same_t_noise = True
 
-    # Student weights: let the network's own __init__ handle loading (base + omniavatar ckpt).
-    # Do NOT copy 14B teacher weights onto 1.3B student (architecture mismatch).
+    # Student weights: Do NOT copy 14B teacher weights onto 1.3B student (architecture mismatch).
     config.model.load_student_weights = False
-    # Pretrained student from KD Stage 1 (uncomment when available):
-    # config.model.pretrained_student_net_path = f"{CKPT_ROOT_DIR}/OmniAvatar/checkpoints/ode_init.pt"
+    # Load DF-initialized student from Stage 1 checkpoint (full FastGen format: {"model": {"net": ...}})
+    config.trainer.checkpointer.pretrained_ckpt_path = os.getenv(
+        "OMNIAVATAR_DF_CKPT",
+        "/data/karlo-research_715/workspace/kinemaar/paul/AR_diffusion/reference_FastGen_OmniAvatar/OmniAvatar-Train/pretrained_models/1.3B-causal-step-0002500.pth",
+    )
+    config.trainer.checkpointer.pretrained_ckpt_key_map = {"net": "net"}
 
     # Timestep schedule — shift=3.0 matches the OmniAvatar teacher's training distribution
     config.model.sample_t_cfg.time_dist_type = "shifted"
@@ -129,8 +134,8 @@ def create_config():
     config.model.same_step_across_blocks = True
     config.model.context_noise = 0.0
 
-    # Dataloader
-    config.dataloader_train = L(create_omniavatar_dataloader)(
+    # Dataloader (OmniAvatarDataLoader provides infinite iteration required by trainer)
+    config.dataloader_train = L(OmniAvatarDataLoader)(
         data_list_path=f"{DATA_ROOT}/video_square_path.txt",
         latentsync_mask_path=os.getenv(
             "LATENTSYNC_MASK_PATH",
@@ -142,7 +147,11 @@ def create_config():
         use_ref_sequence=True,
     )
 
-    # Training
+    # Training — gradient accumulation 16 steps
+    # Effective batch: batch_size(1) × num_gpus × grad_accum(16)
+    #   4 GPUs: 1 × 4 × 16 = 64
+    #   2 GPUs: 1 × 2 × 16 = 32
+    config.trainer.grad_accum_rounds = 16
     config.trainer.max_iter = 5000
     config.trainer.logging_iter = 10
     config.trainer.save_ckpt_iter = 500
