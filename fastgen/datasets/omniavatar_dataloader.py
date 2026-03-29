@@ -265,6 +265,7 @@ def create_omniavatar_dataloader(
     batch_size: int = 1,
     num_workers: int = 4,
     load_ode_path: bool = False,
+    shuffle: bool = False,
     **kwargs,
 ) -> DataLoader:
     """Create a DataLoader for OmniAvatar training data (non-infinite, no DDP support).
@@ -289,9 +290,9 @@ def create_omniavatar_dataloader(
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=True,
         collate_fn=collate_fn,
-        drop_last=True,
+        drop_last=False,
     )

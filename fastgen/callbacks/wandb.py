@@ -326,6 +326,7 @@ class WandbCallback(Callback):
         self.val_sample_map = None
         self._val_gen_videos: list[torch.Tensor] = []
         self._val_gt_videos: list[torch.Tensor] = []
+        self._val_audio_paths: list[str | None] = []
         self.vid_format = vid_format
         self.fps = fps
         self.loss_dict_record = _LossDictRecord()
@@ -370,6 +371,7 @@ class WandbCallback(Callback):
             device = model.device
             try:
                 gt_videos = []
+                audio_paths = []
                 with torch.no_grad(), basic_utils.inference_mode(
                     precision_amp=model.precision_amp_enc, device_type=device.type
                 ):
@@ -377,7 +379,18 @@ class WandbCallback(Callback):
                         real = data["real"].to(device)  # [1, 16, 21, 64, 64]
                         decoded = model.net.vae.decode(real[:1])  # [1, C, T, H, W]
                         gt_videos.append(self._to_uint8_video(decoded))
-                gt_list = [wandb.Video(v[0].numpy(), fps=self.fps, format="mp4") for v in gt_videos]
+                        ap = None
+                        if "audio_path" in data:
+                            raw = data["audio_path"]
+                            if isinstance(raw, (list, tuple)) and len(raw) > 0 and raw[0]:
+                                ap = raw[0] if os.path.isfile(raw[0]) else None
+                        audio_paths.append(ap)
+                gt_list = []
+                for v, ap in zip(gt_videos, audio_paths):
+                    if ap:
+                        gt_list.append(tensor_to_wandb_video_with_audio(v, ap, fps=self.fps))
+                    else:
+                        gt_list.append(wandb.Video(v[0].numpy(), fps=self.fps, format="mp4"))
                 wandb.log({"val_gt/videos": gt_list}, step=0)
                 logger.info(f"Uploaded {len(gt_videos)} GT validation videos to wandb")
             except Exception as e:
@@ -625,14 +638,30 @@ class WandbCallback(Callback):
             self._val_gen_videos.append(self._to_uint8_video(gen_decoded))
             self._val_gt_videos.append(self._to_uint8_video(gt_decoded))
 
+            # Extract audio path for muxing
+            audio_path = None
+            if "audio_path" in data_batch:
+                ap = data_batch["audio_path"]
+                if isinstance(ap, (list, tuple)) and len(ap) > 0 and ap[0]:
+                    audio_path = ap[0] if os.path.isfile(ap[0]) else None
+            self._val_audio_paths.append(audio_path)
+
             gc.collect()
             torch.cuda.empty_cache()
 
     def on_validation_end(self, model: FastGenModel, iteration: int = 0, idx: int = 0) -> None:
         self.log_stats(self.val_loss_dict_record, iteration=iteration, group=f"val{idx}")
         if wandb.run and self._val_gen_videos:
-            gen_list = [wandb.Video(v[0].numpy(), fps=self.fps, format="mp4") for v in self._val_gen_videos]
-            gt_list = [wandb.Video(v[0].numpy(), fps=self.fps, format="mp4") for v in self._val_gt_videos]
+            gen_list = []
+            gt_list = []
+            for i, (gen_v, gt_v) in enumerate(zip(self._val_gen_videos, self._val_gt_videos)):
+                ap = self._val_audio_paths[i] if i < len(self._val_audio_paths) else None
+                if ap:
+                    gen_list.append(tensor_to_wandb_video_with_audio(gen_v, ap, fps=self.fps))
+                    gt_list.append(tensor_to_wandb_video_with_audio(gt_v, ap, fps=self.fps))
+                else:
+                    gen_list.append(wandb.Video(gen_v[0].numpy(), fps=self.fps, format="mp4"))
+                    gt_list.append(wandb.Video(gt_v[0].numpy(), fps=self.fps, format="mp4"))
             wandb.log({
                 f"val{idx}/generated": gen_list,
                 f"val{idx}/reconstructed": gt_list,
@@ -640,3 +669,4 @@ class WandbCallback(Callback):
             logger.info(f"Logged {len(self._val_gen_videos)} val videos at iteration {iteration}")
         self._val_gen_videos = []
         self._val_gt_videos = []
+        self._val_audio_paths = []
