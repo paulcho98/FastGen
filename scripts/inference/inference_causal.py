@@ -344,6 +344,10 @@ def compute_generation_length(audio_path, override_frames, chunk_size, fps):
     Returns:
         (num_latent_frames, num_video_frames)
     """
+    duration = get_audio_duration(audio_path)
+    num_video_raw = int(duration * fps)  # floor
+    num_latent_raw = 1 + (num_video_raw - 1) // 4
+
     if override_frames is not None:
         num_latent = override_frames
         if num_latent % chunk_size != 0:
@@ -351,11 +355,12 @@ def compute_generation_length(audio_path, override_frames, chunk_size, fps):
                 f"--num_latent_frames ({num_latent}) must be a multiple of "
                 f"chunk_size ({chunk_size})"
             )
+        if num_latent > num_latent_raw:
+            raise ValueError(
+                f"--num_latent_frames ({num_latent}) exceeds audio-derived max "
+                f"({num_latent_raw}). Audio is {duration:.2f}s."
+            )
     else:
-        duration = get_audio_duration(audio_path)
-        num_video_raw = int(math.ceil(duration * fps))
-        # VAE temporal: num_latent = 1 + (num_video - 1) // 4
-        num_latent_raw = 1 + (num_video_raw - 1) // 4
         # Round DOWN to multiple of chunk_size
         num_latent = (num_latent_raw // chunk_size) * chunk_size
         num_latent = max(num_latent, chunk_size)  # at least one chunk
