@@ -643,26 +643,191 @@ def build_condition(vae, wav2vec_model, wav2vec_extractor, video_frames_np,
 
 
 # ===========================================================================
-# Inference & post-processing stubs (implemented in Tasks 4 & 5)
+# Inference & post-processing (Tasks 4 & 5)
 # ===========================================================================
 
 @torch.no_grad()
-def run_inference(model, condition, num_latent_frames, t_list, chunk_size,
-                  context_noise, seed, device, dtype):
-    """Run block-wise autoregressive inference.
+def run_inference(
+    model, condition, num_latent_frames, t_list,
+    chunk_size, context_noise, seed, device, dtype,
+):
+    """Block-wise AR inference loop.
 
-    Will be implemented in Task 4.
+    Adapted from Self-Forcing's rollout_with_gradient but inference-only:
+    - No gradients, no random exit steps
+    - Full denoising per block (all steps in t_list)
+    - KV cache updated after each block with denoised output
+    - Rolling window eviction handled internally by CausalSelfAttention
+
+    Args:
+        model: CausalOmniAvatarWan (1.3B student)
+        condition: dict with text_embeds, audio_emb, ref_latent, mask, etc.
+        num_latent_frames: total latent frames to generate
+        t_list: denoising timestep schedule (e.g. [0.999, 0.9, 0.75, 0.5, 0.0])
+        chunk_size: frames per AR block (3)
+        context_noise: noise level for cache updates (0 = clean)
+        seed: random seed
+        device: torch device
+        dtype: torch dtype
+
+    Returns:
+        output: [1, 16, num_latent_frames, H_lat, W_lat] denoised latents
     """
-    raise NotImplementedError("Will be implemented in Task 4")
+    # Update model's total_num_frames for correct cache allocation
+    model.total_num_frames = num_latent_frames
+    model.clear_caches()
+
+    # Determine spatial dims from ref_latent
+    ref_latent = condition["ref_latent"]  # [1, 16, 1, H_lat, W_lat]
+    B = ref_latent.shape[0]
+    C = 16
+    H_lat, W_lat = ref_latent.shape[3], ref_latent.shape[4]
+
+    num_blocks = num_latent_frames // chunk_size
+    assert num_latent_frames % chunk_size == 0
+
+    # Generate noise
+    torch.manual_seed(seed)
+    noise = torch.randn(B, C, num_latent_frames, H_lat, W_lat, device=device, dtype=dtype)
+
+    # Convert t_list to tensor
+    t_list_t = torch.tensor(t_list, device=device, dtype=torch.float64)
+
+    # Output accumulator
+    output = torch.zeros_like(noise)
+
+    print(f"  {num_blocks} blocks x {len(t_list) - 1} denoising steps")
+    for block_idx in range(num_blocks):
+        cur_start_frame = block_idx * chunk_size
+
+        # Slice noise for this chunk
+        noisy_input = noise[:, :, cur_start_frame:cur_start_frame + chunk_size]
+
+        # Multi-step denoising
+        for step_idx in range(len(t_list_t) - 1):
+            t_cur = t_list_t[step_idx]
+            t_next = t_list_t[step_idx + 1]
+
+            # Forward pass — model.forward() handles _build_y, rescale_t, _forward_ar internally
+            x0_pred = model(
+                noisy_input,
+                t_cur.float().expand(B),
+                condition=condition,
+                cur_start_frame=cur_start_frame,
+                store_kv=False,
+                is_ar=True,
+                fwd_pred_type="x0",
+                use_gradient_checkpointing=False,
+            )
+
+            if t_next > 0:
+                # Add noise for next step (SDE: fresh random noise)
+                eps = torch.randn_like(x0_pred)
+                noisy_input = model.noise_scheduler.forward_process(
+                    x0_pred, eps, t_next.float().expand(B),
+                )
+            else:
+                # Final step — clean output
+                noisy_input = x0_pred
+
+        # Store denoised chunk
+        output[:, :, cur_start_frame:cur_start_frame + chunk_size] = x0_pred
+
+        # Update KV cache with denoised output (context for next block)
+        cache_input = x0_pred
+        t_cache = torch.full((B,), context_noise, device=device, dtype=dtype)
+        if context_noise > 0:
+            cache_eps = torch.randn_like(x0_pred)
+            cache_input = model.noise_scheduler.forward_process(
+                x0_pred, cache_eps,
+                torch.tensor(context_noise, device=device, dtype=torch.float64).expand(B),
+            )
+
+        model(
+            cache_input,
+            t_cache,
+            condition=condition,
+            cur_start_frame=cur_start_frame,
+            store_kv=True,
+            is_ar=True,
+            fwd_pred_type="x0",
+            use_gradient_checkpointing=False,
+        )
+
+        if (block_idx + 1) % 10 == 0 or block_idx == num_blocks - 1:
+            print(f"  Block {block_idx + 1}/{num_blocks} done")
+
+    model.clear_caches()
+    return output
 
 
 @torch.no_grad()
 def decode_and_save(vae, output_latents, audio_path, output_path, fps, device):
-    """Decode latents to pixels and save as video with audio.
+    """VAE decode latents -> save silent video -> mux with audio."""
+    import imageio.v3 as iio
 
-    Will be implemented in Task 5.
-    """
-    raise NotImplementedError("Will be implemented in Task 5")
+    # VAE decode — expects list of [C, T_lat, H_lat, W_lat] tensors
+    latent_for_vae = output_latents[0]  # [16, T_lat, H_lat, W_lat]
+    video_tensor = vae.decode([latent_for_vae], device=device)  # [1, 3, T_video, H, W]
+    video_tensor = video_tensor.clamp(-1, 1)
+
+    # Convert to uint8 frames: [T, H, W, 3]
+    video_np = video_tensor[0]  # [3, T, H, W]
+    video_np = video_np.permute(1, 2, 3, 0)  # [T, H, W, 3]
+    video_np = ((video_np.float() + 1) * 127.5).clamp(0, 255).cpu().to(torch.uint8).numpy()
+
+    # Save silent video to temp file
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    tmp_silent = output_path + ".silent.mp4"
+    iio.imwrite(
+        tmp_silent,
+        video_np,
+        fps=fps,
+        codec="libx264",
+        output_params=["-loglevel", "quiet", "-crf", "18"],
+    )
+    print(f"  Silent video: {video_np.shape[0]} frames at {fps}fps")
+
+    # Mux with audio
+    video_duration = video_np.shape[0] / fps
+    mux_video_with_audio(tmp_silent, audio_path, output_path, duration_s=video_duration)
+
+    # Cleanup
+    if os.path.exists(tmp_silent):
+        os.remove(tmp_silent)
+
+
+def mux_video_with_audio(video_path, audio_path, output_path, duration_s=None):
+    """Mux silent video with audio via ffmpeg."""
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error", "-nostdin",
+        "-i", video_path, "-i", audio_path,
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "libx264", "-crf", "18",
+        "-c:a", "aac", "-q:v", "0", "-q:a", "0",
+    ]
+    if duration_s is not None:
+        cmd.extend(["-t", f"{duration_s:.4f}"])
+    cmd.append(output_path)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg mux failed: {result.stderr}")
+
+
+def verify_kv_cache(model, chunk_size, frame_seqlen, block_idx):
+    """Debug helper — verify KV cache state after a store_kv=True call."""
+    if model._kv_caches is None:
+        print("  [WARN] KV caches are None!")
+        return
+    cache_0 = model._kv_caches[0]
+    expected_global = (block_idx + 1) * chunk_size * frame_seqlen
+    actual_global = cache_0["global_end_index"].item()
+    actual_local = cache_0["local_end_index"].item()
+    match = "OK" if actual_global == expected_global else "MISMATCH"
+    print(
+        f"  [Cache] block={block_idx} global_end={actual_global} "
+        f"(expected={expected_global}) local_end={actual_local} [{match}]"
+    )
 
 
 # ===========================================================================
