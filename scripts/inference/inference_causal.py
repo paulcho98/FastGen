@@ -95,6 +95,10 @@ def parse_args():
                         help="Pre-computed T5 embeddings .pt file")
     parser.add_argument("--text_encoder_path", type=str, default=None,
                         help="T5 model path for runtime encoding")
+    parser.add_argument("--precomputed_dir", type=str, default=None,
+                        help="Directory with precomputed .pt files (vae_latents_mask_all.pt, "
+                             "ref_latents.pt, audio_emb_omniavatar.pt, text_emb.pt). "
+                             "Bypasses VAE/Wav2Vec encoding — uses exact training-style tensors.")
     parser.add_argument("--t_list", type=float, nargs="+",
                         default=[0.999, 0.900, 0.750, 0.500, 0.0],
                         help="Noise schedule timestep list for AR generation")
@@ -153,12 +157,32 @@ def load_diffusion_model(args, device, dtype):
     )
 
     # Load Self-Forcing checkpoint on top
+    # Handle FSDP checkpoint format: ckpt["model"]["net"] or ckpt["net"] or bare state_dict
     print(f"Loading SF checkpoint from {args.ckpt_path} ...")
     ckpt = torch.load(args.ckpt_path, map_location="cpu", weights_only=False)
-    if isinstance(ckpt, dict) and "net" in ckpt:
-        ckpt = ckpt["net"]
-    missing, unexpected = model.load_state_dict(ckpt, strict=False)
-    print(f"  SF checkpoint: {len(missing)} missing, {len(unexpected)} unexpected keys")
+    if isinstance(ckpt, dict):
+        if "model" in ckpt and isinstance(ckpt["model"], dict) and "net" in ckpt["model"]:
+            state_dict = ckpt["model"]["net"]
+        elif "net" in ckpt:
+            state_dict = ckpt["net"]
+        else:
+            state_dict = ckpt
+    else:
+        state_dict = ckpt
+
+    # Keys in checkpoint use plain names (e.g. "patch_embedding.weight")
+    # Model wraps everything under _core, so keys are "_core.xxx"
+    # Try loading directly first, if too many missing, try adding _core prefix
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if len(missing) > len(state_dict) * 0.5 and not any(k.startswith("_core.") for k in state_dict):
+        # Try with _core prefix
+        prefixed_sd = {"_core." + k: v for k, v in state_dict.items()}
+        missing2, unexpected2 = model.load_state_dict(prefixed_sd, strict=False)
+        if len(missing2) < len(missing):
+            missing, unexpected = missing2, unexpected2
+            print(f"  Applied _core. prefix for key matching")
+
+    print(f"  SF checkpoint: {len(state_dict)} params, {len(missing)} missing, {len(unexpected)} unexpected")
 
     model = model.to(device=device, dtype=dtype)
     model.eval()
@@ -656,6 +680,81 @@ def build_condition(vae, wav2vec_model, wav2vec_extractor, video_frames_np,
     }
 
 
+def build_condition_from_precomputed(precomputed_dir, mask_path, num_latent_frames, device, dtype):
+    """Build conditioning dict from pre-computed .pt files (exact training format).
+
+    This bypasses VAE/Wav2Vec encoding and uses the same tensors the model was
+    trained on, enabling direct comparison.
+    """
+    print(f"Loading precomputed tensors from {precomputed_dir} ...")
+
+    # VAE latents (input + masked)
+    vae_data = torch.load(
+        os.path.join(precomputed_dir, "vae_latents_mask_all.pt"),
+        map_location="cpu", weights_only=False,
+    )
+    input_latents = vae_data["input_latents"].to(dtype=dtype)  # [16, T, H, W]
+    masked_latents = vae_data["masked_latents"].to(dtype=dtype)
+
+    # ref_latent = first frame of input video
+    ref_latent = input_latents[:, :1].unsqueeze(0)  # [1, 16, 1, H, W]
+
+    # Slice to num_latent_frames
+    input_latents = input_latents[:, :num_latent_frames].unsqueeze(0)  # [1, 16, T, H, W]
+    masked_latents = masked_latents[:, :num_latent_frames].unsqueeze(0)
+
+    # ref_sequence (from separate file)
+    ref_path = os.path.join(precomputed_dir, "ref_latents.pt")
+    if os.path.exists(ref_path):
+        ref_data = torch.load(ref_path, map_location="cpu", weights_only=False)
+        ref_seq_key = "ref_sequence_latents" if "ref_sequence_latents" in ref_data else list(ref_data.keys())[0]
+        ref_sequence = ref_data[ref_seq_key].to(dtype=dtype)[:, :num_latent_frames].unsqueeze(0)
+    else:
+        print("  Warning: ref_latents.pt not found, using input_latents as ref_sequence")
+        ref_sequence = input_latents
+
+    # Audio (video-frame-rate)
+    audio_data = torch.load(
+        os.path.join(precomputed_dir, "audio_emb_omniavatar.pt"),
+        map_location="cpu", weights_only=False,
+    )
+    audio_emb = audio_data["audio_emb"] if isinstance(audio_data, dict) else audio_data
+    # Training slices to num_video_frames = 1 + (num_latent - 1) * 4
+    num_video_frames = 1 + (num_latent_frames - 1) * 4
+    audio_emb = audio_emb[:num_video_frames].unsqueeze(0).to(dtype=dtype)  # [1, V, 10752]
+    print(f"  audio_emb: {audio_emb.shape} (sliced to {num_video_frames} video frames)")
+
+    # Text
+    text_data = torch.load(
+        os.path.join(precomputed_dir, "text_emb.pt"),
+        map_location="cpu", weights_only=False,
+    )
+    if isinstance(text_data, dict):
+        text_embeds = next(v for v in text_data.values() if isinstance(v, torch.Tensor))
+    else:
+        text_embeds = text_data
+    if text_embeds.dim() == 2:
+        text_embeds = text_embeds.unsqueeze(0)
+    text_embeds = text_embeds.to(dtype=dtype)
+
+    # Mask
+    from PIL import Image
+    H_lat, W_lat = ref_latent.shape[3], ref_latent.shape[4]
+    latent_mask = load_latentsync_mask(mask_path, H_lat, W_lat)
+
+    print(f"  ref_latent: {ref_latent.shape}, masked_video: {masked_latents.shape}")
+    print(f"  ref_sequence: {ref_sequence.shape}, mask: {latent_mask.shape}")
+
+    return {
+        "text_embeds": text_embeds.to(device),
+        "audio_emb": audio_emb.to(device),
+        "ref_latent": ref_latent.to(device),
+        "mask": latent_mask.to(device=device, dtype=dtype),
+        "masked_video": masked_latents.to(device),
+        "ref_sequence": ref_sequence.to(device),
+    }
+
+
 # ===========================================================================
 # Inference & post-processing (Tasks 4 & 5)
 # ===========================================================================
@@ -870,33 +969,42 @@ def main():
             audio_path, args.num_latent_frames, args.chunk_size, args.fps
         )
 
-        # --- Load models ---
-        print("Loading VAE ...")
-        vae = load_vae(args.vae_path, device)
-
-        print("Loading Wav2Vec2 ...")
-        wav2vec_model, wav2vec_extractor = load_wav2vec(args.wav2vec_path, device)
-
-        print("Loading text embeddings ...")
-        text_embeds = load_or_encode_text(args, device, dtype)
-
+        # --- Load diffusion model (always needed) ---
         print("Loading diffusion model ...")
         model = load_diffusion_model(args, device, dtype)
 
-        # --- Preprocess inputs ---
-        print("Loading and adjusting reference video ...")
-        video_frames_np = load_and_adjust_video(args.video_path, num_video_frames)
+        # --- Build conditioning ---
+        if args.precomputed_dir is not None:
+            # Use pre-computed tensors (exact training format)
+            condition = build_condition_from_precomputed(
+                args.precomputed_dir, args.mask_path,
+                num_latent_frames, device, dtype,
+            )
+            # Still need VAE for decode
+            print("Loading VAE ...")
+            vae = load_vae(args.vae_path, device)
+        else:
+            # Encode from raw video/audio
+            print("Loading VAE ...")
+            vae = load_vae(args.vae_path, device)
 
-        print("Building conditioning ...")
-        condition = build_condition(
-            vae, wav2vec_model, wav2vec_extractor, video_frames_np,
-            audio_path, text_embeds, args.mask_path,
-            num_video_frames, num_latent_frames, device, dtype,
-        )
+            print("Loading Wav2Vec2 ...")
+            wav2vec_model, wav2vec_extractor = load_wav2vec(args.wav2vec_path, device)
 
-        # --- Free audio encoder VRAM ---
-        del wav2vec_model
-        torch.cuda.empty_cache()
+            print("Loading text embeddings ...")
+            text_embeds = load_or_encode_text(args, device, dtype)
+
+            print("Loading and adjusting reference video ...")
+            video_frames_np = load_and_adjust_video(args.video_path, num_video_frames)
+
+            print("Building conditioning ...")
+            condition = build_condition(
+                vae, wav2vec_model, wav2vec_extractor, video_frames_np,
+                audio_path, text_embeds, args.mask_path,
+                num_video_frames, num_latent_frames, device, dtype,
+            )
+            del wav2vec_model
+            torch.cuda.empty_cache()
 
         # --- Run inference ---
         print("Running inference ...")
