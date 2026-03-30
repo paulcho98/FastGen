@@ -384,6 +384,7 @@ def load_video_frames(video_path, max_frames=None):
         raise RuntimeError(f"Cannot open video: {video_path}")
 
     frames = []
+    checked_size = False
     while True:
         if max_frames is not None and len(frames) >= max_frames:
             break
@@ -391,9 +392,15 @@ def load_video_frames(video_path, max_frames=None):
         if not ret:
             break
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w = frame.shape[:2]
-        if h != 512 or w != 512:
-            frame = cv2.resize(frame, (512, 512), interpolation=cv2.INTER_LANCZOS4)
+        if not checked_size:
+            h, w = frame.shape[:2]
+            if h != 512 or w != 512:
+                cap.release()
+                raise ValueError(
+                    f"Video must be 512x512, got {w}x{h}. "
+                    "Resize or use LatentSync compositing pipeline."
+                )
+            checked_size = True
         frames.append(frame)
     cap.release()
 
