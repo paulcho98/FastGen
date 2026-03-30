@@ -42,6 +42,19 @@ OMNIAVATAR_ROOT = os.getenv(
 sys.path.insert(0, OMNIAVATAR_ROOT)
 
 
+def _get_ffmpeg():
+    """Return path to ffmpeg binary (system or imageio_ffmpeg fallback)."""
+    import shutil
+    path = shutil.which("ffmpeg")
+    if path:
+        return path
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except ImportError:
+        raise RuntimeError("ffmpeg not found. Install ffmpeg or pip install imageio-ffmpeg.")
+
+
 # ===========================================================================
 # CLI argument parsing
 # ===========================================================================
@@ -195,7 +208,7 @@ def load_wav2vec(wav2vec_path, device):
 
     print(f"Loading Wav2Vec2 from {wav2vec_path} ...")
     extractor = Wav2Vec2FeatureExtractor.from_pretrained(wav2vec_path)
-    model = Wav2VecModel.from_pretrained(wav2vec_path)
+    model = Wav2VecModel.from_pretrained(wav2vec_path, attn_implementation="eager")
 
     # Freeze feature extractor (CNN) — must stay float32
     model.feature_extractor.requires_grad_(False)
@@ -297,7 +310,8 @@ def resolve_audio(args):
     tmp.close()
 
     cmd = [
-        "ffmpeg", "-y", "-i", args.video_path,
+        _get_ffmpeg(), "-y", "-loglevel", "error", "-nostdin",
+        "-i", args.video_path,
         "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
         tmp_path,
     ]
@@ -316,16 +330,9 @@ def get_audio_duration(audio_path):
     Returns:
         float — duration in seconds.
     """
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        audio_path,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffprobe failed:\n{result.stderr}")
-    return float(result.stdout.strip())
+    # Use librosa instead of ffprobe (ffprobe may not be installed)
+    duration = librosa.get_duration(filename=audio_path)
+    return duration
 
 
 def compute_generation_length(audio_path, override_frames, chunk_size, fps):
@@ -535,19 +542,21 @@ def encode_reference_video(vae, video_frames_np, mask_path, device, dtype):
     # Apply spatial mask (all frames)
     masked_video_tensor = apply_spatial_mask(video_tensor, mask_pixel_binary, mask_all_frames=True)
 
-    # VAE encode both unmasked and masked
+    # VAE encode both unmasked and masked (VAE requires float32)
     with torch.no_grad():
         source_latents = vae.encode(
-            [video_tensor[0].to(dtype=dtype, device=device)], device=device
+            [video_tensor[0].to(dtype=torch.float32)], device=device
         )  # [1, 16, T_lat, H_lat, W_lat]
 
         masked_latents = vae.encode(
-            [masked_video_tensor[0].to(dtype=dtype, device=device)], device=device
+            [masked_video_tensor[0].to(dtype=torch.float32)], device=device
         )  # [1, 16, T_lat, H_lat, W_lat]
 
-    ref_latent = source_latents[:, :, :1]  # [1, 16, 1, H_lat, W_lat]
-    ref_sequence = source_latents  # [1, 16, T_lat, H_lat, W_lat]
-    latent_mask = load_latentsync_mask(mask_path, latent_h, latent_w)
+    ref_latent = source_latents[:, :, :1].to(dtype=dtype)  # [1, 16, 1, H_lat, W_lat]
+    ref_sequence = source_latents.to(dtype=dtype)  # [1, 16, T_lat, H_lat, W_lat]
+    masked_latents = masked_latents.to(dtype=dtype)
+    H_lat, W_lat = ref_latent.shape[3], ref_latent.shape[4]
+    latent_mask = load_latentsync_mask(mask_path, H_lat, W_lat).to(device=device, dtype=dtype)
 
     return ref_latent, masked_latents, ref_sequence, latent_mask
 
@@ -771,8 +780,8 @@ def decode_and_save(vae, output_latents, audio_path, output_path, fps, device):
     """VAE decode latents -> save silent video -> mux with audio."""
     import imageio.v3 as iio
 
-    # VAE decode — expects list of [C, T_lat, H_lat, W_lat] tensors
-    latent_for_vae = output_latents[0]  # [16, T_lat, H_lat, W_lat]
+    # VAE decode — expects list of [C, T_lat, H_lat, W_lat] in float32
+    latent_for_vae = output_latents[0].to(torch.float32)  # [16, T_lat, H_lat, W_lat]
     video_tensor = vae.decode([latent_for_vae], device=device)  # [1, 3, T_video, H, W]
     video_tensor = video_tensor.clamp(-1, 1)
 
@@ -805,7 +814,7 @@ def decode_and_save(vae, output_latents, audio_path, output_path, fps, device):
 def mux_video_with_audio(video_path, audio_path, output_path, duration_s=None):
     """Mux silent video with audio via ffmpeg."""
     cmd = [
-        "ffmpeg", "-y", "-loglevel", "error", "-nostdin",
+        _get_ffmpeg(), "-y", "-loglevel", "error", "-nostdin",
         "-i", video_path, "-i", audio_path,
         "-map", "0:v:0", "-map", "1:a:0",
         "-c:v", "libx264", "-crf", "18",
