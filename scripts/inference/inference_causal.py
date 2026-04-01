@@ -64,10 +64,10 @@ def parse_args():
         description="Causal OmniAvatar inference (block-wise AR with audio conditioning)"
     )
 
-    # --- Required ---
-    parser.add_argument("--video_path", type=str, required=True,
+    # --- Single-sample mode ---
+    parser.add_argument("--video_path", type=str, default=None,
                         help="Reference video path (must be 512x512)")
-    parser.add_argument("--output_path", type=str, required=True,
+    parser.add_argument("--output_path", type=str, default=None,
                         help="Output video path")
     parser.add_argument("--ckpt_path", type=str, required=True,
                         help="SF-trained student checkpoint (.pth)")
@@ -99,6 +99,26 @@ def parse_args():
                         help="Directory with precomputed .pt files (vae_latents_mask_all.pt, "
                              "ref_latents.pt, audio_emb_omniavatar.pt, text_emb.pt). "
                              "Bypasses VAE/Wav2Vec encoding — uses exact training-style tensors.")
+
+    # --- Batch inference ---
+    parser.add_argument("--input_dir", type=str, default=None,
+                        help="Directory of sample subdirs (each with sub_clip.mp4, audio.wav). "
+                             "Mutually exclusive with --video_path.")
+    parser.add_argument("--output_dir", type=str, default=None,
+                        help="Output directory for batch mode")
+    parser.add_argument("--skip_existing", action="store_true",
+                        help="Skip samples whose output already exists (for resume)")
+
+    # --- LatentSync compositing ---
+    parser.add_argument("--latentsync", action="store_true",
+                        help="Enable face detection + 512x512 alignment + compositing")
+    parser.add_argument("--face_cache_dir", type=str, default=None,
+                        help="Directory for face detection caches (required with --latentsync)")
+    parser.add_argument("--use_mouth_only", action="store_true", default=True,
+                        help="Blend only mouth region, keep original upper face (default: True)")
+    parser.add_argument("--no_mouth_only", action="store_false", dest="use_mouth_only",
+                        help="Composite entire generated face (disable mouth-only blending)")
+
     parser.add_argument("--t_list", type=float, nargs="+",
                         default=[0.999, 0.900, 0.750, 0.500, 0.0],
                         help="Noise schedule timestep list for AR generation")
@@ -119,6 +139,19 @@ def parse_args():
                         help="Output video FPS")
 
     return parser.parse_args()
+
+
+def validate_args(args):
+    if args.input_dir is not None and args.video_path is not None:
+        raise ValueError("--input_dir and --video_path are mutually exclusive")
+    if args.input_dir is None and args.video_path is None:
+        raise ValueError("Must provide either --input_dir or --video_path")
+    if args.input_dir is not None and args.output_dir is None:
+        raise ValueError("--input_dir requires --output_dir")
+    if args.latentsync and args.face_cache_dir is None:
+        raise ValueError("--latentsync requires --face_cache_dir")
+    if args.input_dir is None and args.output_path is None:
+        raise ValueError("--video_path mode requires --output_path")
 
 
 # ===========================================================================
@@ -315,18 +348,26 @@ def load_or_encode_text(args, device, dtype):
 # Input preprocessing functions
 # ===========================================================================
 
-def resolve_audio(args):
+def resolve_audio(audio_path=None, video_path=None, args=None):
     """Determine the audio source path.
 
-    If --audio_path is provided, use it directly.  Otherwise extract audio
-    from the reference video using ffmpeg.
+    Accepts explicit *audio_path* / *video_path* for batch mode, or falls
+    back to reading from *args* for single-sample backward-compatibility.
 
     Returns:
         (audio_path, tmp_path_or_None) — tmp_path is set when a temp file
         was created and must be cleaned up later.
     """
-    if args.audio_path is not None:
-        return args.audio_path, None
+    if audio_path is None and args is not None:
+        audio_path = getattr(args, "audio_path", None)
+    if video_path is None and args is not None:
+        video_path = getattr(args, "video_path", None)
+
+    if audio_path is not None:
+        return audio_path, None
+
+    if video_path is None:
+        raise ValueError("resolve_audio: need either audio_path or video_path")
 
     # Extract audio from video
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
@@ -335,7 +376,7 @@ def resolve_audio(args):
 
     cmd = [
         _get_ffmpeg(), "-y", "-loglevel", "error", "-nostdin",
-        "-i", args.video_path,
+        "-i", video_path,
         "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
         tmp_path,
     ]
@@ -756,6 +797,239 @@ def build_condition_from_precomputed(precomputed_dir, mask_path, num_latent_fram
 
 
 # ===========================================================================
+# LatentSync preprocessing / compositing (copied from OmniAvatar-Train)
+# ===========================================================================
+
+def load_image_processor(mask_path, device):
+    """Load LatentSync ImageProcessor for face detection and alignment."""
+    import os as _os
+    _os.environ.setdefault("ORT_DISABLE_THREAD_AFFINITY", "1")
+    from OmniAvatar.utils.latentsync.image_processor import ImageProcessor
+    print("Loading LatentSync ImageProcessor ...")
+    processor = ImageProcessor(resolution=512, device=device, mask_image=mask_path)
+    return processor
+
+
+def preprocess_with_latentsync(video_path, image_processor, face_detection_cache_dir, num_frames=81):
+    """Detect faces, align to 512x512 via affine transform, with caching."""
+    if not os.path.exists(video_path):
+        print(f"[LatentSync] WARNING: Video not found: {video_path}")
+        return None
+
+    try:
+        video_basename = os.path.splitext(os.path.basename(video_path))[0]
+        if video_basename in ("sub_clip", "video"):
+            video_stem = os.path.basename(os.path.dirname(video_path))
+        else:
+            video_stem = video_basename
+        face_cache_path = os.path.join(face_detection_cache_dir, f"{video_stem}_face_cache.pt")
+
+        face_cache_loaded = False
+        original_frames = None
+        if os.path.isfile(face_cache_path):
+            try:
+                face_cache = torch.load(face_cache_path, weights_only=False)
+                if face_cache.get("resolution") == image_processor.resolution:
+                    boxes = face_cache["boxes"]
+                    affine_matrices = face_cache["affine_matrices"]
+                    aligned_faces = face_cache["aligned_faces"]
+                    detection_failures = []
+                    face_cache_loaded = True
+                    print(f"[LatentSync] Loaded face cache: {face_cache_path}")
+                else:
+                    print(f"[LatentSync] Cache stale, recomputing...")
+            except Exception as e:
+                print(f"[LatentSync] Cache corrupt ({e}), recomputing...")
+                os.remove(face_cache_path)
+
+        if not face_cache_loaded:
+            cap = cv2.VideoCapture(video_path)
+            frames = []
+            for _ in range(num_frames):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames.append(frame)
+            cap.release()
+
+            if len(frames) < 5:
+                print(f"[LatentSync] Too few frames ({len(frames)}) in {video_path}")
+                return None
+
+            while len(frames) < num_frames:
+                frames.append(frames[-1].copy())
+
+            original_frames = np.stack(frames, axis=0)
+            boxes = []
+            affine_matrices = []
+            aligned_faces = []
+            detection_failures = []
+
+            # Reset temporal smoothing bias for new video
+            image_processor.restorer.p_bias = None
+
+            for i, frame in enumerate(frames):
+                try:
+                    face, box, affine_matrix = image_processor.affine_transform(frame)
+                    boxes.append(box)
+                    affine_matrices.append(affine_matrix)
+                    aligned_faces.append(face)
+                except RuntimeError as e:
+                    print(f"[LatentSync] Face detection failed for frame {i}: {e}")
+                    boxes.append(None)
+                    affine_matrices.append(None)
+                    detection_failures.append(i)
+
+            if detection_failures:
+                print(f"[LatentSync] Face detection failed for {len(detection_failures)} frames, skipping")
+                return None
+
+            os.makedirs(face_detection_cache_dir, exist_ok=True)
+            torch.save({
+                "aligned_faces": aligned_faces,
+                "boxes": boxes,
+                "affine_matrices": affine_matrices,
+                "resolution": image_processor.resolution,
+                "num_frames": len(original_frames),
+            }, face_cache_path)
+            print(f"[LatentSync] Saved face cache: {face_cache_path}")
+
+        return {
+            "video_path": video_path,
+            "original_frames": original_frames,
+            "num_frames": num_frames,
+            "aligned_faces": aligned_faces,
+            "boxes": boxes,
+            "affine_matrices": affine_matrices,
+            "detection_failures": detection_failures if not face_cache_loaded else [],
+        }
+
+    except Exception as e:
+        print(f"[LatentSync] Preprocessing failed for {video_path}: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def composite_with_latentsync_float(generated_float, latentsync_metadata, image_processor,
+                                     use_mouth_only_compositing=False):
+    """Composite generated faces back onto original video, staying in float space.
+
+    Unlike composite_with_latentsync (which takes uint8 numpy), this function accepts the
+    model output as a float tensor and avoids uint8 quantization before compositing.
+    This matches LatentSync-train's data flow for maximum precision.
+
+    Args:
+        generated_float: [T, C, H, W] float tensor in [0, 1]
+    """
+    import torchvision.transforms.functional as TF_v
+
+    original_frames = latentsync_metadata["original_frames"]
+    if original_frames is None:
+        video_path = latentsync_metadata["video_path"]
+        num_frames = latentsync_metadata.get("num_frames", 81)
+        cap = cv2.VideoCapture(video_path)
+        frames = []
+        for _ in range(num_frames):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(frame)
+        cap.release()
+        while len(frames) < num_frames:
+            frames.append(frames[-1].copy())
+        original_frames = np.stack(frames, axis=0)
+
+    boxes = latentsync_metadata["boxes"]
+    affine_matrices = latentsync_metadata["affine_matrices"]
+    detection_failures = latentsync_metadata.get("detection_failures", [])
+    aligned_faces = latentsync_metadata.get("aligned_faces", None)
+
+    composite_frames = []
+
+    for i in range(generated_float.shape[0]):
+        if i in detection_failures or boxes[i] is None:
+            composite_frames.append(original_frames[i])
+            continue
+
+        face = generated_float[i]  # [C, H, W] float [0,1]
+
+        # Mouth-only compositing in float space (no uint8 quantization)
+        if use_mouth_only_compositing and aligned_faces is not None:
+            mouth_mask = image_processor.mask_image.float()  # [C, H, W] float32
+            original_aligned_float = aligned_faces[i].float() / 255.0  # uint8 → [0,1]
+            face = face * (1 - mouth_mask) + original_aligned_float * mouth_mask
+
+        # Resize in float space
+        x1, y1, x2, y2 = boxes[i]
+        height = int(y2 - y1)
+        width = int(x2 - x1)
+        face_resized = TF_v.resize(
+            face, size=[height, width],
+            interpolation=TF_v.InterpolationMode.BICUBIC, antialias=True,
+        )
+
+        # Convert [0,1] → [-1,1] for restore_img (NO uint8 round-trip)
+        face_resized = face_resized * 2.0 - 1.0
+
+        try:
+            restored_frame = image_processor.restorer.restore_img(
+                original_frames[i], face_resized, affine_matrices[i]
+            )
+            composite_frames.append(restored_frame)
+        except Exception as e:
+            print(f"[LatentSync] Restoration failed for frame {i}: {e}")
+            composite_frames.append(original_frames[i])
+
+    return np.stack(composite_frames)
+
+
+def save_frames_as_video(frames_np, output_path, fps=25):
+    """Save [N, H, W, 3] uint8 numpy array as mp4 video.
+
+    Uses CRF 13 + macro_block_size=None to match LatentSync-train's write_video().
+    """
+    import imageio
+    writer = imageio.get_writer(
+        output_path, fps=fps, codec='libx264',
+        macro_block_size=None,
+        ffmpeg_params=["-crf", "13"],
+        ffmpeg_log_level="error",
+    )
+    for frame in frames_np:
+        writer.append_data(frame)
+    writer.close()
+
+
+# ===========================================================================
+# Batch enumeration
+# ===========================================================================
+
+def enumerate_samples(args):
+    if args.input_dir is not None:
+        for entry in sorted(os.listdir(args.input_dir)):
+            sample_dir = os.path.join(args.input_dir, entry)
+            if not os.path.isdir(sample_dir):
+                continue
+            video_path = os.path.join(sample_dir, "sub_clip.mp4")
+            if not os.path.isfile(video_path):
+                continue
+            audio_path = os.path.join(sample_dir, "audio.wav")
+            if not os.path.isfile(audio_path):
+                print(f"[Skip] No audio.wav in {sample_dir}")
+                continue
+            precomputed = sample_dir if os.path.isfile(
+                os.path.join(sample_dir, "vae_latents_mask_all.pt")
+            ) else None
+            yield entry, video_path, audio_path, precomputed
+    else:
+        name = os.path.splitext(os.path.basename(args.video_path))[0]
+        yield name, args.video_path, args.audio_path, args.precomputed_dir
+
+
+# ===========================================================================
 # Inference & post-processing (Tasks 4 & 5)
 # ===========================================================================
 
@@ -949,6 +1223,7 @@ def verify_kv_cache(model, chunk_size, frame_seqlen, block_idx):
 
 def main():
     args = parse_args()
+    validate_args(args)
 
     # --- Resolve dtype ---
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
@@ -960,71 +1235,190 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    # --- Resolve audio ---
-    audio_path, tmp_audio = resolve_audio(args)
+    # ===================================================================
+    # Load models once (expensive — minutes for 14B/1.3B weights)
+    # ===================================================================
+    print("Loading diffusion model ...")
+    model = load_diffusion_model(args, device, dtype)
 
-    try:
-        # --- Compute generation length ---
-        num_latent_frames, num_video_frames = compute_generation_length(
-            audio_path, args.num_latent_frames, args.chunk_size, args.fps
-        )
+    print("Loading VAE ...")
+    vae = load_vae(args.vae_path, device)
 
-        # --- Load diffusion model (always needed) ---
-        print("Loading diffusion model ...")
-        model = load_diffusion_model(args, device, dtype)
+    # Wav2Vec + text only needed when NOT using precomputed tensors for every sample
+    wav2vec_model = wav2vec_extractor = None
+    text_embeds = None
 
-        # --- Build conditioning ---
-        if args.precomputed_dir is not None:
-            # Use pre-computed tensors (exact training format)
-            condition = build_condition_from_precomputed(
-                args.precomputed_dir, args.mask_path,
-                num_latent_frames, device, dtype,
-            )
-            # Still need VAE for decode
-            print("Loading VAE ...")
-            vae = load_vae(args.vae_path, device)
+    # Optional LatentSync ImageProcessor
+    image_processor = None
+    if args.latentsync:
+        image_processor = load_image_processor(args.mask_path, device)
+
+    # ===================================================================
+    # Loop over samples
+    # ===================================================================
+    samples = list(enumerate_samples(args))
+    succeeded, failed, skipped = [], [], []
+
+    for sample_idx, (name, video_path, audio_path_sample, precomputed_dir) in enumerate(samples):
+        print(f"\n{'='*60}")
+        print(f"[{sample_idx+1}/{len(samples)}] {name}")
+        print(f"{'='*60}")
+
+        # --- Determine output path ---
+        if args.input_dir is not None:
+            output_path = os.path.join(args.output_dir, f"{name}.mp4")
         else:
-            # Encode from raw video/audio
-            print("Loading VAE ...")
-            vae = load_vae(args.vae_path, device)
+            output_path = args.output_path
 
-            print("Loading Wav2Vec2 ...")
-            wav2vec_model, wav2vec_extractor = load_wav2vec(args.wav2vec_path, device)
+        # --- Skip existing ---
+        if args.skip_existing and os.path.isfile(output_path):
+            print(f"  [Skip] Output exists: {output_path}")
+            skipped.append(name)
+            continue
 
-            print("Loading text embeddings ...")
-            text_embeds = load_or_encode_text(args, device, dtype)
-
-            print("Loading and adjusting reference video ...")
-            video_frames_np = load_and_adjust_video(args.video_path, num_video_frames)
-
-            print("Building conditioning ...")
-            condition = build_condition(
-                vae, wav2vec_model, wav2vec_extractor, video_frames_np,
-                audio_path, text_embeds, args.mask_path,
-                num_video_frames, num_latent_frames, device, dtype,
+        tmp_audio = None
+        try:
+            # --- Resolve audio ---
+            audio_path, tmp_audio = resolve_audio(
+                audio_path=audio_path_sample, video_path=video_path,
             )
-            del wav2vec_model
+
+            # --- Compute generation length ---
+            num_latent_frames, num_video_frames = compute_generation_length(
+                audio_path, args.num_latent_frames, args.chunk_size, args.fps,
+            )
+
+            # --- Optional LatentSync preprocessing ---
+            latentsync_metadata = None
+            if args.latentsync:
+                print("Running LatentSync face detection ...")
+                latentsync_metadata = preprocess_with_latentsync(
+                    video_path, image_processor, args.face_cache_dir,
+                    num_frames=num_video_frames,
+                )
+                if latentsync_metadata is None:
+                    print(f"  [FAIL] LatentSync preprocessing failed, skipping {name}")
+                    failed.append(name)
+                    continue
+
+            # --- Build conditioning ---
+            if precomputed_dir is not None:
+                condition = build_condition_from_precomputed(
+                    precomputed_dir, args.mask_path,
+                    num_latent_frames, device, dtype,
+                )
+            else:
+                # Lazy-load Wav2Vec + text on first non-precomputed sample
+                if wav2vec_model is None:
+                    print("Loading Wav2Vec2 ...")
+                    wav2vec_model, wav2vec_extractor = load_wav2vec(
+                        args.wav2vec_path, device,
+                    )
+                if text_embeds is None:
+                    print("Loading text embeddings ...")
+                    text_embeds = load_or_encode_text(args, device, dtype)
+
+                # Reference frames: aligned faces from LatentSync or raw video
+                if args.latentsync and latentsync_metadata is not None:
+                    aligned_faces = latentsync_metadata["aligned_faces"]
+                    ref_frames_np = np.stack([
+                        f.permute(1, 2, 0).numpy() if isinstance(f, torch.Tensor) else f
+                        for f in aligned_faces[:num_video_frames]
+                    ], axis=0)
+                else:
+                    ref_frames_np = load_and_adjust_video(video_path, num_video_frames)
+
+                print("Building conditioning ...")
+                condition = build_condition(
+                    vae, wav2vec_model, wav2vec_extractor, ref_frames_np,
+                    audio_path, text_embeds, args.mask_path,
+                    num_video_frames, num_latent_frames, device, dtype,
+                )
+
+            # --- Run inference ---
+            print("Running inference ...")
+            output_latents = run_inference(
+                model, condition, num_latent_frames, args.t_list,
+                args.chunk_size, args.context_noise, args.seed, device, dtype,
+            )
+
+            # --- Post-processing: decode + save ---
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+            if args.latentsync and latentsync_metadata is not None:
+                # LatentSync compositing path — float-space decode + composite
+                print("VAE decoding (float) ...")
+                latent_for_vae = output_latents[0].to(torch.float32)
+                video_decoded = vae.decode([latent_for_vae], device=device)
+                video_decoded = video_decoded.clamp(-1, 1)
+                # [1, 3, T_video, H, W] -> [T, 3, H, W] in [0, 1]
+                generated_float = video_decoded[0].permute(1, 0, 2, 3)  # [3,T,H,W] -> [T,3,H,W]
+                generated_float = (generated_float + 1) / 2  # [-1,1] -> [0,1]
+
+                # Composite onto original frames
+                print("Compositing ...")
+                composited_np = composite_with_latentsync_float(
+                    generated_float.cpu(), latentsync_metadata, image_processor,
+                    use_mouth_only_compositing=args.use_mouth_only,
+                )
+
+                # Save composited video (original resolution) with audio
+                composited_path = output_path
+                save_frames_as_video(composited_np, composited_path, fps=args.fps)
+                video_duration = composited_np.shape[0] / args.fps
+                tmp_composited = composited_path + ".tmp.mp4"
+                os.rename(composited_path, tmp_composited)
+                mux_video_with_audio(tmp_composited, audio_path, composited_path,
+                                     duration_s=video_duration)
+                if os.path.exists(tmp_composited):
+                    os.remove(tmp_composited)
+
+                # Also save aligned (512x512) video with audio
+                aligned_path = output_path.replace(".mp4", "_aligned.mp4")
+                aligned_np = ((generated_float.permute(0, 2, 3, 1).cpu().float()) * 255
+                              ).clamp(0, 255).to(torch.uint8).numpy()
+                save_frames_as_video(aligned_np, aligned_path, fps=args.fps)
+                tmp_aligned = aligned_path + ".tmp.mp4"
+                os.rename(aligned_path, tmp_aligned)
+                mux_video_with_audio(tmp_aligned, audio_path, aligned_path,
+                                     duration_s=video_duration)
+                if os.path.exists(tmp_aligned):
+                    os.remove(tmp_aligned)
+
+                print(f"  Saved composited: {composited_path}")
+                print(f"  Saved aligned:    {aligned_path}")
+            else:
+                # Standard decode + save (no LatentSync)
+                print("Decoding and saving ...")
+                decode_and_save(vae, output_latents, audio_path, output_path,
+                                args.fps, device)
+
+            succeeded.append(name)
+            print(f"  Done: {output_path}")
+
+        except Exception as e:
+            print(f"  [ERROR] {name}: {e}")
+            import traceback
+            traceback.print_exc()
+            failed.append(name)
+
+        finally:
+            # Cleanup per-sample temp audio
+            if tmp_audio is not None and os.path.exists(tmp_audio):
+                os.remove(tmp_audio)
+
+            # Free per-sample GPU memory
             torch.cuda.empty_cache()
 
-        # --- Run inference ---
-        print("Running inference ...")
-        output_latents = run_inference(
-            model, condition, num_latent_frames, args.t_list,
-            args.chunk_size, args.context_noise, args.seed, device, dtype,
-        )
-
-        # --- Decode and save ---
-        print("Decoding and saving ...")
-        os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)
-        decode_and_save(vae, output_latents, audio_path, args.output_path, args.fps, device)
-
-        print(f"Done! Output saved to {args.output_path}")
-
-    finally:
-        # --- Cleanup temp audio ---
-        if tmp_audio is not None and os.path.exists(tmp_audio):
-            os.remove(tmp_audio)
-            print(f"Cleaned up temp audio: {tmp_audio}")
+    # ===================================================================
+    # Summary
+    # ===================================================================
+    print(f"\n{'='*60}")
+    print(f"Summary: {len(succeeded)} succeeded, {len(failed)} failed, {len(skipped)} skipped "
+          f"(out of {len(samples)} total)")
+    if failed:
+        print(f"  Failed: {failed}")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":
