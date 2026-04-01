@@ -250,6 +250,9 @@ class Head(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
 
     def forward(self, x, t_mod):
+        # t_mod: [B, dim] -> [B, 1, dim] for broadcasting with modulation [1, 2, dim]
+        if t_mod.dim() == 2:
+            t_mod = t_mod.unsqueeze(1)
         shift, scale = (self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(2, dim=1)
         x = (self.head(self.norm(x) * (1 + scale) + shift))
         return x
@@ -380,6 +383,16 @@ class WanModel(torch.nn.Module):
         if audio_emb is not None and self.use_audio:
             audio_emb = audio_emb.reshape(x.shape[0], audio_emb.shape[0] // x.shape[0], -1, *audio_emb.shape[2:])
 
+        # ── BEGIN TEMP MEMORY LOGGING (remove after profiling) ──
+        _do_mem_log = (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)
+        def _mem(tag):
+            if _do_mem_log:
+                a = torch.cuda.memory_allocated() / 1e9
+                p = torch.cuda.max_memory_allocated() / 1e9
+                print(f"[MEM-fwd] {tag}: alloc={a:.2f}GB peak={p:.2f}GB", flush=True)
+        _mem(f"layer_loop_start (dim={x.shape}, {len(self.blocks)} blocks)")
+        # ── END TEMP MEMORY LOGGING ──
+
         features = []
         for layer_i, block in enumerate(self.blocks):
             # audio cond
@@ -399,6 +412,11 @@ class WanModel(torch.nn.Module):
             else:
                 x = block(x, context, t_mod, freqs)
 
+            # ── BEGIN TEMP MEMORY LOGGING ──
+            if layer_i % 10 == 0 or layer_i == len(self.blocks) - 1:
+                _mem(f"after block {layer_i}")
+            # ── END TEMP MEMORY LOGGING ──
+
             # Feature extraction at requested block indices
             if feature_indices and layer_i in feature_indices:
                 features.append(x)
@@ -409,6 +427,7 @@ class WanModel(torch.nn.Module):
 
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))
+        _mem("after head+unpatchify")
 
         if features:
             return x, self._unpatchify_features(features, f, h, w)

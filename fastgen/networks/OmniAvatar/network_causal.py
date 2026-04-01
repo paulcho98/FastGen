@@ -995,7 +995,52 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         This method's existence signals to the wandb callback that
         this network supports VAE decode for visual logging.
         """
-        pass
+        if not hasattr(self, "vae"):
+            self.init_vae()
+
+    def init_vae(self):
+        """Load VAE if vae_path is available. Called by wandb callback if vae not yet loaded."""
+        import os, sys
+        vae_path = os.environ.get("OMNIAVATAR_VAE_PATH", "")
+        if not vae_path:
+            omni_root = os.environ.get("OMNIAVATAR_ROOT", "/home/work/.local/OmniAvatar")
+            vae_path = os.path.join(omni_root, "pretrained_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth")
+        if not os.path.exists(vae_path):
+            logger.warning(f"VAE not found at {vae_path} — visual logging disabled")
+            self.vae = None
+            return
+
+        omni_root = os.environ.get("OMNIAVATAR_ROOT", "/home/work/.local/OmniAvatar")
+        for p in [os.path.join(omni_root, "OmniAvatar"), omni_root]:
+            if p not in sys.path:
+                sys.path.insert(0, p)
+        try:
+            from models.wan_video_vae import WanVideoVAE
+        except ImportError:
+            logger.warning("Could not import WanVideoVAE — visual logging disabled")
+            self.vae = None
+            return
+
+        raw_vae = WanVideoVAE(z_dim=16)
+        vae_state = torch.load(vae_path, map_location="cpu", weights_only=False)
+        if any(k.startswith("encoder.") for k in vae_state):
+            vae_state = {f"model.{k}": v for k, v in vae_state.items()}
+        raw_vae.load_state_dict(vae_state)
+        device = next(self.parameters()).device
+        raw_vae = raw_vae.to(device).eval()
+
+        class VAEWrapper:
+            def __init__(self, vae, dev):
+                self._vae = vae
+                self._device = dev
+            def decode(self, x):
+                with torch.no_grad():
+                    return self._vae.decode([xi.float() for xi in x], self._device)
+            def to(self, *args, **kwargs):
+                return self
+
+        self.vae = VAEWrapper(raw_vae, device)
+        logger.info(f"Loaded WanVideoVAE from {vae_path}")
 
     # ------------------------------------------------------------------
     # Unpatchify
@@ -1524,8 +1569,21 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
             )
 
             if self.training and use_gradient_checkpointing:
+                # Snapshot crossattn_cache is_init so recomputation sees the same state.
+                # The first forward sets is_init=True (computes K,V); without reset,
+                # recomputation would skip those ops → different tensor count → CheckpointError.
+                crossattn_cache_i = self._crossattn_caches[block_index]
+                saved_is_init = crossattn_cache_i["is_init"] if crossattn_cache_i is not None else None
+
+                def make_ckpt_forward(module, cache_ref, init_flag):
+                    def fn(*inputs, **kw):
+                        if cache_ref is not None and init_flag is not None:
+                            cache_ref["is_init"] = init_flag
+                        return module(*inputs, **kw)
+                    return fn
+
                 x = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
+                    make_ckpt_forward(block, crossattn_cache_i, saved_is_init),
                     x,
                     **kwargs,
                     use_reentrant=False,

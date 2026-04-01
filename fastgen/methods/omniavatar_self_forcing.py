@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, TYPE_CHECKING
 
+import os
+import sys
 import torch
 
 from fastgen.methods.distribution_matching.self_forcing import SelfForcingModel
@@ -50,6 +52,45 @@ class OmniAvatarSelfForcingModel(SelfForcingModel):
             with self._get_meta_init_context():
                 self.fake_score = instantiate(fake_score_config)
             synchronize()
+
+        # Load VAE for wandb visual logging (same logic as OmniAvatarDiffusionForcing)
+        vae_path = getattr(self.config, "vae_path", "") or ""
+        if vae_path and os.path.exists(vae_path):
+            self._load_vae(vae_path)
+
+    def _load_vae(self, vae_path: str):
+        """Load WanVideoVAE for visual logging in wandb callback."""
+        omni_root = os.environ.get("OMNIAVATAR_ROOT", "")
+        if omni_root:
+            for p in [os.path.join(omni_root, "OmniAvatar"), omni_root]:
+                if p not in sys.path:
+                    sys.path.insert(0, p)
+        try:
+            from models.wan_video_vae import WanVideoVAE
+        except ImportError:
+            logger.warning("Could not import WanVideoVAE — visual logging disabled.")
+            return
+
+        raw_vae = WanVideoVAE(z_dim=16)
+        vae_state = torch.load(vae_path, map_location="cpu", weights_only=False)
+        if any(k.startswith("encoder.") for k in vae_state):
+            vae_state = {f"model.{k}": v for k, v in vae_state.items()}
+        raw_vae.load_state_dict(vae_state)
+        device_str = f"cuda:{self.device}" if isinstance(self.device, int) else str(self.device)
+        raw_vae = raw_vae.to(device_str).eval()
+
+        class VAEWrapper:
+            def __init__(self, vae, device):
+                self._vae = vae
+                self._device = device
+            def decode(self, x):
+                with torch.no_grad():
+                    return self._vae.decode([xi.float() for xi in x], self._device)
+            def to(self, *args, **kwargs):
+                return self
+
+        self.net.vae = VAEWrapper(raw_vae, device_str)
+        logger.info(f"Loaded WanVideoVAE from {vae_path} for visual logging")
 
     def _prepare_training_data(self, data: Dict[str, Any]) -> tuple[torch.Tensor, Any, Any]:
         """Build OmniAvatar condition and neg_condition dicts from dataset output.

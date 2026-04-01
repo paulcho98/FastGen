@@ -17,16 +17,19 @@ from fastgen.utils import LazyCall as L
 
 from fastgen.networks.OmniAvatar.network import OmniAvatarWan
 from fastgen.networks.OmniAvatar.network_causal import CausalOmniAvatarWan
-from fastgen.datasets.omniavatar_dataloader import OmniAvatarDataLoader
+from fastgen.datasets.omniavatar_dataloader import OmniAvatarDataLoader, create_omniavatar_dataloader
 
 # ---- Paths (override via CLI or env) ----
 OMNIAVATAR_ROOT = os.getenv("OMNIAVATAR_ROOT", "/home/work/.local/OmniAvatar")
 DATA_ROOT = os.getenv("OMNIAVATAR_DATA_ROOT", "/home/work/stableavatar_data/v2v_training_data")
 TEACHER_CKPT = os.getenv(
     "OMNIAVATAR_TEACHER_CKPT",
-    "/home/work/output_omniavatar_v2v_maskall_refseq_new_data_loss_weights_mouth_weights/step-1500.pt",
+    "/home/work/output_omniavatar_v2v_phase2/step-10500.pt",
 )
-STUDENT_CKPT = os.getenv("OMNIAVATAR_STUDENT_CKPT", None)  # Set when 1.3B refseq is trained
+STUDENT_CKPT = os.getenv(
+    "OMNIAVATAR_STUDENT_CKPT",
+    "/home/work/output_omniavatar_v2v_1.3B_phase2/step-19500.pt",
+)
 
 # ---- Network configs ----
 OmniAvatar_V2V_14B_Teacher: dict = L(OmniAvatarWan)(
@@ -119,17 +122,17 @@ def create_config():
     # Load DF-initialized student from Stage 1 checkpoint (full FastGen format: {"model": {"net": ...}})
     config.trainer.checkpointer.pretrained_ckpt_path = os.getenv(
         "OMNIAVATAR_DF_CKPT",
-        "/data/karlo-research_715/workspace/kinemaar/paul/AR_diffusion/reference_FastGen_OmniAvatar/OmniAvatar-Train/pretrained_models/1.3B-causal-step-0002500.pth",
+        "/home/work/.local/hyunbin/FastGen/FASTGEN_OUTPUT/OmniAvatar-FastGen/omniavatar_df/df_4gpu_bs16_lr1e5_10000iter_shift_5/checkpoints/0005000.pth",
     )
     config.trainer.checkpointer.pretrained_ckpt_key_map = {"net": "net"}
 
-    # Timestep schedule — shift=3.0 matches the OmniAvatar teacher's training distribution
+    # Timestep schedule — shift=5.0 matches OmniAvatar's inference scheduler
     config.model.sample_t_cfg.time_dist_type = "shifted"
-    config.model.sample_t_cfg.shift = 3.0
+    config.model.sample_t_cfg.shift = 5.0
     config.model.sample_t_cfg.min_t = 0.001
     config.model.sample_t_cfg.max_t = 0.999
-    # t_list derived from shift=3.0: new_t = 3*t / (1 + 2*t) applied to linspace(1,0,5)
-    config.model.sample_t_cfg.t_list = [0.999, 0.900, 0.750, 0.500, 0.0]
+    # t_list derived from shift=5.0: new_t = 5*t / (1 + 4*t) applied to linspace(1,0,5)
+    config.model.sample_t_cfg.t_list = [0.999, 0.937, 0.833, 0.624, 0.0]
 
     # Self-Forcing specific
     config.model.enable_gradient_in_rollout = True
@@ -144,20 +147,43 @@ def create_config():
             "LATENTSYNC_MASK_PATH",
             "/home/work/.local/Self-Forcing_LipSync_StableAvatar/diffsynth/utils/mask.png",
         ),
-        batch_size=1,
+        batch_size=8,
         num_workers=4,
         neg_text_emb_path=os.getenv("NEG_TEXT_EMB_PATH", None),
         use_ref_sequence=True,
     )
 
-    # Training — gradient accumulation 16 steps
-    # Effective batch: batch_size(1) × num_gpus × grad_accum(16)
-    #   4 GPUs: 1 × 4 × 16 = 64
-    #   2 GPUs: 1 × 2 × 16 = 32
-    config.trainer.grad_accum_rounds = 16
+    # Validation dataloader — 10 fixed samples, finite iterator, batch_size=1
+    VAL_LIST = os.getenv("OMNIAVATAR_VAL_LIST", f"{DATA_ROOT}/video_square_val10.txt")
+    VAE_PATH = os.getenv(
+        "OMNIAVATAR_VAE_PATH",
+        os.path.join(OMNIAVATAR_ROOT, "pretrained_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth"),
+    )
+    config.dataloader_val = L(create_omniavatar_dataloader)(
+        data_list_path=VAL_LIST,
+        latentsync_mask_path=os.getenv(
+            "LATENTSYNC_MASK_PATH",
+            "/home/work/.local/Self-Forcing_LipSync_StableAvatar/diffsynth/utils/mask.png",
+        ),
+        batch_size=1,
+        num_workers=2,
+        neg_text_emb_path=os.getenv("NEG_TEXT_EMB_PATH", None),
+        use_ref_sequence=True,
+        load_ode_path=False,
+    )
+    config.model.vae_path = VAE_PATH
+
+    # Training — bs=8, grad_accum=2 for effective batch 64 on 4 GPUs
+    # Effective batch: batch_size(8) × num_gpus(4) × grad_accum(2) = 64
+    config.trainer.grad_accum_rounds = 2
     config.trainer.max_iter = 5000
-    config.trainer.logging_iter = 10
-    config.trainer.save_ckpt_iter = 500
+    config.trainer.logging_iter = 1
+    config.trainer.save_ckpt_iter = 100
+    config.trainer.validation_iter = 100
+    config.trainer.skip_initial_validation = True
+
+    # Wandb sample logging (video generation) every 100 steps, aligned with validation
+    config.trainer.callbacks.wandb.sample_logging_iter = 100
 
     config.log_config.group = "omniavatar_sf"
     return config

@@ -107,6 +107,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip_existing", action="store_true", default=False,
                         help="Skip samples that already have output subdirectory")
 
+    # Ablation
+    parser.add_argument("--zero_audio", action="store_true", default=False,
+                        help="Zero out audio embeddings (for audio ablation analysis)")
+
     # Seed
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility")
@@ -526,6 +530,11 @@ def main():
         input_latents = sample["input_latents"]   # [16, 21, H, W]
         condition = sample["condition"]
         neg_condition = sample["neg_condition"]
+
+        # Audio ablation: zero out audio in both conditional and unconditional
+        if args.zero_audio:
+            condition["audio_emb"] = torch.zeros_like(condition["audio_emb"])
+            neg_condition["audio_emb"] = torch.zeros_like(neg_condition["audio_emb"])
 
         latent_shape = tuple(input_latents.shape)  # (16, 21, H, W)
 

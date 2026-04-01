@@ -197,21 +197,18 @@ class GradClipCallback(Callback):
 
             # Check if CPU offloading is enabled by looking for DTensor grads on CPU
             # CPU offloading = DTensor local tensors are on CPU
-            # No CPU offloading = DTensor local tensors are on GPU (or no DTensors)
-            use_fsdp_cpu_offload_clip = False
-            for p in model.parameters():
-                if p.grad is not None and isinstance(p.grad, DTensor):
-                    if p.grad._local_tensor.device.type == "cpu":
-                        use_fsdp_cpu_offload_clip = True
-                        break
+            # Check if any gradients are DTensors (FSDP2 sharded params).
+            # Standard clip_grad_norm_ with foreach=True can't mix DTensor and regular Tensor.
+            has_dtensor_grads = any(
+                isinstance(p.grad, DTensor) for p in model.parameters() if p.grad is not None
+            )
 
             with cast_gradients_dtype(model, dtype=self.precision_grad_clip, enabled=cast_grads):
-                if use_fsdp_cpu_offload_clip:
-                    # Use custom clipping for FSDP with CPU offloading
-                    # Standard clip_grad_norm_ fails because DTensor ops trigger all_reduce on CPU
+                if has_dtensor_grads:
+                    # Use custom clipping that handles DTensor/Tensor mix
                     total_norm = clip_grad_norm_fsdp(model.parameters(), self.grad_norm, device=model_device)
                 else:
-                    # Standard clipping for non-FSDP or FSDP without CPU offloading
+                    # Standard clipping for non-FSDP
                     total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), self.grad_norm, foreach=True)
 
             log_dict[f"optimizer/grad_norm (model_key {self.model_key})"] = total_norm.item()

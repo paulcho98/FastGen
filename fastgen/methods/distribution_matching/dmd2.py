@@ -153,12 +153,13 @@ class DMD2Model(FastGenModel):
             # Compute the GAN loss for the generator
             gan_loss_gen = gan_loss_generator(self.discriminator(fake_feat))
         else:
-            teacher_x0 = self.teacher(
-                perturbed_data,
-                t,
-                condition=condition,
-                fwd_pred_type="x0",
-            )
+            with torch.no_grad():
+                teacher_x0 = self.teacher(
+                    perturbed_data,
+                    t,
+                    condition=condition,
+                    fwd_pred_type="x0",
+                )
             gan_loss_gen = torch.tensor(0.0, device=self.device, dtype=teacher_x0.dtype)
 
         return teacher_x0.detach(), gan_loss_gen
@@ -192,6 +193,17 @@ class DMD2Model(FastGenModel):
         teacher_x0 = teacher_x0 + (self.config.guidance_scale - 1) * (teacher_x0 - teacher_x0_neg)
         return teacher_x0
 
+    # ── BEGIN TEMP MEMORY LOGGING (remove after profiling) ──
+    @staticmethod
+    def _log_mem(tag: str):
+        import torch
+        if torch.cuda.is_available() and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0):
+            alloc = torch.cuda.memory_allocated() / 1e9
+            reserved = torch.cuda.memory_reserved() / 1e9
+            peak = torch.cuda.max_memory_allocated() / 1e9
+            print(f"[MEM] {tag}: alloc={alloc:.2f}GB reserved={reserved:.2f}GB peak={peak:.2f}GB", flush=True)
+    # ── END TEMP MEMORY LOGGING ──
+
     def _student_update_step(
         self,
         input_student: torch.Tensor,
@@ -216,13 +228,19 @@ class DMD2Model(FastGenModel):
         Returns:
             tuple of (loss_map, outputs)
         """
+        self._log_mem("student_update: START")
+
         # Generate data from student
         gen_data = self.gen_data_from_net(input_student, t_student, condition=condition)
+        self._log_mem("student_update: after rollout")
+
         perturbed_data = self.net.noise_scheduler.forward_process(gen_data, eps, t)
+        self._log_mem("student_update: after perturb")
 
         # Compute the fake score with x0-prediction
         with torch.no_grad():
             fake_score_x0 = self.fake_score(perturbed_data, t, condition=condition, fwd_pred_type="x0")
+        self._log_mem("student_update: after fake_score")
 
         # Compute the teacher x0-prediction and gan loss for generator
         assert (
@@ -232,15 +250,18 @@ class DMD2Model(FastGenModel):
             t.dtype == t_student.dtype == self.net.noise_scheduler.t_precision
         ), f"t.dtype: {t.dtype}, t_student.dtype: {t_student.dtype}, self.net.noise_scheduler.t_precision: {self.net.noise_scheduler.t_precision}"
         teacher_x0, gan_loss_gen = self._compute_teacher_prediction_gan_loss(perturbed_data, t, condition=condition)
+        self._log_mem("student_update: after teacher")
 
         # Apply classifier-free guidance if needed
         if self.config.guidance_scale is not None:
             teacher_x0 = self._apply_classifier_free_guidance(
                 perturbed_data, t, teacher_x0, neg_condition=neg_condition
             )
+        self._log_mem("student_update: after CFG")
 
         # Compute the VSD loss
         vsd_loss = variational_score_distillation_loss(gen_data, teacher_x0, fake_score_x0)
+        self._log_mem("student_update: after VSD loss")
 
         # Compute the final loss
         loss = vsd_loss + self.config.gan_loss_weight_gen * gan_loss_gen
@@ -346,10 +367,13 @@ class DMD2Model(FastGenModel):
         Returns:
             tuple of (loss_map, outputs)
         """
+        self._log_mem("fake_score_update: START")
+
         # Generate data and compute fake score loss
         with torch.no_grad():
             gen_data = self.gen_data_from_net(input_student, t_student, condition=condition)
             x_t_sg = self.net.noise_scheduler.forward_process(gen_data, eps, t)
+        self._log_mem("fake_score_update: after student gen (no_grad)")
 
         # The fake score matches the teacher, but we want to do SDS in x0 space
         fake_score_pred_type = self.config.fake_score_pred_type or self.teacher.net_pred_type
