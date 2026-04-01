@@ -801,12 +801,25 @@ def build_condition_from_precomputed(precomputed_dir, mask_path, num_latent_fram
 # ===========================================================================
 
 def load_image_processor(mask_path, device):
-    """Load LatentSync ImageProcessor for face detection and alignment."""
+    """Load LatentSync ImageProcessor for face detection and alignment.
+
+    Matches the reference inference_v2v.py initialization exactly:
+    - mask_image loaded via load_fixed_mask (uses caller-specified path)
+    - insightface_root defaults to "checkpoints/auxiliary" (same as reference)
+    - device passed as string for InsightFace compatibility
+    """
     import os as _os
     _os.environ.setdefault("ORT_DISABLE_THREAD_AFFINITY", "1")
-    from OmniAvatar.utils.latentsync.image_processor import ImageProcessor
+    from OmniAvatar.utils.latentsync.image_processor import ImageProcessor, load_fixed_mask
     print("Loading LatentSync ImageProcessor ...")
-    processor = ImageProcessor(resolution=512, device=device, mask_image=mask_path)
+    device_str = str(device) if isinstance(device, torch.device) else device
+    mask_tensor = load_fixed_mask(512, mask_image_path=mask_path) if mask_path else None
+    processor = ImageProcessor(
+        resolution=512,
+        device=device_str,
+        mask_image=mask_tensor,
+        insightface_root="checkpoints/auxiliary",  # match reference default
+    )
     return processor
 
 
@@ -1353,7 +1366,7 @@ def main():
                 video_decoded = video_decoded.clamp(-1, 1)
                 # [1, 3, T_video, H, W] -> [T, 3, H, W] in [0, 1]
                 generated_float = video_decoded[0].permute(1, 0, 2, 3)  # [3,T,H,W] -> [T,3,H,W]
-                generated_float = (generated_float + 1) / 2  # [-1,1] -> [0,1]
+                generated_float = ((generated_float + 1) / 2).clamp(0, 1)  # [-1,1] -> [0,1]
 
                 # Composite onto original frames
                 print("Compositing ...")
