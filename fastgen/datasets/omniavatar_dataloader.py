@@ -228,11 +228,18 @@ class OmniAvatarDataLoader:
             shuffle = True
 
         def collate_fn(batch):
-            """Filter out None samples from failed loads."""
+            """Filter out None samples from failed loads, detach tensors for worker compatibility."""
             valid = [s for s in batch if s is not None]
             if not valid:
                 return {}
-            return torch.utils.data.default_collate(valid)
+            # Detach tensors to avoid autograd collation errors with num_workers>0
+            detached = []
+            for sample in valid:
+                d = {}
+                for k, v in sample.items():
+                    d[k] = v.detach() if isinstance(v, torch.Tensor) and v.requires_grad else v
+                detached.append(d)
+            return torch.utils.data.default_collate(detached)
 
         self._dataloader = DataLoader(
             self.dataset,

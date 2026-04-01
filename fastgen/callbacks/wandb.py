@@ -354,6 +354,12 @@ class WandbCallback(Callback):
         """
         if dataloader_val is None:
             return
+        # Skip GT upload if SKIP_GT_VAL_UPLOAD env var is set (avoids NCCL timeout)
+        if os.environ.get("SKIP_GT_VAL_UPLOAD", "0") == "1":
+            if wandb.run:
+                logger.info("SKIP_GT_VAL_UPLOAD=1 — skipping GT val video upload")
+            synchronize()
+            return
         if iteration > 0:
             if wandb.run:
                 logger.info("Resuming from checkpoint — skipping GT val video upload (already logged)")
@@ -584,7 +590,8 @@ class WandbCallback(Callback):
         if iteration % self.config.trainer.logging_iter == 0 or iteration == 1:
             self.log_stats(self.loss_dict_record, iteration=iteration, group="train")
             logged = True
-        if iteration % self.sample_logging_iter == 0 or iteration == 1:
+        skip_early_sample = os.environ.get("SKIP_EARLY_SAMPLE_LOG", "0") == "1"
+        if iteration % self.sample_logging_iter == 0 or (iteration == 1 and not skip_early_sample):
             self.log_sample_map(model, data_batch, output_batch, iteration=iteration, group="train")
             logged = True
         if logged:

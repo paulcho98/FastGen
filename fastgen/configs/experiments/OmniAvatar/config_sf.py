@@ -92,7 +92,7 @@ def create_config():
 
     # Precision
     config.model.precision = "bfloat16"
-    config.model.precision_fsdp = "float32"  # Official T2V configs use float32 for FSDP
+    config.model.precision_fsdp = "bfloat16"  # Must match model precision to avoid dtype mismatch in Conv3d
 
     # Input shape: 512x512 @ 81 frames → latent [16, 21, 64, 64]
     config.model.input_shape = [16, 21, 64, 64]
@@ -148,7 +148,7 @@ def create_config():
             "/home/work/.local/Self-Forcing_LipSync_StableAvatar/diffsynth/utils/mask.png",
         ),
         batch_size=8,
-        num_workers=4,
+        num_workers=2,
         neg_text_emb_path=os.getenv("NEG_TEXT_EMB_PATH", None),
         use_ref_sequence=True,
     )

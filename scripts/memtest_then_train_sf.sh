@@ -12,6 +12,9 @@ export NEG_TEXT_EMB_PATH="/home/work/stableavatar_data/neg_text_emb.pt"
 export WANDB_API_KEY="${WANDB_API_KEY:-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}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export NCCL_TIMEOUT=1800  # 30 min timeout for wandb uploads during validation
+export FASTGEN_OUTPUT_ROOT="/tmp/FASTGEN_SF_OUTPUT"  # Use overlay FS (960GB free) instead of /home/work (17GB free)
+export SKIP_GT_VAL_UPLOAD=1  # Skip GT validation video upload at startup (causes NCCL timeout)
+export SKIP_EARLY_SAMPLE_LOG=1  # Skip sample video generation at iter 1 (slow, blocks NCCL)
 
 MEMTEST_LOG="/tmp/sf_14b_memtest_$(date +%Y%m%d_%H%M%S).log"
 TRAIN_LOG="/tmp/sf_train_$(date +%Y%m%d_%H%M%S).log"
