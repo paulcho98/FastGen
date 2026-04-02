@@ -130,6 +130,9 @@ class OmniAvatarSelfForcingModel(SelfForcingModel):
         fake_score_loss_val = fake_loss_map["total_loss"].detach()
 
         # --- 2. Student update (returned for trainer's backward) ---
+        # Clear KV/crossattn caches — the fake_score step's rollout left them dirty
+        self.net.clear_caches()
+
         self.fake_score.eval().requires_grad_(False)
         self.net.train().requires_grad_(True)
 
