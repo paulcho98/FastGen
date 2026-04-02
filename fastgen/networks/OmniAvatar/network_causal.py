@@ -1493,6 +1493,14 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         if self.freqs[0].device != device:
             self.freqs = tuple(f.to(device) for f in self.freqs)
 
+        # Reset crossattn is_init for gradient checkpointing safety.
+        # Between AR chunks, store_kv calls set is_init=True. If this _forward_ar
+        # call uses checkpointing, recomputation must see the same is_init state.
+        # Resetting to False ensures consistent behavior: always compute K,V fresh.
+        if self.training and use_gradient_checkpointing and self._crossattn_caches is not None:
+            for cache in self._crossattn_caches:
+                cache["is_init"] = False
+
         # Concatenate conditioning
         if y is not None:
             x = torch.cat([x, y], dim=1)
