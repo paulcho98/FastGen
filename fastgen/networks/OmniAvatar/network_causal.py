@@ -1026,8 +1026,12 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         if any(k.startswith("encoder.") for k in vae_state):
             vae_state = {f"model.{k}": v for k, v in vae_state.items()}
         raw_vae.load_state_dict(vae_state)
-        device = next(self.parameters()).device
+        # Use explicit CUDA device — next(self.parameters()).device returns DTensor device with FSDP
+        # which may not work correctly for non-FSDP modules
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        device = torch.device(f"cuda:{local_rank}")
         raw_vae = raw_vae.to(device).eval()
+        logger.info(f"VAE on device: {device}")
 
         class VAEWrapper:
             def __init__(self, vae, dev):

@@ -201,16 +201,16 @@ class Trainer:
                 iteration=iter_cur,
             )
 
-            # validation
-            if iter_cur % self.config.trainer.validation_iter == 0 and dataloader_val is not None:
-                self.validate(model_ddp, model, dataloader_val, iteration=iter_cur)
-
-            # save checkpoint
+            # save checkpoint (before validation so progress is not lost if validation is slow)
             just_saved_checkpoint = False
             latest_checkpoint_path = None
             if iter_cur % self.config.trainer.save_ckpt_iter == 0:
                 latest_checkpoint_path = self.save_checkpoint(model, iter_cur)
                 just_saved_checkpoint = True
+
+            # validation
+            if iter_cur % self.config.trainer.validation_iter == 0 and dataloader_val is not None:
+                self.validate(model_ddp, model, dataloader_val, iteration=iter_cur)
 
             if self.auto_resume_exit(
                 model, iter_cur, skip_if_just_saved=just_saved_checkpoint, recent_checkpoint_path=latest_checkpoint_path
@@ -356,21 +356,33 @@ class Trainer:
             ):
                 self.callbacks.on_validation_begin(model, iteration=iteration, idx=idx)
                 logger.info(f"Validation iteration {iteration}")
+                import time as _time
+                _val_t0 = _time.time()
                 for step, data in enumerate(dataloader_val):
                     if getattr(global_vars, "MAX_VAL_STEPS", None) is not None and step >= getattr(
                         global_vars, "MAX_VAL_STEPS"
                     ):
                         break
 
+                    _step_t0 = _time.time()
                     self.callbacks.on_validation_step_begin(model, data, step=step, iteration=iteration, idx=idx)
                     data = self.preprocess_data(model, data)
-                    logger.debug(f"iteration: {iteration} | validation step: {step} | data: {basic_utils.to_str(data)}")
+                    logger.info(f"[val] step {step}: data preprocessed ({_time.time()-_step_t0:.1f}s)")
                     with model.autocast():
-                        loss_map, outputs = model_ddp.single_train_step(data, iteration)
+                        # Use validation_step if available (causal AR inference),
+                        # otherwise fall back to single_train_step
+                        if hasattr(model, "validation_step"):
+                            loss_map, outputs = model.validation_step(data, iteration)
+                        else:
+                            loss_map, outputs = model_ddp.single_train_step(data, iteration)
+                    logger.info(f"[val] step {step}: inference done ({_time.time()-_step_t0:.1f}s)")
                     self.callbacks.on_validation_step_end(
                         model, data, outputs, loss_map, step=step, iteration=iteration, idx=idx
                     )
+                    logger.info(f"[val] step {step}: callbacks done ({_time.time()-_step_t0:.1f}s)")
+                logger.info(f"[val] all steps done ({_time.time()-_val_t0:.1f}s)")
                 self.callbacks.on_validation_end(model, iteration=iteration, idx=idx)
+                logger.info(f"[val] on_validation_end done ({_time.time()-_val_t0:.1f}s)")
                 synchronize()
 
     @torch.no_grad()

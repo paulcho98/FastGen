@@ -619,42 +619,71 @@ class WandbCallback(Callback):
         idx: int = 0,
     ) -> None:
         self.val_loss_dict_record.add(loss_dict)
+        # ── TEMP TIMING LOG ──
+        import time as _time
+        _t0 = _time.time()
+        _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        def _tlog(msg):
+            if _rank == 0:
+                logger.info(f"[val_step_end step={step}] {msg} ({_time.time()-_t0:.1f}s elapsed)")
+        _tlog("entered")
+        # ── END TEMP ──
 
         if step % self.validation_logging_step == 0:
             has_vae = hasattr(model.net, "vae")
+            _tlog(f"video logging: has_vae={has_vae}, vae_is_none={getattr(model.net, 'vae', 'MISSING') is None}")
             if not has_vae:
                 return
 
             # AR-generate the video
             gen_rand = output_batch.get("gen_rand")
+            _tlog(f"gen_rand type={type(gen_rand).__name__}, is_callable={isinstance(gen_rand, Callable)}")
             if gen_rand is not None and isinstance(gen_rand, Callable):
+                _tlog("calling gen_rand()... (synchronize before)")
                 synchronize()
                 gen_rand = gen_rand()
                 synchronize()
+                _tlog("gen_rand() done")
 
             if gen_rand is None:
+                _tlog("gen_rand is None, skipping")
                 return
 
-            device = model.device
-            with torch.no_grad(), basic_utils.inference_mode(
-                precision_amp=model.precision_amp_enc, device_type=device.type
-            ):
-                gen_decoded = model.net.vae.decode(gen_rand[:1])
-                gt_decoded = model.net.vae.decode(data_batch["real"][:1].to(device))
+            if isinstance(gen_rand, torch.Tensor):
+                _tlog(f"gen_rand shape={gen_rand.shape}, dtype={gen_rand.dtype}")
 
-            self._val_gen_videos.append(self._to_uint8_video(gen_decoded))
-            self._val_gt_videos.append(self._to_uint8_video(gt_decoded))
+            # VAE decode + video collection — rank 0 only to avoid FSDP deadlock.
+            # Other ranks wait at synchronize() below.
+            if _rank == 0:
+                device = model.device
+                _tlog("starting VAE decode of gen_rand[:1] (rank 0 only)")
+                with torch.no_grad(), basic_utils.inference_mode(
+                    precision_amp=model.precision_amp_enc, device_type=device.type
+                ):
+                    gen_decoded = model.net.vae.decode(gen_rand[:1])
+                    _tlog(f"gen_rand decoded, shape={gen_decoded.shape}")
+                    gt_decoded = model.net.vae.decode(data_batch["real"][:1].to(device))
+                    _tlog(f"gt decoded, shape={gt_decoded.shape}")
 
-            # Extract audio path for muxing
-            audio_path = None
-            if "audio_path" in data_batch:
-                ap = data_batch["audio_path"]
-                if isinstance(ap, (list, tuple)) and len(ap) > 0 and ap[0]:
-                    audio_path = ap[0] if os.path.isfile(ap[0]) else None
-            self._val_audio_paths.append(audio_path)
+                self._val_gen_videos.append(self._to_uint8_video(gen_decoded))
+                self._val_gt_videos.append(self._to_uint8_video(gt_decoded))
+                _tlog("videos appended")
 
+                # Extract audio path for muxing
+                audio_path = None
+                if "audio_path" in data_batch:
+                    ap = data_batch["audio_path"]
+                    if isinstance(ap, (list, tuple)) and len(ap) > 0 and ap[0]:
+                        audio_path = ap[0] if os.path.isfile(ap[0]) else None
+                self._val_audio_paths.append(audio_path)
+                _tlog(f"audio_path={audio_path is not None}")
+
+            synchronize()
             gc.collect()
             torch.cuda.empty_cache()
+            _tlog("done (after sync)")
+        else:
+            _tlog(f"skipping video logging (step={step} % {self.validation_logging_step} != 0)")
 
     def on_validation_end(self, model: FastGenModel, iteration: int = 0, idx: int = 0) -> None:
         self.log_stats(self.val_loss_dict_record, iteration=iteration, group=f"val{idx}")

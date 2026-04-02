@@ -92,6 +92,46 @@ class OmniAvatarSelfForcingModel(SelfForcingModel):
         self.net.vae = VAEWrapper(raw_vae, device_str)
         logger.info(f"Loaded WanVideoVAE from {vae_path} for visual logging")
 
+    def validation_step(self, data: Dict[str, Any], iteration: int) -> tuple[dict, dict]:
+        """Validation using CausVid's causal AR inference (chunk-by-chunk with KV cache).
+
+        Uses CausVidModel._student_sample_loop which does proper AR inference:
+        chunk-by-chunk denoising with KV cache updates, matching inference behavior.
+        No teacher, no fake_score — just the student generating video.
+        """
+        import time
+        from fastgen.methods.distribution_matching.causvid import CausVidModel
+
+        t0 = time.time()
+
+        real_data, condition, neg_condition = self._prepare_training_data(data)
+        B, C, T, H, W = real_data.shape
+
+        logger.info(f"[val] Starting CausVid AR inference (B={B}, T={T}, steps={self.config.student_sample_steps})")
+
+        noise = torch.randn_like(real_data)
+        context_noise = getattr(self.config, "context_noise", 0)
+
+        with torch.no_grad():
+            gen_data = CausVidModel.generator_fn(
+                net=self.net,
+                noise=noise,
+                condition=condition,
+                student_sample_steps=self.config.student_sample_steps,
+                student_sample_type=self.config.student_sample_type,
+                t_list=self.config.sample_t_cfg.t_list,
+                context_noise=context_noise,
+                precision_amp=self.precision_amp_infer,
+            )
+
+        t_gen = time.time() - t0
+        logger.info(f"[val] AR inference done in {t_gen:.1f}s")
+
+        loss_map = {"total_loss": torch.tensor(0.0, device=self.device)}
+        outputs = {"gen_rand": gen_data}  # Already generated, not a callable
+
+        return loss_map, outputs
+
     def _prepare_training_data(self, data: Dict[str, Any]) -> tuple[torch.Tensor, Any, Any]:
         """Build OmniAvatar condition and neg_condition dicts from dataset output.
 
