@@ -241,6 +241,7 @@ def init_wandb(config: BaseConfig):
         project=wandb_config.project,
         group=wandb_config.group,
         name=wandb_config.name,
+        entity=getattr(wandb_config, "wandb_entity", None),
         config=config_resolved,
         dir=wandb_config.save_path,
         resume="allow",

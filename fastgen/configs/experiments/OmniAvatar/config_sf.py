@@ -82,7 +82,7 @@ def create_config():
     config = config_sf_default.create_config()
 
     # Learning rates and optimizer (beta1=0.0 matches reference Self-Forcing implementation)
-    config.model.net_optimizer.lr = 1e-5
+    config.model.net_optimizer.lr = 2e-6
     config.model.net_optimizer.betas = (0.0, 0.999)
     config.model.fake_score_optimizer.lr = 2e-6
     config.model.fake_score_optimizer.betas = (0.0, 0.999)
@@ -108,7 +108,7 @@ def create_config():
     # GAN disabled by default to save ~35 GB VRAM (matching T2V 14B teacher config).
     # Enable later for quality improvement if memory allows.
     config.model.gan_loss_weight_gen = 0
-    config.model.student_update_freq = 6  # 1:5 ratio (5 critic updates + 1 student update per cycle, matching original SF)
+    config.model.student_update_freq = 5  # On every 5th step, both fake_score and student update (matching original SF)
     # To enable GAN, uncomment:
     # config.model.gan_loss_weight_gen = 0.003
     # config.model.discriminator = Discriminator_Wan_14B_Config
@@ -187,4 +187,5 @@ def create_config():
     config.trainer.callbacks.wandb.fps = 25  # OmniAvatar is 25 fps
 
     config.log_config.group = "omniavatar_sf"
+    config.log_config.wandb_entity = "paulhcho"
     return config

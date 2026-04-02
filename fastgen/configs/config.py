@@ -34,6 +34,8 @@ class LogConfig:
     name: str = "debug"
     # W&B mode, can be "online" or "disabled".
     wandb_mode: str = "online"
+    # W&B entity (team or username)
+    wandb_entity: Optional[str] = None
     # Wandb credential path
     wandb_credential: str = "./credentials/wandb_api.txt"
 
