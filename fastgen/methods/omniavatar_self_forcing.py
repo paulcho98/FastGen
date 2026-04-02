@@ -136,12 +136,21 @@ class OmniAvatarSelfForcingModel(SelfForcingModel):
         self.fake_score.eval().requires_grad_(False)
         self.net.train().requires_grad_(True)
 
+        # Disable gradient checkpointing for AR rollout to avoid crossattn cache
+        # is_init mismatch between forward and recomputation. The 1.3B model on
+        # chunk_size=3 (3072 tokens) uses minimal extra memory without checkpointing.
+        saved_grad_ckpt = self.net._use_gradient_checkpointing
+        self.net._use_gradient_checkpointing = False
+
         # Re-generate noise (fresh data like original SF)
         input_student, t_student, t, eps = self._generate_noise_and_time(real_data)
 
         student_loss_map, student_outputs = self._student_update_step(
             input_student, t_student, t, eps, data, condition=condition, neg_condition=neg_condition
         )
+
+        # Restore gradient checkpointing
+        self.net._use_gradient_checkpointing = saved_grad_ckpt
 
         # Add fake_score loss to the returned map for logging
         student_loss_map["fake_score_loss"] = fake_score_loss_val
