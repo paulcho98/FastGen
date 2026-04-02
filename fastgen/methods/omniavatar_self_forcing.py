@@ -92,62 +92,6 @@ class OmniAvatarSelfForcingModel(SelfForcingModel):
         self.net.vae = VAEWrapper(raw_vae, device_str)
         logger.info(f"Loaded WanVideoVAE from {vae_path} for visual logging")
 
-    def single_train_step(
-        self, data: Dict[str, Any], iteration: int
-    ) -> tuple[dict, dict]:
-        """Override to run both fake_score and student on student update steps.
-
-        Matches original Self-Forcing: critic updates every step including
-        generator steps. On student steps, fake_score does its own
-        forward/backward/step first, then student loss is returned for
-        the trainer's backward.
-        """
-        if iteration % self.config.student_update_freq != 0:
-            # Non-student step: just fake_score (same as base)
-            return super().single_train_step(data, iteration)
-
-        # Student step: run fake_score update first, then student update
-
-        # --- 1. Fake score update (manual backward + step) ---
-        self.net.requires_grad_(False)
-        self.fake_score.train().requires_grad_(True)
-
-        real_data, condition, neg_condition = self._prepare_training_data(data)
-        input_student, t_student, t, eps = self._generate_noise_and_time(real_data)
-
-        fake_loss_map, fake_outputs = self._fake_score_discriminator_update_step(
-            input_student, t_student, t, eps, real_data, condition=condition
-        )
-
-        # Manual backward + step for fake_score
-        self.fake_score_optimizer.zero_grad(set_to_none=True)
-        fake_loss_map["total_loss"].backward()
-        from fastgen.callbacks.grad_clip import clip_grad_norm_fsdp
-        clip_grad_norm_fsdp(self.fake_score.parameters(), max_norm=10.0)
-        self.fake_score_optimizer.step()
-        self.fake_score_lr_scheduler.step()
-
-        fake_score_loss_val = fake_loss_map["total_loss"].detach()
-
-        # --- 2. Student update (returned for trainer's backward) ---
-        # Clear KV/crossattn caches — the fake_score step's rollout left them dirty
-        self.net.clear_caches()
-
-        self.fake_score.eval().requires_grad_(False)
-        self.net.train().requires_grad_(True)
-
-        # Re-generate noise (fresh data like original SF)
-        input_student, t_student, t, eps = self._generate_noise_and_time(real_data)
-
-        student_loss_map, student_outputs = self._student_update_step(
-            input_student, t_student, t, eps, data, condition=condition, neg_condition=neg_condition
-        )
-
-        # Add fake_score loss to the returned map for logging
-        student_loss_map["fake_score_loss"] = fake_score_loss_val
-
-        return student_loss_map, student_outputs
-
     def validation_step(self, data: Dict[str, Any], iteration: int) -> tuple[dict, dict]:
         """Validation using CausVid's causal AR inference (chunk-by-chunk with KV cache).
 

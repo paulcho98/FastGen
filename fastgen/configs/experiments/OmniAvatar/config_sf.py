@@ -108,7 +108,7 @@ def create_config():
     # GAN disabled by default to save ~35 GB VRAM (matching T2V 14B teacher config).
     # Enable later for quality improvement if memory allows.
     config.model.gan_loss_weight_gen = 0
-    config.model.student_update_freq = 5  # On every 5th step, both fake_score and student update (matching original SF)
+    config.model.student_update_freq = 5  # 1:4 ratio (exclusive: either student or fake_score per step)
     # To enable GAN, uncomment:
     # config.model.gan_loss_weight_gen = 0.003
     # config.model.discriminator = Discriminator_Wan_14B_Config
