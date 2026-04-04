@@ -530,3 +530,218 @@ class TestStochasticAttnConfig:
         assert mask_full is not None and mask_window is not None
         # They should be structurally different (different kv_num_blocks)
 
+
+# ---------------------------------------------------------------------------
+# Test class for mask visualization and exhaustive verification
+# ---------------------------------------------------------------------------
+class TestMaskVisualization:
+    """Detailed verification of mask patterns -- print for visual inspection."""
+
+    NUM_FRAMES = 21
+    CHUNK_SIZE = 3
+    FRAME_SEQLEN = 4
+
+    def _build(self, local_attn_size, sink_size=0):
+        """Build a mask and return dense [total_tokens, total_tokens] bool tensor."""
+        dense, _ = _build_mask_and_dense(
+            num_frames=self.NUM_FRAMES,
+            frame_seqlen=self.FRAME_SEQLEN,
+            chunk_size=self.CHUNK_SIZE,
+            local_attn_size=local_attn_size,
+            sink_size=sink_size,
+        )
+        return dense
+
+    def _frame_mask(self, dense):
+        """Collapse token-level mask to frame-level [F, F] bool tensor.
+
+        True if ANY token pair between those frames is visible.
+        """
+        F = self.NUM_FRAMES
+        S = self.FRAME_SEQLEN
+        frame_mask = torch.zeros(F, F, dtype=torch.bool)
+        for qf in range(F):
+            for kf in range(F):
+                block = dense[
+                    qf * S : (qf + 1) * S,
+                    kf * S : (kf + 1) * S,
+                ]
+                frame_mask[qf, kf] = block.any().item()
+        return frame_mask
+
+    def _print_frame_mask(self, frame_mask, label):
+        """Print an ASCII grid of the frame-level mask for visual inspection."""
+        F = frame_mask.shape[0]
+        print(f"\n{'=' * 60}")
+        print(f"  {label}")
+        print(f"  {self.NUM_FRAMES} frames, chunk_size={self.CHUNK_SIZE}, "
+              f"FRAME_SEQLEN={self.FRAME_SEQLEN}")
+        print(f"{'=' * 60}")
+
+        # Header row
+        header = "kv: " + "".join(f"{i:3d}" for i in range(F))
+        print(header)
+        print("q   " + "---" * F)
+
+        for qf in range(F):
+            row = f"{qf:2d} |"
+            for kf in range(F):
+                if frame_mask[qf, kf]:
+                    row += " \u2588\u2588"
+                else:
+                    row += " \u00b7\u00b7"
+            print(row)
+        print()
+
+    # --- Test 1: full causal visualization and verification -----------------
+    def test_visualize_full_causal(self):
+        """Print full causal mask. Verify lower-triangular at chunk level."""
+        dense = self._build(local_attn_size=-1, sink_size=0)
+        fm = self._frame_mask(dense)
+        self._print_frame_mask(fm, "Full Causal (local_attn_size=-1, sink=0)")
+
+        chunks = _chunk_boundaries(self.NUM_FRAMES, self.CHUNK_SIZE)
+
+        # Verify: for each pair of chunks (qi, ki), all frames in qi see
+        # all frames in ki iff ki <= qi.
+        for qi, (q_start, q_end) in enumerate(chunks):
+            for ki, (k_start, k_end) in enumerate(chunks):
+                expected = ki <= qi
+                for qf in range(q_start, q_end):
+                    for kf in range(k_start, k_end):
+                        actual = fm[qf, kf].item()
+                        assert actual == expected, (
+                            f"Frame q={qf} (chunk {qi}), kv={kf} (chunk {ki}): "
+                            f"expected {expected}, got {actual}"
+                        )
+
+    # --- Test 2: window=6 visualization and verification --------------------
+    def test_visualize_window_6(self):
+        """Print window=6 mask. Verify chunk 4 sees chunks 3-4 but NOT chunk 2."""
+        dense = self._build(local_attn_size=6, sink_size=0)
+        fm = self._frame_mask(dense)
+        self._print_frame_mask(fm, "Window=6 (local_attn_size=6, sink=0)")
+
+        chunks = _chunk_boundaries(self.NUM_FRAMES, self.CHUNK_SIZE)
+        # With 21 frames and chunk_size=3:
+        # chunks: [(0,3), (3,6), (6,9), (9,12), (12,15), (15,18), (18,21)]
+        # But front-loading remainder: 21 // 3 = 7, remainder = 0
+        # So: frame_counts = [3, 3, 3, 3, 3, 3, 3]
+        # chunks: [(0,3), (3,6), (6,9), (9,12), (12,15), (15,18), (18,21)]
+
+        # Chunk 4 = frames 12-14, chunk_end=15, window_start=max(0,15-6)=9
+        # So chunk 4 sees frames 9-14 (chunks 3 and 4) but NOT chunk 2 (frames 6-8)
+        for qf in range(12, 15):
+            # Should see chunk 3 (frames 9-11) and chunk 4 (frames 12-14)
+            for kf in range(9, 15):
+                assert fm[qf, kf].item(), (
+                    f"Frame q={qf} should see kv={kf} (in window)"
+                )
+            # Should NOT see chunk 2 (frames 6-8)
+            for kf in range(6, 9):
+                assert not fm[qf, kf].item(), (
+                    f"Frame q={qf} should NOT see kv={kf} (outside window)"
+                )
+
+    # --- Test 3: window=7 + sink=1 visualization and verification -----------
+    def test_visualize_window_7_sink_1(self):
+        """Print window=7 + sink=1 mask. Verify frame 0 visible from ALL frames.
+        Frame 1 NOT visible from chunk 6."""
+        dense = self._build(local_attn_size=7, sink_size=1)
+        fm = self._frame_mask(dense)
+        self._print_frame_mask(fm, "Window=7, Sink=1 (local_attn_size=7, sink_size=1)")
+
+        # Frame 0 (sink) should be visible from ALL query frames
+        for qf in range(self.NUM_FRAMES):
+            assert fm[qf, 0].item(), (
+                f"Sink frame 0 must be visible from frame {qf}"
+            )
+
+        chunks = _chunk_boundaries(self.NUM_FRAMES, self.CHUNK_SIZE)
+        # Chunk 6 = frames 18-20, chunk_end=21, window_start=max(0,21-7)=14
+        # Frame 1 is not a sink (only frame 0 is), and 1 < 14 so outside window
+        for qf in range(18, 21):
+            assert not fm[qf, 1].item(), (
+                f"Frame 1 should NOT be visible from chunk 6 frame {qf} "
+                f"(not sink, outside window)"
+            )
+
+    # --- Test 4: window=9 visualization and verification --------------------
+    def test_visualize_window_9(self):
+        """Print window=9 mask (3 chunks visible)."""
+        dense = self._build(local_attn_size=9, sink_size=0)
+        fm = self._frame_mask(dense)
+        self._print_frame_mask(fm, "Window=9 (local_attn_size=9, sink=0)")
+
+        chunks = _chunk_boundaries(self.NUM_FRAMES, self.CHUNK_SIZE)
+
+        # With window=9 and chunk_size=3, each chunk sees 3 chunks (9/3 = 3)
+        # Verify: chunk 5 (frames 15-17), chunk_end=18, window_start=max(0,18-9)=9
+        # Sees frames 9-17 (chunks 3, 4, 5) but NOT chunk 2 (frames 6-8)
+        for qf in range(15, 18):
+            for kf in range(9, 18):
+                assert fm[qf, kf].item(), (
+                    f"Frame q={qf} should see kv={kf} (3-chunk window)"
+                )
+            for kf in range(6, 9):
+                assert not fm[qf, kf].item(), (
+                    f"Frame q={qf} should NOT see kv={kf} (outside 3-chunk window)"
+                )
+
+        # Verify: last chunk 6 (frames 18-20), chunk_end=21, window_start=max(0,21-9)=12
+        # Sees frames 12-20 (chunks 4, 5, 6) but NOT chunk 3 (frames 9-11)
+        for qf in range(18, 21):
+            for kf in range(12, 21):
+                assert fm[qf, kf].item(), (
+                    f"Frame q={qf} should see kv={kf} (in window)"
+                )
+            for kf in range(9, 12):
+                assert not fm[qf, kf].item(), (
+                    f"Frame q={qf} should NOT see kv={kf} (outside window)"
+                )
+
+    # --- Test 5: RoPE indices for all configs -------------------------------
+    def test_rope_indices_all_configs(self):
+        """Print RoPE indices for all configs. Verify max index bounded."""
+        configs = [
+            {"label": "Full Causal", "local_attn_size": -1, "sink_size": 0},
+            {"label": "Window=6", "local_attn_size": 6, "sink_size": 0},
+            {"label": "Window=7 + Sink=1", "local_attn_size": 7, "sink_size": 1},
+            {"label": "Window=9", "local_attn_size": 9, "sink_size": 0},
+        ]
+
+        for cfg in configs:
+            indices = compute_dynamic_rope_indices(
+                num_frames=self.NUM_FRAMES,
+                chunk_size=self.CHUNK_SIZE,
+                local_attn_size=cfg["local_attn_size"],
+                sink_size=cfg["sink_size"],
+            )
+
+            # Print the indices
+            print(f"\nRoPE indices -- {cfg['label']} "
+                  f"(local_attn_size={cfg['local_attn_size']}, "
+                  f"sink_size={cfg['sink_size']})")
+            print(f"  Frames:  {list(range(self.NUM_FRAMES))}")
+            print(f"  Indices: {indices.tolist()}")
+            print(f"  Max index: {indices.max().item()}")
+
+            # Verify max index bound for windowed configs
+            if cfg["local_attn_size"] > 0:
+                max_allowed = cfg["local_attn_size"] - 1
+                assert indices.max().item() <= max_allowed, (
+                    f"{cfg['label']}: max RoPE index {indices.max().item()} "
+                    f"exceeds allowed {max_allowed}"
+                )
+            else:
+                # Full causal: max index should be NUM_FRAMES - 1
+                assert indices.max().item() == self.NUM_FRAMES - 1, (
+                    f"Full causal: max RoPE index {indices.max().item()} "
+                    f"should be {self.NUM_FRAMES - 1}"
+                )
+
+            # Verify length matches
+            assert len(indices) == self.NUM_FRAMES, (
+                f"Expected {self.NUM_FRAMES} indices, got {len(indices)}"
+            )
+
