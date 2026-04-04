@@ -745,3 +745,126 @@ class TestMaskVisualization:
                 f"Expected {self.NUM_FRAMES} indices, got {len(indices)}"
             )
 
+
+# ---------------------------------------------------------------------------
+# End-to-end smoke tests: real forward + backward through the model
+# ---------------------------------------------------------------------------
+class TestEndToEnd:
+    """Smoke tests running forward + backward through CausalOmniAvatarWan.
+
+    Uses tiny dimensions (B=1, T=9, H=16, W=16) with random weights to
+    verify no shape mismatches or crashes with sliding window attention.
+    """
+
+    # Shared helper to build a minimal model and inputs
+    def _build_model_and_inputs(self, **model_overrides):
+        """Construct a tiny CausalOmniAvatarWan and matching dummy inputs.
+
+        Returns (model, x_t, t, condition) all on CUDA in bf16.
+        """
+        from fastgen.networks.OmniAvatar.network_causal import CausalOmniAvatarWan
+
+        defaults = dict(
+            model_size="1.3B",
+            in_dim=65,
+            mode="v2v",
+            chunk_size=3,
+            total_num_frames=9,
+            use_audio=False,
+            local_attn_size=-1,
+            sink_size=0,
+            use_dynamic_rope=False,
+            base_model_paths=None,
+            omniavatar_ckpt_path=None,
+            disable_grad_ckpt=True,
+        )
+        defaults.update(model_overrides)
+
+        model = CausalOmniAvatarWan(**defaults)
+        model = model.cuda().to(torch.bfloat16).train()
+
+        B, C, T, H, W = 1, 16, 9, 16, 16
+        device = torch.device("cuda")
+        dtype = torch.bfloat16
+
+        x_t = torch.randn(B, C, T, H, W, device=device, dtype=dtype)
+        # Per-frame timesteps [B, T] triggers full-sequence mode
+        t = torch.rand(B, T, device=device, dtype=dtype)
+
+        # Condition dict — V2V with in_dim=65 needs 49 extra channels:
+        #   ref_latent(16) + mask(1) + masked_video(16) + ref_sequence(16) = 49
+        condition = {
+            "text_embeds": torch.randn(B, 512, 4096, device=device, dtype=dtype),
+            "ref_latent": torch.randn(B, 16, 1, H, W, device=device, dtype=dtype),
+            "mask": torch.ones(H, W, device=device, dtype=dtype),
+            "masked_video": torch.randn(B, 16, T, H, W, device=device, dtype=dtype),
+            "ref_sequence": torch.randn(B, 16, T, H, W, device=device, dtype=dtype),
+        }
+
+        return model, x_t, t, condition
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+    def test_forward_backward_with_window(self):
+        """Full forward + backward pass with local_attn_size=6."""
+        model, x_t, t, condition = self._build_model_and_inputs(
+            local_attn_size=6,
+            sink_size=0,
+            use_dynamic_rope=True,
+        )
+
+        out = model(x_t, t, condition=condition, is_ar=False, fwd_pred_type="x0")
+
+        # Output shape must match input latent shape
+        assert out.shape == x_t.shape, (
+            f"Expected output shape {x_t.shape}, got {out.shape}"
+        )
+
+        # Backward pass
+        out.sum().backward()
+
+        # At least one parameter must have gradients
+        has_grad = any(
+            p.grad is not None and p.grad.abs().sum() > 0
+            for p in model.parameters()
+            if p.requires_grad
+        )
+        assert has_grad, "No parameter received gradients after backward"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+    def test_forward_backward_with_stochastic(self):
+        """Forward + backward with stochastic attention configs (two forward passes)."""
+        model, x_t, t, condition = self._build_model_and_inputs(
+            local_attn_size=-1,  # default; overridden by stochastic configs
+            sink_size=0,
+            use_dynamic_rope=True,
+            stochastic_attn_configs=[
+                {"local_attn_size": -1, "sink_size": 0, "weight": 0.5},
+                {"local_attn_size": 6, "sink_size": 0, "weight": 0.5},
+            ],
+        )
+
+        # First forward pass
+        out1 = model(x_t, t, condition=condition, is_ar=False, fwd_pred_type="x0")
+        assert out1.shape == x_t.shape, (
+            f"Pass 1: expected output shape {x_t.shape}, got {out1.shape}"
+        )
+
+        # Clear cached block_mask to force rebuild with a potentially different config
+        model.block_mask = None
+
+        # Second forward pass (may sample different stochastic config)
+        out2 = model(x_t, t, condition=condition, is_ar=False, fwd_pred_type="x0")
+        assert out2.shape == x_t.shape, (
+            f"Pass 2: expected output shape {x_t.shape}, got {out2.shape}"
+        )
+
+        # Backward on second output
+        out2.sum().backward()
+
+        has_grad = any(
+            p.grad is not None and p.grad.abs().sum() > 0
+            for p in model.parameters()
+            if p.requires_grad
+        )
+        assert has_grad, "No parameter received gradients after backward"
+
