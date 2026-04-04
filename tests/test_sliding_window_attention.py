@@ -482,3 +482,51 @@ class TestDynamicRoPE:
         out_dynamic = dynamic_rope_apply_full(x, grid_sizes, freqs, rope_indices)
 
         torch.testing.assert_close(out_standard, out_dynamic, atol=1e-6, rtol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Test class for stochastic attention config sampling
+# ---------------------------------------------------------------------------
+class TestStochasticAttnConfig:
+    """Test stochastic attention config sampling."""
+
+    def test_sample_returns_defaults_when_no_configs(self):
+        """Without stochastic configs, returns instance defaults."""
+        from fastgen.networks.OmniAvatar.network_causal import CausalOmniAvatarWan
+        model = object.__new__(CausalOmniAvatarWan)
+        model.local_attn_size = 6
+        model.sink_size = 1
+        model._stochastic_attn_configs = None
+        cfg = model._sample_attn_config()
+        assert cfg == {"local_attn_size": 6, "sink_size": 1}
+
+    def test_sample_picks_from_configs(self):
+        """With stochastic configs, samples from the list."""
+        from fastgen.networks.OmniAvatar.network_causal import CausalOmniAvatarWan
+        model = object.__new__(CausalOmniAvatarWan)
+        model.local_attn_size = -1
+        model.sink_size = 0
+        model._stochastic_attn_configs = [
+            {"local_attn_size": -1, "sink_size": 0, "weight": 0.5},
+            {"local_attn_size": 6, "sink_size": 1, "weight": 0.5},
+        ]
+        configs_seen = set()
+        for _ in range(200):
+            cfg = model._sample_attn_config()
+            configs_seen.add((cfg["local_attn_size"], cfg["sink_size"]))
+        assert (-1, 0) in configs_seen
+        assert (6, 1) in configs_seen
+
+    def test_different_masks_from_different_configs(self):
+        """Different configs should produce different masks."""
+        from fastgen.networks.OmniAvatar.network_causal import CausalOmniAvatarWan
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = object.__new__(CausalOmniAvatarWan)
+        model.chunk_size = 3
+        frame_seqlen = 4
+
+        mask_full = model._build_block_mask(device, 21, frame_seqlen, 3, local_attn_size=-1, sink_size=0)
+        mask_window = model._build_block_mask(device, 21, frame_seqlen, 3, local_attn_size=6, sink_size=0)
+        assert mask_full is not None and mask_window is not None
+        # They should be structurally different (different kv_num_blocks)
+

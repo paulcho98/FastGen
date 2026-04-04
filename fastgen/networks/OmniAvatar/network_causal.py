@@ -910,6 +910,7 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         sink_size: int = 0,
         use_dynamic_rope: bool = False,
         disable_grad_ckpt: bool = False,
+        stochastic_attn_configs: Optional[list] = None,
         **kwargs,
     ):
         """
@@ -1043,6 +1044,7 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
 
         # Gradient checkpointing: enabled by default (like T2V's CausalWan)
         self._use_gradient_checkpointing = not disable_grad_ckpt
+        self._stochastic_attn_configs = stochastic_attn_configs
 
         # --- Load weights ---
         self._finish_init(base_model_paths, omniavatar_ckpt_path)
@@ -1482,6 +1484,26 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         self.block_mask = None
         self._cached_audio = None
 
+    def _sample_attn_config(self) -> dict:
+        """Sample an attention config from stochastic_attn_configs.
+
+        Returns dict with 'local_attn_size' and 'sink_size' keys.
+        Falls back to instance defaults if no stochastic configs.
+        """
+        if not self._stochastic_attn_configs:
+            return {
+                "local_attn_size": self.local_attn_size,
+                "sink_size": self.sink_size,
+            }
+
+        import random
+        weights = [c.get("weight", 1.0) for c in self._stochastic_attn_configs]
+        chosen = random.choices(self._stochastic_attn_configs, weights=weights, k=1)[0]
+        return {
+            "local_attn_size": chosen.get("local_attn_size", self.local_attn_size),
+            "sink_size": chosen.get("sink_size", self.sink_size),
+        }
+
     # ------------------------------------------------------------------
     # Internal forward (full-sequence mode)
     # ------------------------------------------------------------------
@@ -1562,20 +1584,36 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         # Audio processing
         processed_audio = self._process_audio_embeddings(audio_emb, x.shape)
 
-        # Build block mask (chunk-wise causal, matching CausalWan)
-        if self.block_mask is None and FLEX_ATTENTION_AVAILABLE:
-            frame_seqlen = h * w
-            self.block_mask = self._build_block_mask(
-                device, f, frame_seqlen, self.chunk_size,
-                local_attn_size=self.local_attn_size,
-                sink_size=self.sink_size,
-            )
+        # Determine attention config (stochastic during training, defaults during eval)
+        if self.training and self._stochastic_attn_configs:
+            attn_cfg = self._sample_attn_config()
+            attn_local = attn_cfg["local_attn_size"]
+            attn_sink = attn_cfg["sink_size"]
+            # Rebuild mask every forward pass (stochastic — different config each time)
+            if FLEX_ATTENTION_AVAILABLE:
+                frame_seqlen = h * w
+                self.block_mask = self._build_block_mask(
+                    device, f, frame_seqlen, self.chunk_size,
+                    local_attn_size=attn_local,
+                    sink_size=attn_sink,
+                )
+        else:
+            attn_local = self.local_attn_size
+            attn_sink = self.sink_size
+            # Cache mask (non-stochastic path — build once)
+            if self.block_mask is None and FLEX_ATTENTION_AVAILABLE:
+                frame_seqlen = h * w
+                self.block_mask = self._build_block_mask(
+                    device, f, frame_seqlen, self.chunk_size,
+                    local_attn_size=attn_local,
+                    sink_size=attn_sink,
+                )
 
-        # Compute dynamic RoPE indices if enabled
+        # Compute dynamic RoPE indices (depends on current attn config)
         rope_frame_indices = None
         if self.use_dynamic_rope:
             rope_frame_indices = compute_dynamic_rope_indices(
-                f, self.chunk_size, self.local_attn_size, self.sink_size,
+                f, self.chunk_size, attn_local, attn_sink,
             ).to(device)
 
         # Create custom forward for gradient checkpointing
