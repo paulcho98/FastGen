@@ -1497,7 +1497,9 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         # Between AR chunks, store_kv calls set is_init=True. If this _forward_ar
         # call uses checkpointing, recomputation must see the same is_init state.
         # Resetting to False ensures consistent behavior: always compute K,V fresh.
-        if self.training and use_gradient_checkpointing and self._crossattn_caches is not None:
+        # Guard on torch.is_grad_enabled() to match FastGen's CausalWan pattern —
+        # no-grad calls (e.g. fake_score rollout) skip checkpoint machinery entirely.
+        if self.training and use_gradient_checkpointing and torch.is_grad_enabled() and self._crossattn_caches is not None:
             for cache in self._crossattn_caches:
                 cache["is_init"] = False
 
@@ -1580,7 +1582,7 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
                 cache_local_end_override=cache_local_end,
             )
 
-            if self.training and use_gradient_checkpointing:
+            if self.training and use_gradient_checkpointing and torch.is_grad_enabled():
                 # Snapshot crossattn_cache is_init so recomputation sees the same state.
                 # The first forward sets is_init=True (computes K,V); without reset,
                 # recomputation would skip those ops → different tensor count → CheckpointError.

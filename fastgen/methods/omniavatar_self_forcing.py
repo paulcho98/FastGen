@@ -37,6 +37,81 @@ class OmniAvatarSelfForcingModel(SelfForcingModel):
     def __init__(self, config: ModelConfig):
         super().__init__(config)
 
+    def single_train_step(self, data: Dict[str, Any], iteration: int):
+        """Combined fake_score + student update on student steps (1:5 ratio).
+
+        Matches the original Self-Forcing training loop where the critic updates
+        EVERY step, including on the generator (student) step. This gives a true
+        1:5 ratio (5 critic updates per student update in a 5-step cycle).
+
+        On non-student steps (iter % freq != 0): delegate to base class (fake_score only).
+        On student steps (iter % freq == 0): run fake_score backward manually
+        (freeing its graph to save memory), then return student loss for the
+        trainer's backward. Both sets of gradients accumulate across grad_accum
+        rounds; the trainer steps both optimizers at the end.
+        """
+        if iteration % self.config.student_update_freq != 0:
+            # Critic-only step — unchanged from base class
+            return super().single_train_step(data, iteration)
+
+        # === Combined step: fake_score + student ===
+
+        real_data, condition, neg_condition = self._prepare_training_data(data)
+        grad_accum_rounds = getattr(self.config, "grad_accum_rounds", None) or 1
+
+        # --- Step 1: Fake score forward + manual backward (frees graph) ---
+        # Keep self.net.requires_grad_ unchanged (True) — same as the exclusive
+        # pattern. The no_grad() inside _fake_score_discriminator_update_step is
+        # sufficient. Toggling requires_grad on FSDP2 DTensors leaves stale
+        # internal state that breaks gradient checkpointing recomputation.
+        self.fake_score.train().requires_grad_(True)
+
+        input_fs, t_student_fs, t_fs, eps_fs = self._generate_noise_and_time(real_data)
+
+        fake_loss_map, _ = self._fake_score_discriminator_update_step(
+            input_fs, t_student_fs, t_fs, eps_fs, real_data, condition=condition,
+        )
+
+        # Manual backward with same scaling the trainer uses for the student loss.
+        # This ensures fake_score grads accumulate correctly across grad_accum rounds.
+        # The graph is freed here so it doesn't overlap with the student forward.
+        (fake_loss_map["total_loss"] / grad_accum_rounds).backward()
+
+        # --- Step 2: Student forward (returned for trainer's backward) ---
+        self.net.clear_caches()
+
+        input_student, t_student, t, eps = self._generate_noise_and_time(real_data)
+
+        student_loss_map, student_outputs = self._student_update_step(
+            input_student, t_student, t, eps, data,
+            condition=condition, neg_condition=neg_condition,
+        )
+
+        # Attach fake_score loss for logging (detached — no gradient)
+        student_loss_map["fake_score_loss"] = fake_loss_map["total_loss"].detach()
+
+        return student_loss_map, student_outputs
+
+    def get_optimizers(self, iteration: int) -> list:
+        """On student steps, return BOTH optimizers (trainer steps both)."""
+        if iteration % self.config.student_update_freq == 0:
+            return [self.net_optimizer, self.fake_score_optimizer]
+        else:
+            if self.config.gan_loss_weight_gen > 0:
+                return [self.fake_score_optimizer, self.discriminator_optimizer]
+            else:
+                return [self.fake_score_optimizer]
+
+    def get_lr_schedulers(self, iteration: int) -> list:
+        """On student steps, return BOTH schedulers (trainer steps both)."""
+        if iteration % self.config.student_update_freq == 0:
+            return [self.net_lr_scheduler, self.fake_score_lr_scheduler]
+        else:
+            if self.config.gan_loss_weight_gen > 0:
+                return [self.fake_score_lr_scheduler, self.discriminator_lr_scheduler]
+            else:
+                return [self.fake_score_lr_scheduler]
+
     def build_model(self):
         """Override to instantiate fake_score from config.fake_score if provided.
 

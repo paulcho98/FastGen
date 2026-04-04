@@ -167,6 +167,7 @@ class OmniAvatarDiffusionForcingModel(KDModel):
                 noise=noise,
                 condition=condition,
                 student_sample_steps=self.config.student_sample_steps,
+                student_sample_type=self.config.student_sample_type,
                 t_list=self.config.sample_t_cfg.t_list,
                 context_noise=context_noise,
                 precision_amp=self.precision_amp_infer,

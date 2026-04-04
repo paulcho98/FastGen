@@ -108,7 +108,7 @@ def create_config():
     # GAN disabled by default to save ~35 GB VRAM (matching T2V 14B teacher config).
     # Enable later for quality improvement if memory allows.
     config.model.gan_loss_weight_gen = 0
-    config.model.student_update_freq = 5  # 1:4 ratio (exclusive: either student or fake_score per step)
+    config.model.student_update_freq = 5  # 1:5 ratio (combined: fake_score updates every step including student steps)
     # To enable GAN, uncomment:
     # config.model.gan_loss_weight_gen = 0.003
     # config.model.discriminator = Discriminator_Wan_14B_Config
@@ -176,6 +176,8 @@ def create_config():
     # Training — bs=8, grad_accum=2 for effective batch 64 on 4 GPUs
     # Effective batch: batch_size(8) × num_gpus(4) × grad_accum(2) = 64
     config.trainer.grad_accum_rounds = 2
+    # Mirror to model config so combined step can scale fake_score loss correctly
+    config.model.grad_accum_rounds = 2
     config.trainer.max_iter = 5000
     config.trainer.logging_iter = 1
     config.trainer.save_ckpt_iter = 100

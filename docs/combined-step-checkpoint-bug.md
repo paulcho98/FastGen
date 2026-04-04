@@ -113,24 +113,39 @@ The OmniAvatar causal network introduced the `is_init` pattern which is fundamen
 | 3. Disable gradient checkpointing on student step | Skip checkpointing entirely during combined step | OOM at 138 GB — bs=8 requires checkpointing for the 7-chunk rollout |
 | 4. Per-block `is_init` snapshot in checkpoint wrapper | Save/restore `is_init` around each checkpointed block call | Works for exclusive steps but not combined — the inter-chunk `store_kv` creates additional state that the snapshot doesn't capture |
 
-## Proper Fix (Not Yet Implemented)
+## Root Cause Found (2026-04-02)
 
-To truly fix this, the OmniAvatar causal network needs to adopt the original Wan causal network's approach:
+The actual root cause was **not** the `is_init` pattern or CrossAttention cache — it was
+`requires_grad_(False)` / `requires_grad_(True)` toggling on FSDP2 DTensor parameters.
 
-1. **Remove the `is_init` pattern** from CrossAttention — always compute K,V fresh, or cache them outside the checkpointed region
-2. **Use `functools.partial`** to freeze all mutable cache state before checkpointing
-3. **Create isolated cache snapshots** with immutable metadata, following the pattern at `fastgen/networks/Wan/network_causal.py:865-913`
+In the exclusive pattern, `_setup_grad_requirements` never touches `self.net` — it stays
+at `requires_grad=True` the entire time. The `no_grad()` context inside
+`_fake_score_discriminator_update_step` is sufficient to prevent gradient flow. Our combined
+step override was explicitly toggling `self.net.requires_grad_(False)` before the fake_score
+update and `requires_grad_(True)` before the student update. This left FSDP2 internal state
+inconsistent, causing gradient checkpointing's recomputation to see a different number of
+saved tensors (94 vs 80).
 
-This is a significant refactor of `network_causal.py`'s attention and cache management — roughly 100-200 lines of changes across `OmniAvatarWanAttention`, `CrossAttention`, and `_forward_ar`.
+### Fix
+
+1. **Don't toggle `requires_grad_` on `self.net`** — keep it `True` (same as exclusive pattern).
+   The `no_grad()` context is sufficient.
+2. **Manual fake_score backward** inside `single_train_step` with `loss / grad_accum_rounds`
+   scaling, freeing the graph before the student forward to avoid extra memory.
+3. **Return both optimizers** from `get_optimizers` on combined steps so the trainer steps
+   both at the end of gradient accumulation.
+4. **Added `torch.is_grad_enabled()` guard** to checkpoint path in `_forward_ar` for extra
+   safety (matching FastGen's CausalWan pattern).
 
 ## Current State
 
-Using FastGen's native exclusive pattern with `student_update_freq=5` (1:4 ratio). This works correctly and has been verified end-to-end with training, validation, checkpointing, and wandb logging.
+Combined step working with `student_update_freq=5` (true 1:5 ratio). Verified end-to-end
+with training, validation, checkpointing, and wandb logging. Peak memory unchanged at ~85 GB.
 
 ## Files Involved
 
-- `fastgen/methods/omniavatar_self_forcing.py` — the `single_train_step` override (reverted)
-- `fastgen/networks/OmniAvatar/network_causal.py` — `_forward_ar`, `CrossAttention`, `clear_caches`, `is_init` handling
+- `fastgen/methods/omniavatar_self_forcing.py` — `single_train_step` override, `get_optimizers`, `get_lr_schedulers`
+- `fastgen/networks/OmniAvatar/network_causal.py` — `_forward_ar` checkpoint guards (`torch.is_grad_enabled()`)
 - `fastgen/methods/distribution_matching/self_forcing.py` — `rollout_with_gradient` (shared, not modified)
 - `fastgen/methods/distribution_matching/dmd2.py` — `single_train_step`, `_setup_grad_requirements`
 - `/home/work/.local/reference/Self-Forcing/trainer/gan.py:356-398` — original SF training loop for reference
