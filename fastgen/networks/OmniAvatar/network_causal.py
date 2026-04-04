@@ -456,6 +456,7 @@ class CausalSelfAttention(nn.Module):
         current_start: int = 0,
         store_kv: bool = True,
         cache_local_end_override: Optional[int] = None,
+        rope_frame_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -477,8 +478,12 @@ class CausalSelfAttention(nn.Module):
 
         if kv_cache is None:
             # ----- Full-sequence mode (training / bidirectional eval) -----
-            roped_q = rope_apply_full(q, grid_sizes, freqs).type_as(v)
-            roped_k = rope_apply_full(k, grid_sizes, freqs).type_as(v)
+            if rope_frame_indices is not None:
+                roped_q = dynamic_rope_apply_full(q, grid_sizes, freqs, rope_frame_indices).type_as(v)
+                roped_k = dynamic_rope_apply_full(k, grid_sizes, freqs, rope_frame_indices).type_as(v)
+            else:
+                roped_q = rope_apply_full(q, grid_sizes, freqs).type_as(v)
+                roped_k = rope_apply_full(k, grid_sizes, freqs).type_as(v)
 
             if block_mask is not None and FLEX_ATTENTION_AVAILABLE:
                 # FlexAttention path
@@ -770,6 +775,7 @@ class CausalDiTBlock(nn.Module):
         current_start: int = 0,
         store_kv: bool = True,
         cache_local_end_override: Optional[int] = None,
+        rope_frame_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -808,6 +814,7 @@ class CausalDiTBlock(nn.Module):
             current_start,
             store_kv=store_kv,
             cache_local_end_override=cache_local_end_override,
+            rope_frame_indices=rope_frame_indices,
         )
 
         x = x + (
@@ -1558,7 +1565,18 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         # Build block mask (chunk-wise causal, matching CausalWan)
         if self.block_mask is None and FLEX_ATTENTION_AVAILABLE:
             frame_seqlen = h * w
-            self.block_mask = self._build_block_mask(device, f, frame_seqlen, self.chunk_size)
+            self.block_mask = self._build_block_mask(
+                device, f, frame_seqlen, self.chunk_size,
+                local_attn_size=self.local_attn_size,
+                sink_size=self.sink_size,
+            )
+
+        # Compute dynamic RoPE indices if enabled
+        rope_frame_indices = None
+        if self.use_dynamic_rope:
+            rope_frame_indices = compute_dynamic_rope_indices(
+                f, self.chunk_size, self.local_attn_size, self.sink_size,
+            ).to(device)
 
         # Create custom forward for gradient checkpointing
         def create_custom_forward(module):
@@ -1581,6 +1599,7 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
                 context=context,
                 context_lens=None,
                 block_mask=self.block_mask,
+                rope_frame_indices=rope_frame_indices,
             )
 
             if self.training and use_gradient_checkpointing:
