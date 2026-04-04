@@ -235,6 +235,118 @@ def rope_apply_full(
 
 
 # ---------------------------------------------------------------------------
+# Dynamic RoPE for sliding-window full-sequence mode
+# ---------------------------------------------------------------------------
+
+def compute_dynamic_rope_indices(
+    num_frames: int,
+    chunk_size: int,
+    local_attn_size: int = -1,
+    sink_size: int = 0,
+) -> torch.Tensor:
+    """Compute per-frame RoPE temporal indices for dynamic RoPE in full-sequence mode.
+
+    With sliding window, each frame gets an index relative to its chunk's
+    window start. This caps the maximum temporal RoPE index at
+    ``local_attn_size - 1``, matching AR-mode dynamic RoPE behavior.
+
+    Args:
+        num_frames: Total number of latent frames.
+        chunk_size: Frames per chunk.
+        local_attn_size: Attention window in frames (-1 = unlimited -> absolute indices).
+        sink_size: Number of initial sink frames (always index 0..sink_size-1).
+
+    Returns:
+        [num_frames] tensor of per-frame RoPE temporal indices (long).
+    """
+    if local_attn_size <= 0:
+        return torch.arange(num_frames, dtype=torch.long)
+
+    # Build chunk boundaries — front-load remainder into first chunk
+    # (same logic as _build_block_mask)
+    num_chunks = num_frames // chunk_size
+    remaining = num_frames % chunk_size
+
+    frame_counts = []
+    if num_frames > 0:
+        if num_chunks == 0:
+            frame_counts.append(remaining)
+        else:
+            frame_counts.append(chunk_size + remaining)
+            frame_counts.extend([chunk_size] * max(num_chunks - 1, 0))
+
+    indices = torch.zeros(num_frames, dtype=torch.long)
+
+    current_frame = 0
+    for frames_in_chunk in frame_counts:
+        chunk_end_frame = current_frame + frames_in_chunk
+        window_start_frame = max(0, chunk_end_frame - local_attn_size)
+
+        for f in range(current_frame, chunk_end_frame):
+            if f < sink_size:
+                # Sink frames always get their absolute index
+                indices[f] = f
+            else:
+                indices[f] = f - window_start_frame
+
+        current_frame = chunk_end_frame
+
+    return indices
+
+
+def dynamic_rope_apply_full(
+    x: torch.Tensor,
+    grid_sizes: torch.Tensor,
+    freqs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    rope_frame_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Apply 3D RoPE with per-frame temporal indices for dynamic positioning.
+
+    Like ``causal_rope_apply`` but uses arbitrary per-frame temporal indices
+    instead of a contiguous range. Spatial (H, W) indices remain unchanged.
+
+    Args:
+        x: [B, S, num_heads, head_dim]
+        grid_sizes: [B, 3] -- (F, H, W) per sample
+        freqs: tuple of 3 complex frequency tables (f, h, w)
+        rope_frame_indices: [num_frames] per-frame temporal RoPE indices
+
+    Returns:
+        Tensor same shape as x with RoPE applied.
+    """
+    n, c = x.size(2), x.size(3) // 2
+    freq_f, freq_h, freq_w = freqs
+
+    output = []
+    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+        seq_len = f * h * w
+        x_i = torch.view_as_complex(
+            x[i, :seq_len].to(torch.float64).reshape(seq_len, n, -1, 2)
+        )
+
+        # Gather temporal frequencies by per-frame indices instead of
+        # contiguous slice
+        frame_idx = rope_frame_indices[:f].to(freq_f.device)
+        freqs_i = torch.cat(
+            [
+                freq_f[frame_idx]
+                .view(f, 1, 1, -1)
+                .expand(f, h, w, -1),
+                freq_h[:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                freq_w[:w].view(1, 1, w, -1).expand(f, h, w, -1),
+            ],
+            dim=-1,
+        ).reshape(seq_len, 1, -1)
+
+        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+        # Append any padding tokens unchanged
+        x_i = torch.cat([x_i, x[i, seq_len:]])
+        output.append(x_i)
+
+    return torch.stack(output).type_as(x)
+
+
+# ---------------------------------------------------------------------------
 # Embedding helpers
 # ---------------------------------------------------------------------------
 

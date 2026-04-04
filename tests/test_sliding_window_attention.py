@@ -335,3 +335,150 @@ class TestBlockMask:
         for cfg in configs:
             _, bm = _build_mask_and_dense(frame_seqlen=FRAME_SEQLEN, **cfg)
             assert isinstance(bm, BlockMask), f"Failed for config {cfg}"
+
+
+# ---------------------------------------------------------------------------
+# Imports for dynamic RoPE tests
+# ---------------------------------------------------------------------------
+from fastgen.networks.OmniAvatar.network_causal import (
+    compute_dynamic_rope_indices,
+    dynamic_rope_apply_full,
+    rope_apply_full,
+    _precompute_freqs_cis_3d,
+)
+
+
+# ---------------------------------------------------------------------------
+# Test class for dynamic RoPE
+# ---------------------------------------------------------------------------
+class TestDynamicRoPE:
+    """Test suite for compute_dynamic_rope_indices and dynamic_rope_apply_full."""
+
+    # --- Test 1: full causal (local_attn_size=-1) gives absolute indices ----
+    def test_rope_indices_full_causal(self):
+        """local_attn_size=-1 produces absolute indices [0, 1, ..., 20]."""
+        num_frames = 21
+        chunk_size = 3
+        indices = compute_dynamic_rope_indices(
+            num_frames=num_frames,
+            chunk_size=chunk_size,
+            local_attn_size=-1,
+            sink_size=0,
+        )
+        expected = torch.arange(num_frames, dtype=torch.long)
+        assert torch.equal(indices, expected), (
+            f"Expected {expected.tolist()}, got {indices.tolist()}"
+        )
+
+    # --- Test 2: sliding window caps max index at local_attn_size - 1 ------
+    def test_rope_indices_sliding_window(self):
+        """local_attn_size=6 with chunk_size=3: max index is 5, later chunks stabilize."""
+        num_frames = 12
+        chunk_size = 3
+        local_attn_size = 6
+        indices = compute_dynamic_rope_indices(
+            num_frames=num_frames,
+            chunk_size=chunk_size,
+            local_attn_size=local_attn_size,
+            sink_size=0,
+        )
+
+        # Verify chunk boundaries (front-load remainder logic):
+        # num_chunks=4, remaining=0 -> frame_counts=[3, 3, 3, 3]
+        # Chunk 0 (frames 0-2): chunk_end=3, window_start=max(0,3-6)=0, indices=[0,1,2]
+        # Chunk 1 (frames 3-5): chunk_end=6, window_start=max(0,6-6)=0, indices=[3,4,5]
+        # Chunk 2 (frames 6-8): chunk_end=9, window_start=max(0,9-6)=3, indices=[3,4,5]
+        # Chunk 3 (frames 9-11): chunk_end=12, window_start=max(0,12-6)=6, indices=[3,4,5]
+        expected = torch.tensor([0, 1, 2, 3, 4, 5, 3, 4, 5, 3, 4, 5], dtype=torch.long)
+        assert torch.equal(indices, expected), (
+            f"Expected {expected.tolist()}, got {indices.tolist()}"
+        )
+
+        # Max index should be local_attn_size - 1
+        assert indices.max().item() == local_attn_size - 1, (
+            f"Max index {indices.max().item()} should be {local_attn_size - 1}"
+        )
+
+    # --- Test 3: sliding window with sink frames ---------------------------
+    def test_rope_indices_with_sink(self):
+        """local_attn_size=7, sink_size=1: frame 0 always index 0, max index <= 6."""
+        num_frames = 12
+        chunk_size = 3
+        local_attn_size = 7
+        sink_size = 1
+        indices = compute_dynamic_rope_indices(
+            num_frames=num_frames,
+            chunk_size=chunk_size,
+            local_attn_size=local_attn_size,
+            sink_size=sink_size,
+        )
+
+        # Frame 0 is a sink frame, always gets index 0
+        assert indices[0].item() == 0, f"Sink frame 0 should have index 0, got {indices[0].item()}"
+
+        # Max index should be <= local_attn_size - 1
+        assert indices.max().item() <= local_attn_size - 1, (
+            f"Max index {indices.max().item()} should be <= {local_attn_size - 1}"
+        )
+
+        # Verify chunk 0 (frames 0-2): chunk_end=3, window_start=max(0,3-7)=0
+        # Frame 0: sink -> index 0
+        # Frame 1: 1 - 0 = 1
+        # Frame 2: 2 - 0 = 2
+        assert indices[0].item() == 0
+        assert indices[1].item() == 1
+        assert indices[2].item() == 2
+
+        # Verify last chunk (frames 9-11): chunk_end=12, window_start=max(0,12-7)=5
+        # Frame 9: 9 - 5 = 4
+        # Frame 10: 10 - 5 = 5
+        # Frame 11: 11 - 5 = 6
+        assert indices[9].item() == 4
+        assert indices[10].item() == 5
+        assert indices[11].item() == 6
+
+    # --- Test 4: output shape of dynamic_rope_apply_full -------------------
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Needs CUDA")
+    def test_rope_function_output_shape(self):
+        """dynamic_rope_apply_full returns same shape as input."""
+        B, F, H, W = 1, 4, 2, 2
+        head_dim = 12  # must be even; split into 3 parts: 4 + 4 + 4 (half-dims: 2+2+2)
+        num_heads = 2
+        seq_len = F * H * W
+        device = DEVICE
+
+        x = torch.randn(B, seq_len, num_heads, head_dim, device=device)
+        grid_sizes = torch.tensor([[F, H, W]], device=device)
+        freqs = _precompute_freqs_cis_3d(head_dim, end=64)
+        freqs = tuple(f.to(device) for f in freqs)
+
+        rope_indices = compute_dynamic_rope_indices(
+            num_frames=F, chunk_size=2, local_attn_size=-1
+        )
+
+        out = dynamic_rope_apply_full(x, grid_sizes, freqs, rope_indices)
+        assert out.shape == x.shape, f"Expected shape {x.shape}, got {out.shape}"
+        assert out.dtype == x.dtype, f"Expected dtype {x.dtype}, got {out.dtype}"
+
+    # --- Test 5: matches rope_apply_full when indices are [0..F-1] ---------
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Needs CUDA")
+    def test_rope_matches_standard_when_full_causal(self):
+        """When indices are [0,1,...,F-1], dynamic_rope_apply_full matches rope_apply_full."""
+        B, F, H, W = 2, 6, 3, 3
+        head_dim = 12
+        num_heads = 2
+        seq_len = F * H * W
+        device = DEVICE
+
+        x = torch.randn(B, seq_len, num_heads, head_dim, device=device)
+        grid_sizes = torch.tensor([[F, H, W]] * B, device=device)
+        freqs = _precompute_freqs_cis_3d(head_dim, end=64)
+        freqs = tuple(f.to(device) for f in freqs)
+
+        # Absolute indices (full causal)
+        rope_indices = torch.arange(F, dtype=torch.long)
+
+        out_standard = rope_apply_full(x, grid_sizes, freqs)
+        out_dynamic = dynamic_rope_apply_full(x, grid_sizes, freqs, rope_indices)
+
+        torch.testing.assert_close(out_standard, out_dynamic, atol=1e-6, rtol=1e-6)
