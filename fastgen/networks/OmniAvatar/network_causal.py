@@ -1224,11 +1224,25 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         num_frames: int,
         frame_seqlen: int,
         chunk_size: int = None,
+        local_attn_size: int = -1,
+        sink_size: int = 0,
     ) -> Optional[BlockMask]:
         """Build a chunk-wise causal attention mask for full-sequence mode.
 
         Tokens within the same chunk attend bidirectionally. Tokens can attend
-        to all previous chunks. Matches CausalWan's _prepare_blockwise_causal_attn_mask.
+        to all previous chunks (or a sliding window of previous frames if
+        ``local_attn_size > 0``).
+
+        Args:
+            device: Device to create mask tensors on.
+            num_frames: Number of video frames in the sequence.
+            frame_seqlen: Number of tokens per frame.
+            chunk_size: Chunk size in frames (defaults to ``self.chunk_size``).
+            local_attn_size: Sliding window size in **frames**. Each chunk
+                sees at most this many frames (including itself). ``-1`` means
+                unlimited (full causal, same as original behaviour).
+            sink_size: Number of leading frames that are always visible to
+                every query token, regardless of the sliding window.
         """
         if not FLEX_ATTENTION_AVAILABLE:
             return None
@@ -1238,8 +1252,10 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
 
         total_length = num_frames * frame_seqlen
         pad_len = math.ceil(total_length / 128) * 128 - total_length
+        padded_length = total_length + pad_len
 
-        ends = torch.zeros(total_length + pad_len, device=device, dtype=torch.long)
+        ends = torch.zeros(padded_length, device=device, dtype=torch.long)
+        starts = torch.zeros(padded_length, device=device, dtype=torch.long)
 
         # Build chunk boundaries — front-load remainder into first chunk
         num_chunks = num_frames // chunk_size
@@ -1256,18 +1272,35 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         current_start = 0
         for frames_in_chunk in frame_counts:
             chunk_len_tokens = frames_in_chunk * frame_seqlen
-            ends[current_start : current_start + chunk_len_tokens] = current_start + chunk_len_tokens
+            chunk_end = current_start + chunk_len_tokens
+
+            # --- sliding window lower bound (in tokens) ---
+            if local_attn_size > 0:
+                # The last frame index covered by this chunk (0-based):
+                chunk_last_frame = (current_start // frame_seqlen) + frames_in_chunk
+                window_start_frame = max(0, chunk_last_frame - local_attn_size)
+                window_start_token = window_start_frame * frame_seqlen
+            else:
+                window_start_token = 0
+
+            ends[current_start : chunk_end] = chunk_end
+            starts[current_start : chunk_end] = window_start_token
             current_start += chunk_len_tokens
 
+        # Sink boundary (in tokens): first ``sink_size`` frames always visible
+        sink_end = sink_size * frame_seqlen
+
         def attention_mask(b, h, q_idx, kv_idx):
-            return (kv_idx < ends[q_idx]) | (q_idx == kv_idx)
+            in_window = (kv_idx >= starts[q_idx]) & (kv_idx < ends[q_idx])
+            is_sink = kv_idx < sink_end
+            return in_window | is_sink | (q_idx == kv_idx)
 
         block_mask = create_block_mask(
             attention_mask,
             B=None,
             H=None,
-            Q_LEN=total_length + pad_len,
-            KV_LEN=total_length + pad_len,
+            Q_LEN=padded_length,
+            KV_LEN=padded_length,
             _compile=False,
             device=device,
         )
