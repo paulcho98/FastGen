@@ -75,6 +75,10 @@ CausalOmniAvatar_V2V_1_3B_Student: dict = L(CausalOmniAvatarWan)(
     omniavatar_ckpt_path=STUDENT_CKPT,
     net_pred_type="flow",
     schedule_type="rf",
+    # Sliding window attention — should match DF training config
+    local_attn_size=-1,
+    sink_size=0,
+    use_dynamic_rope=False,
 )
 
 
