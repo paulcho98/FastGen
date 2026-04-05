@@ -1741,10 +1741,18 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         # Text embedding
         context = self.text_embedding(context)
 
-        # Audio processing: cache once, slice per chunk
-        if not hasattr(self, "_cached_audio") or self._cached_audio is None:
-            self._cached_audio = self._process_audio_embeddings(audio_emb, x.shape)
-        processed_audio = self._cached_audio
+        # Audio processing: cache for inference, recompute when gradients needed.
+        # Caching under no_grad() (e.g., SF rollout non-exit steps) produces a
+        # tensor without grad_fn, cutting gradient flow through audio_proj/audio_cond_projs
+        # on subsequent gradient-tracked exit steps.
+        if torch.is_grad_enabled():
+            # Gradient-tracked: always recompute to preserve grad flow
+            processed_audio = self._process_audio_embeddings(audio_emb, x.shape)
+        else:
+            # Inference / no_grad: cache for speed
+            if not hasattr(self, "_cached_audio") or self._cached_audio is None:
+                self._cached_audio = self._process_audio_embeddings(audio_emb, x.shape)
+            processed_audio = self._cached_audio
         if processed_audio is not None:
             current_frame_start = current_start // frame_seqlen
             current_video_frames = grid_sizes[0][0].item()
