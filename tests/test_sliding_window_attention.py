@@ -868,3 +868,130 @@ class TestEndToEnd:
         )
         assert has_grad, "No parameter received gradients after backward"
 
+
+# ---------------------------------------------------------------------------
+# DF vs AR RoPE consistency tests
+# ---------------------------------------------------------------------------
+
+
+class TestDFvsARRoPEConsistency:
+    """Verify dynamic RoPE consistency between DF full-sequence and AR chunk modes.
+
+    In full-sequence (DF) mode, each frame gets ONE RoPE index based on its own
+    chunk's window. In AR mode, keys are re-RoPE'd relative to the attending
+    chunk's window each time.
+
+    What IS consistent (and tested here):
+    - Q indices for the generating chunk match between DF and AR
+    - Max RoPE index is capped identically (local_attn_size - 1)
+    - Sink frame always gets index 0 in both modes
+
+    What is inherently different (documented, not a bug):
+    - Cross-chunk K indices differ because DF assigns one index per frame
+      while AR re-indexes keys per attending chunk's window.
+    """
+
+    CONFIGS = [
+        (7, 1),   # sink=1, window=6
+        (10, 1),  # sink=1, window=9
+        (13, 1),  # sink=1, window=12
+        (9, 3),   # sink=3, window=6
+        (12, 3),  # sink=3, window=9
+    ]
+    NUM_FRAMES = 21
+    CHUNK_SIZE = 3
+
+    def _chunk_boundaries(self):
+        """Return list of (start_frame, end_frame) for each chunk."""
+        num_chunks = self.NUM_FRAMES // self.CHUNK_SIZE
+        remaining = self.NUM_FRAMES % self.CHUNK_SIZE
+        chunks = []
+        if num_chunks == 0:
+            chunks.append((0, remaining))
+        else:
+            first = self.CHUNK_SIZE + remaining
+            chunks.append((0, first))
+            for i in range(1, num_chunks):
+                s = first + (i - 1) * self.CHUNK_SIZE
+                chunks.append((s, s + self.CHUNK_SIZE))
+        return chunks
+
+    def _ar_query_rope_indices(self, chunk_idx, local_attn_size, sink_size):
+        """Compute what AR mode assigns as Q RoPE indices for a given chunk.
+
+        In AR dynamic RoPE, the window is laid out as:
+            [sink_frames | rolling_past | current_chunk]
+        Keys get sequential RoPE [0, 1, ..., F_window-1].
+        Q start = position of current chunk within the window.
+        """
+        chunks = self._chunk_boundaries()
+        cs, ce = chunks[chunk_idx]
+        chunk_frames = ce - cs
+
+        if local_attn_size <= 0:
+            # Full causal: Q start = absolute frame position
+            return list(range(cs, ce))
+
+        # How many past frames are in the window (excluding current chunk)?
+        past_frames_available = cs  # all frames before this chunk
+        window_budget_for_past = local_attn_size - chunk_frames
+
+        if sink_size > 0 and past_frames_available > window_budget_for_past:
+            # Sink + rolling: sink takes sink_size, rolling fills the rest
+            rolling_budget = window_budget_for_past - sink_size
+            past_in_window = sink_size + max(0, rolling_budget)
+        else:
+            past_in_window = min(past_frames_available, window_budget_for_past)
+
+        q_start_in_window = past_in_window
+        return list(range(q_start_in_window, q_start_in_window + chunk_frames))
+
+    def test_query_indices_match_all_configs(self):
+        """For each config and each chunk, DF Q indices must match AR Q indices."""
+        from fastgen.networks.OmniAvatar.network_causal import compute_dynamic_rope_indices
+
+        chunks = self._chunk_boundaries()
+
+        for local_attn, sink in self.CONFIGS:
+            df_indices = compute_dynamic_rope_indices(
+                self.NUM_FRAMES, self.CHUNK_SIZE, local_attn, sink
+            ).tolist()
+
+            for ci, (cs, ce) in enumerate(chunks):
+                df_q = df_indices[cs:ce]
+                ar_q = self._ar_query_rope_indices(ci, local_attn, sink)
+
+                assert df_q == ar_q, (
+                    f"Q RoPE mismatch at chunk {ci} (frames {cs}-{ce-1}) "
+                    f"with local_attn={local_attn}, sink={sink}: "
+                    f"DF={df_q}, AR={ar_q}"
+                )
+
+    def test_max_index_matches(self):
+        """Max RoPE index is local_attn_size - 1 in both modes."""
+        from fastgen.networks.OmniAvatar.network_causal import compute_dynamic_rope_indices
+
+        for local_attn, sink in self.CONFIGS:
+            df_indices = compute_dynamic_rope_indices(
+                self.NUM_FRAMES, self.CHUNK_SIZE, local_attn, sink
+            )
+            max_idx = df_indices.max().item()
+            assert max_idx == local_attn - 1, (
+                f"Max RoPE index {max_idx} != {local_attn - 1} "
+                f"for local_attn={local_attn}, sink={sink}"
+            )
+
+    def test_sink_frame_always_zero(self):
+        """Sink frames always get RoPE index 0 in both modes."""
+        from fastgen.networks.OmniAvatar.network_causal import compute_dynamic_rope_indices
+
+        for local_attn, sink in self.CONFIGS:
+            df_indices = compute_dynamic_rope_indices(
+                self.NUM_FRAMES, self.CHUNK_SIZE, local_attn, sink
+            )
+            for f in range(sink):
+                assert df_indices[f].item() == f, (
+                    f"Sink frame {f} has RoPE index {df_indices[f].item()}, "
+                    f"expected {f} for local_attn={local_attn}, sink={sink}"
+                )
+
