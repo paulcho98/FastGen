@@ -18,14 +18,14 @@ echo "============================================="
 
 # Step 1: Wait for step 3001 to appear in the training log
 # The trainer saves checkpoint at 3000, then runs validation, then continues to 3001.
-# Seeing iteration 3001 in the log means 3000 is fully saved.
+# Seeing "3001 :" in the profiler log means 3000 is fully saved.
 while true; do
-    if grep -q "iteration 3001\b\|iter.*3001 " "$SF_LOG" 2>/dev/null; then
+    if grep -q " 3001 :" "$SF_LOG" 2>/dev/null; then
         echo "$(date): Step 3001 found in log — step 3000 checkpoint is safe."
         break
     fi
-    # Show current progress
-    LATEST_ITER=$(grep "on_training_step_end" "$SF_LOG" 2>/dev/null | tail -1 | grep -oP '\d+(?= :)' || echo "?")
+    # Show current progress from profiler lines (format: "NNNN : avg iteration time")
+    LATEST_ITER=$(grep "avg iteration time" "$SF_LOG" 2>/dev/null | tail -1 | grep -oP '\d+(?= :)' || echo "?")
     echo "$(date): Current iteration: ${LATEST_ITER}, waiting for 3001..."
     sleep 30
 done
