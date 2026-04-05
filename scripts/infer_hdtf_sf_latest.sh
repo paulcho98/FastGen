@@ -1,5 +1,6 @@
 #!/bin/bash
-# Inference on HDTF test set using the latest SF checkpoint
+# Inference on HDTF test set — self-reenactment (own audio)
+# Uses the latest SF checkpoint
 set -euo pipefail
 
 CKPT_DIR="/tmp/FASTGEN_SF_OUTPUT/OmniAvatar-FastGen/omniavatar_sf/sf_4gpu_bs8_lr2e6_5000iter_shift5_combined_v3/checkpoints"

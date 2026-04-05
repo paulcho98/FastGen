@@ -1,9 +1,9 @@
 #!/bin/bash
-# Run HDTF inference for the last 16 SF checkpoints, distributed across 4 GPUs.
-# Each GPU processes 4 checkpoints sequentially.
-# Reuses face detection caches from --face_cache_dir.
+# Inference on HDTF test set for the last 12 SF checkpoints.
+# Distributed across 4 GPUs (3 checkpoints each, in parallel).
+# Reuses face detection caches for speed.
 #
-# Usage: bash scripts/infer_hdtf_sf_batch16.sh
+# Usage: bash scripts/infer_hdtf_sf_batch12.sh
 set -euo pipefail
 
 CKPT_DIR="/tmp/FASTGEN_SF_OUTPUT/OmniAvatar-FastGen/omniavatar_sf/sf_4gpu_bs8_lr2e6_5000iter_shift5_combined_v3/checkpoints"
@@ -13,18 +13,17 @@ OUT_ROOT=/home/work/output_hdtf_sf_sweep
 
 export OMNIAVATAR_ROOT="${OMNIAVATAR_ROOT:-/home/work/.local/OmniAvatar}"
 
-# Get last 16 checkpoints
-mapfile -t ALL_CKPTS < <(ls "$CKPT_DIR"/*.pth 2>/dev/null | sort | tail -16)
+# Get last 12 checkpoints
+mapfile -t ALL_CKPTS < <(ls "$CKPT_DIR"/*.pth 2>/dev/null | sort | tail -12)
 
-if [ ${#ALL_CKPTS[@]} -lt 16 ]; then
-    echo "WARNING: Only ${#ALL_CKPTS[@]} checkpoints found (expected 16)"
+if [ ${#ALL_CKPTS[@]} -lt 12 ]; then
+    echo "WARNING: Only ${#ALL_CKPTS[@]} checkpoints found (expected 12)"
 fi
 
 echo "============================================="
 echo "  SF Checkpoint Sweep: ${#ALL_CKPTS[@]} checkpoints × 4 GPUs"
 echo "============================================="
 
-# Distribute checkpoints across 4 GPUs (round-robin)
 run_gpu() {
     local GPU_ID=$1
     shift
@@ -37,14 +36,18 @@ run_gpu() {
 
         echo "[GPU $GPU_ID] Starting step $STEP → $OUT_DIR"
 
+        total=$(ls "$HDTF"/videos_cfr/*.mp4 | wc -l)
+        i=0
+
         for video in "$HDTF"/videos_cfr/*.mp4; do
             name=$(basename "$video" _cfr25.mp4)
-            out_file="$OUT_DIR/${name}.mp4"
+            i=$((i + 1))
 
-            if [ -f "$out_file" ]; then
-                continue  # skip existing
+            if [ -f "$OUT_DIR/${name}.mp4" ]; then
+                continue
             fi
 
+            echo "[GPU $GPU_ID | step $STEP] [$i/$total] $name"
             CUDA_VISIBLE_DEVICES=$GPU_ID /home/work/.local/miniconda3/envs/hb_fastgen/bin/python \
                 scripts/inference/inference_causal.py \
                 --ckpt_path "$CKPT" \
@@ -55,19 +58,19 @@ run_gpu() {
                 --omniavatar_ckpt_path /home/work/output_omniavatar_v2v_1.3B_phase2/step-19500.pt \
                 --text_embeds_path "$TEXT_EMB" \
                 --video_path "$video" \
-                --output_path "$out_file" \
+                --output_path "$OUT_DIR/${name}.mp4" \
                 --t_list 0.999 0.937 0.833 0.624 0.0 \
                 --use_dynamic_rope \
                 --latentsync \
                 --face_cache_dir /home/work/.local/HDTF/face_cache \
                 --skip_existing
-        done 2>&1 | tee "$OUT_DIR/inference.log"
+        done
 
         echo "[GPU $GPU_ID] Finished step $STEP"
     done
 }
 
-# Split checkpoints: GPU 0 gets indices 0,4,8,12; GPU 1 gets 1,5,9,13; etc.
+# Split: GPU 0 gets indices 0,4,8; GPU 1 gets 1,5,9; etc. (3 each)
 GPU0_CKPTS=()
 GPU1_CKPTS=()
 GPU2_CKPTS=()
@@ -83,10 +86,10 @@ for i in "${!ALL_CKPTS[@]}"; do
 done
 
 echo ""
-echo "GPU 0: ${GPU0_CKPTS[*]##*/}"
-echo "GPU 1: ${GPU1_CKPTS[*]##*/}"
-echo "GPU 2: ${GPU2_CKPTS[*]##*/}"
-echo "GPU 3: ${GPU3_CKPTS[*]##*/}"
+echo "GPU 0 (3 ckpts): $(printf '%s ' "${GPU0_CKPTS[@]##*/}")"
+echo "GPU 1 (3 ckpts): $(printf '%s ' "${GPU1_CKPTS[@]##*/}")"
+echo "GPU 2 (3 ckpts): $(printf '%s ' "${GPU2_CKPTS[@]##*/}")"
+echo "GPU 3 (3 ckpts): $(printf '%s ' "${GPU3_CKPTS[@]##*/}")"
 echo ""
 
 # Launch all 4 GPUs in parallel
