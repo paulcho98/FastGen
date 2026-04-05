@@ -8,25 +8,26 @@
 set -euo pipefail
 
 CKPT_DIR="/tmp/FASTGEN_SF_OUTPUT/OmniAvatar-FastGen/omniavatar_sf/sf_4gpu_bs8_lr2e6_5000iter_shift5_combined_v3/checkpoints"
-WAIT_FOR_STEP=3100  # Next checkpoint after 3000 — guarantees 3000 is fully saved
+SF_LOG="/tmp/FASTGEN_SF_OUTPUT/OmniAvatar-FastGen/omniavatar_sf/sf_4gpu_bs8_lr2e6_5000iter_shift5_combined_v3/wandb/run-20260403_003233-uym93c8h/files/output.log"
 
 echo "============================================="
-echo "  Monitoring SF training for step ${WAIT_FOR_STEP}"
-echo "  (kill after step 3000 checkpoint is confirmed saved)"
+echo "  Monitoring SF training log for step 3001"
+echo "  (step 3000 checkpoint saved before validation)"
+echo "  Log: ${SF_LOG}"
 echo "============================================="
 
-# Step 1: Wait for step 3100 checkpoint to appear
+# Step 1: Wait for step 3001 to appear in the training log
+# The trainer saves checkpoint at 3000, then runs validation, then continues to 3001.
+# Seeing iteration 3001 in the log means 3000 is fully saved.
 while true; do
-    if [ -f "${CKPT_DIR}/$(printf '%07d' ${WAIT_FOR_STEP}).pth" ]; then
-        echo "$(date): Step ${WAIT_FOR_STEP} checkpoint found — step 3000 is safe."
+    if grep -q "iteration 3001\b\|iter.*3001 " "$SF_LOG" 2>/dev/null; then
+        echo "$(date): Step 3001 found in log — step 3000 checkpoint is safe."
         break
     fi
-    LATEST=$(ls "${CKPT_DIR}"/*.pth 2>/dev/null | sort | tail -1)
-    if [ -n "$LATEST" ]; then
-        STEP=$(basename "$LATEST" .pth)
-        echo "$(date): Latest checkpoint: step ${STEP}, waiting for ${WAIT_FOR_STEP}..."
-    fi
-    sleep 60
+    # Show current progress
+    LATEST_ITER=$(grep "on_training_step_end" "$SF_LOG" 2>/dev/null | tail -1 | grep -oP '\d+(?= :)' || echo "?")
+    echo "$(date): Current iteration: ${LATEST_ITER}, waiting for 3001..."
+    sleep 30
 done
 
 # Step 2: Kill SF training
