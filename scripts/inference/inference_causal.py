@@ -124,6 +124,10 @@ def parse_args():
                         help="Noise schedule timestep list for AR generation")
     parser.add_argument("--local_attn_size", type=int, default=-1,
                         help="Rolling local attention window in frames (-1 = full)")
+    parser.add_argument("--sink_size", type=int, default=0,
+                        help="Number of initial frames always kept in attention window")
+    parser.add_argument("--use_dynamic_rope", action="store_true", default=False,
+                        help="Use window-local dynamic RoPE (recommended for sliding window)")
     parser.add_argument("--chunk_size", type=int, default=3,
                         help="Number of latent frames per AR chunk")
     parser.add_argument("--context_noise", type=float, default=0.0,
@@ -187,6 +191,8 @@ def load_diffusion_model(args, device, dtype):
         mask_all_frames=True,
         dtype=args.dtype,
         local_attn_size=args.local_attn_size,
+        sink_size=args.sink_size,
+        use_dynamic_rope=args.use_dynamic_rope,
     )
 
     # Load Self-Forcing checkpoint on top
