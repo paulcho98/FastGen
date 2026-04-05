@@ -2167,3 +2167,15 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         # for memory savings (same as reference Self-Forcing FSDP1 pattern).
         for block in self._core.blocks:
             fully_shard(block, **kwargs)
+
+        # Cast non-sharded modules to compute precision (bf16).
+        # on_train_begin casts everything to precision_fsdp (float32) for FSDP's
+        # optimizer precision. But non-sharded modules (patch_embedding, embeddings,
+        # head, audio) are called directly in forward — they must match the input
+        # dtype (bf16). FSDP1 handles this via unshard hooks; FSDP2 with per-block
+        # sharding doesn't, so we cast them explicitly.
+        compute_dtype = self._default_dtype  # bf16
+        for name, module in self._core.named_children():
+            if name != "blocks":  # blocks are FSDP-wrapped, leave them alone
+                module.to(dtype=compute_dtype)
+                logger.debug(f"Cast non-sharded module '{name}' to {compute_dtype}")

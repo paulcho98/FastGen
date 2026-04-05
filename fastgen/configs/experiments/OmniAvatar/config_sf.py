@@ -99,7 +99,7 @@ def create_config():
 
     # Precision
     config.model.precision = "bfloat16"
-    config.model.precision_fsdp = "bfloat16"  # Must match model precision to avoid dtype mismatch in Conv3d
+    config.model.precision_fsdp = "float32"  # fp32 optimizer precision; non-sharded modules cast to bf16 in fully_shard()
 
     # Input shape: 512x512 @ 81 frames → latent [16, 21, 64, 64]
     config.model.input_shape = [16, 21, 64, 64]
