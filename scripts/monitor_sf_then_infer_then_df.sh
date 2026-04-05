@@ -8,23 +8,36 @@
 set -euo pipefail
 
 CKPT_DIR="/tmp/FASTGEN_SF_OUTPUT/OmniAvatar-FastGen/omniavatar_sf/sf_4gpu_bs8_lr2e6_5000iter_shift5_combined_v3/checkpoints"
-TARGET_STEP=3000
+SAVE_STEP=3000
+# Wait for step 3001 — checkpoint saves at 3000, then validation runs.
+# Killing at 3001 ensures the checkpoint is fully saved.
+KILL_STEP=3001
 
 echo "============================================="
-echo "  Monitoring SF training for step ${TARGET_STEP}"
+echo "  Monitoring SF training for step ${KILL_STEP}"
+echo "  (checkpoint saved at step ${SAVE_STEP})"
 echo "============================================="
 
-# Step 1: Wait for step 3000 checkpoint
+# Step 1: Wait for step 3001 checkpoint (= step 3000 saved + validation done + iter 3001 started)
 while true; do
-    if [ -f "${CKPT_DIR}/$(printf '%07d' ${TARGET_STEP}).pth" ]; then
-        echo "$(date): Step ${TARGET_STEP} checkpoint found!"
+    if [ -f "${CKPT_DIR}/$(printf '%07d' ${KILL_STEP}).pth" ]; then
+        echo "$(date): Step ${KILL_STEP} checkpoint found — safe to kill."
         break
+    fi
+    # Also accept if step 3000 exists and a LATER step exists (meaning 3000 is fully saved)
+    if [ -f "${CKPT_DIR}/$(printf '%07d' ${SAVE_STEP}).pth" ]; then
+        LATEST=$(ls "${CKPT_DIR}"/*.pth 2>/dev/null | sort | tail -1)
+        LATEST_STEP=$(basename "$LATEST" .pth | sed 's/^0*//')
+        if [ "$LATEST_STEP" -gt "$SAVE_STEP" ] 2>/dev/null; then
+            echo "$(date): Step ${SAVE_STEP} saved and training progressed to step ${LATEST_STEP} — safe to kill."
+            break
+        fi
     fi
     # Check latest checkpoint
     LATEST=$(ls "${CKPT_DIR}"/*.pth 2>/dev/null | sort | tail -1)
     if [ -n "$LATEST" ]; then
         STEP=$(basename "$LATEST" .pth)
-        echo "$(date): Latest checkpoint: step ${STEP}, waiting for ${TARGET_STEP}..."
+        echo "$(date): Latest checkpoint: step ${STEP}, waiting for step >${SAVE_STEP}..."
     fi
     sleep 60
 done
