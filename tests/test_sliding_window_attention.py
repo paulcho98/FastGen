@@ -401,7 +401,7 @@ class TestDynamicRoPE:
 
     # --- Test 3: sliding window with sink frames ---------------------------
     def test_rope_indices_with_sink(self):
-        """local_attn_size=7, sink_size=1: frame 0 always index 0, max index <= 6."""
+        """local_attn_size=7, sink_size=1: sink included in budget, max index <= 5."""
         num_frames = 12
         chunk_size = 3
         local_attn_size = 7
@@ -416,12 +416,13 @@ class TestDynamicRoPE:
         # Frame 0 is a sink frame, always gets index 0
         assert indices[0].item() == 0, f"Sink frame 0 should have index 0, got {indices[0].item()}"
 
-        # Max index should be <= local_attn_size - 1
-        assert indices.max().item() <= local_attn_size - 1, (
-            f"Max index {indices.max().item()} should be <= {local_attn_size - 1}"
+        # Max index = effective_window - 1 = (local_attn_size - sink_size) - 1
+        effective_window = local_attn_size - sink_size  # 6
+        assert indices.max().item() <= effective_window - 1, (
+            f"Max index {indices.max().item()} should be <= {effective_window - 1}"
         )
 
-        # Verify chunk 0 (frames 0-2): chunk_end=3, window_start=max(0,3-7)=0
+        # Verify chunk 0 (frames 0-2): effective_window=6, window_start=max(0,3-6)=0
         # Frame 0: sink -> index 0
         # Frame 1: 1 - 0 = 1
         # Frame 2: 2 - 0 = 2
@@ -429,13 +430,13 @@ class TestDynamicRoPE:
         assert indices[1].item() == 1
         assert indices[2].item() == 2
 
-        # Verify last chunk (frames 9-11): chunk_end=12, window_start=max(0,12-7)=5
-        # Frame 9: 9 - 5 = 4
-        # Frame 10: 10 - 5 = 5
-        # Frame 11: 11 - 5 = 6
-        assert indices[9].item() == 4
-        assert indices[10].item() == 5
-        assert indices[11].item() == 6
+        # Verify last chunk (frames 9-11): window_start=max(0,12-6)=6
+        # Frame 9: 9 - 6 = 3
+        # Frame 10: 10 - 6 = 4
+        # Frame 11: 11 - 6 = 5
+        assert indices[9].item() == 3
+        assert indices[10].item() == 4
+        assert indices[11].item() == 5
 
     # --- Test 4: output shape of dynamic_rope_apply_full -------------------
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="Needs CUDA")
@@ -946,13 +947,17 @@ class TestDFvsARRoPEConsistency:
         q_start_in_window = past_in_window
         return list(range(q_start_in_window, q_start_in_window + chunk_frames))
 
-    def test_query_indices_match_all_configs(self):
-        """For each config and each chunk, DF Q indices must match AR Q indices."""
+    def test_query_indices_match_no_sink(self):
+        """Without sink, DF Q indices match AR Q indices exactly."""
         from fastgen.networks.OmniAvatar.network_causal import compute_dynamic_rope_indices
 
         chunks = self._chunk_boundaries()
+        # Only test configs without sink — with sink, AR pushes Q forward
+        # by sink_size (sink occupies position 0 in window), but DF doesn't.
+        # This is acceptable since DF uses absolute RoPE (use_dynamic_rope=False).
+        no_sink_configs = [(la, 0) for la in [6, 9, 12]]
 
-        for local_attn, sink in self.CONFIGS:
+        for local_attn, sink in no_sink_configs:
             df_indices = compute_dynamic_rope_indices(
                 self.NUM_FRAMES, self.CHUNK_SIZE, local_attn, sink
             ).tolist()
@@ -968,16 +973,17 @@ class TestDFvsARRoPEConsistency:
                 )
 
     def test_max_index_matches(self):
-        """Max RoPE index is local_attn_size - 1 in both modes."""
+        """Max RoPE index is effective_window - 1 = local_attn_size - sink_size - 1."""
         from fastgen.networks.OmniAvatar.network_causal import compute_dynamic_rope_indices
 
         for local_attn, sink in self.CONFIGS:
             df_indices = compute_dynamic_rope_indices(
                 self.NUM_FRAMES, self.CHUNK_SIZE, local_attn, sink
             )
+            effective_window = local_attn - sink
             max_idx = df_indices.max().item()
-            assert max_idx == local_attn - 1, (
-                f"Max RoPE index {max_idx} != {local_attn - 1} "
+            assert max_idx == effective_window - 1, (
+                f"Max RoPE index {max_idx} != {effective_window - 1} "
                 f"for local_attn={local_attn}, sink={sink}"
             )
 

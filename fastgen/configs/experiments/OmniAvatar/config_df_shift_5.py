@@ -49,11 +49,12 @@ CausalOmniAvatar_V2V_1_3B_Config: dict = L(CausalOmniAvatarWan)(
     omniavatar_ckpt_path=STUDENT_CKPT,
     net_pred_type="flow",
     schedule_type="rf",
-    # Sliding window attention with dynamic RoPE
+    # Sliding window attention (absolute RoPE — correct relative positions within window).
+    # Dynamic RoPE deferred to SF training where AR mode handles it correctly.
     # Stochastic: randomly sample (local_attn_size, sink_size) per forward pass.
     # local_attn_size = sink_size + rolling_window_frames (sink included in budget).
     # All configs use sink >= 1 for identity anchoring.
-    use_dynamic_rope=True,
+    use_dynamic_rope=False,
     stochastic_attn_configs=[
         {"local_attn_size": 7,  "sink_size": 1, "weight": 0.2},   # sink=1, window=6
         {"local_attn_size": 10, "sink_size": 1, "weight": 0.2},   # sink=1, window=9

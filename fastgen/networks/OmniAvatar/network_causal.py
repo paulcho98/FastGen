@@ -280,7 +280,9 @@ def compute_dynamic_rope_indices(
     current_frame = 0
     for frames_in_chunk in frame_counts:
         chunk_end_frame = current_frame + frames_in_chunk
-        window_start_frame = max(0, chunk_end_frame - local_attn_size)
+        # Subtract sink from window budget — matches _build_block_mask and AR mode
+        effective_window = local_attn_size - sink_size
+        window_start_frame = max(0, chunk_end_frame - effective_window)
 
         for f in range(current_frame, chunk_end_frame):
             if f < sink_size:
@@ -1397,9 +1399,12 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
 
             # --- sliding window lower bound (in tokens) ---
             if local_attn_size > 0:
-                # The last frame index covered by this chunk (0-based):
+                # Subtract sink from window budget — sink is added separately
+                # via the is_sink term. This matches AR mode where sink_size
+                # frames are reserved from the local_attn_size budget.
+                effective_window = local_attn_size - sink_size
                 chunk_last_frame = (current_start // frame_seqlen) + frames_in_chunk
-                window_start_frame = max(0, chunk_last_frame - local_attn_size)
+                window_start_frame = max(0, chunk_last_frame - effective_window)
                 window_start_token = window_start_frame * frame_seqlen
             else:
                 window_start_token = 0
