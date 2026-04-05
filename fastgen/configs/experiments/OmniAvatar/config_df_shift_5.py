@@ -49,17 +49,18 @@ CausalOmniAvatar_V2V_1_3B_Config: dict = L(CausalOmniAvatarWan)(
     omniavatar_ckpt_path=STUDENT_CKPT,
     net_pred_type="flow",
     schedule_type="rf",
-    # Sliding window attention (default: full causal, no window)
-    local_attn_size=-1,
-    sink_size=0,
-    use_dynamic_rope=False,
-    # Stochastic attention configs (uncomment to enable):
-    # stochastic_attn_configs=[
-    #     {"local_attn_size": -1, "sink_size": 0, "weight": 0.25},   # full causal
-    #     {"local_attn_size": 6,  "sink_size": 0, "weight": 0.25},   # tight window
-    #     {"local_attn_size": 9,  "sink_size": 0, "weight": 0.25},   # medium window
-    #     {"local_attn_size": 7,  "sink_size": 1, "weight": 0.25},   # window + sink
-    # ],
+    # Sliding window attention with dynamic RoPE
+    # Stochastic: randomly sample (local_attn_size, sink_size) per forward pass.
+    # local_attn_size = sink_size + rolling_window_frames (sink included in budget).
+    # All configs use sink >= 1 for identity anchoring.
+    use_dynamic_rope=True,
+    stochastic_attn_configs=[
+        {"local_attn_size": 7,  "sink_size": 1, "weight": 0.2},   # sink=1, window=6
+        {"local_attn_size": 10, "sink_size": 1, "weight": 0.2},   # sink=1, window=9
+        {"local_attn_size": 13, "sink_size": 1, "weight": 0.2},   # sink=1, window=12
+        {"local_attn_size": 9,  "sink_size": 3, "weight": 0.2},   # sink=3, window=6
+        {"local_attn_size": 12, "sink_size": 3, "weight": 0.2},   # sink=3, window=9
+    ],
 )
 
 

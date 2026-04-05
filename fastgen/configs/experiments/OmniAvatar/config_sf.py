@@ -75,10 +75,13 @@ CausalOmniAvatar_V2V_1_3B_Student: dict = L(CausalOmniAvatarWan)(
     omniavatar_ckpt_path=STUDENT_CKPT,
     net_pred_type="flow",
     schedule_type="rf",
-    # Sliding window attention — should match DF training config
+    # Sliding window attention for AR rollout.
+    # DF pretraining uses stochastic configs to build a robust checkpoint.
+    # SF picks a specific config per experiment (override via CLI or new config).
+    # Defaults: full causal (no window constraint during SF).
     local_attn_size=-1,
     sink_size=0,
-    use_dynamic_rope=False,
+    use_dynamic_rope=True,
 )
 
 
