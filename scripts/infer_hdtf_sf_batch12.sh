@@ -9,7 +9,7 @@ set -euo pipefail
 CKPT_DIR="/tmp/FASTGEN_SF_OUTPUT/OmniAvatar-FastGen/omniavatar_sf/sf_4gpu_bs8_lr2e6_5000iter_shift5_combined_v3/checkpoints"
 HDTF=/home/work/.local/HDTF/HDTF_original_testset_81frames
 TEXT_EMB=/home/work/stableavatar_data/v2v_training_data/0010234f331f491ffacc538958094732_shot_001_000/text_emb.pt
-OUT_ROOT=/home/work/output_hdtf_sf_sweep
+OUT_ROOT=/home/work/output_hdtf_sf_sweep_v2
 
 export OMNIAVATAR_ROOT="${OMNIAVATAR_ROOT:-/home/work/.local/OmniAvatar}"
 

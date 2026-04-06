@@ -196,18 +196,53 @@ def load_diffusion_model(args, device, dtype):
     )
 
     # Load Self-Forcing checkpoint on top
-    # Handle FSDP checkpoint format: ckpt["model"]["net"] or ckpt["net"] or bare state_dict
+    # Supports: regular .pt/.pth, FSDP distcp directory, or .pth + adjacent distcp dir
     print(f"Loading SF checkpoint from {args.ckpt_path} ...")
-    ckpt = torch.load(args.ckpt_path, map_location="cpu", weights_only=False)
-    if isinstance(ckpt, dict):
-        if "model" in ckpt and isinstance(ckpt["model"], dict) and "net" in ckpt["model"]:
-            state_dict = ckpt["model"]["net"]
-        elif "net" in ckpt:
-            state_dict = ckpt["net"]
+
+    state_dict = None
+
+    # Check for FSDP distributed checkpoint: look for .net_model/ directory
+    ckpt_stem = args.ckpt_path.replace(".pth", "")
+    fsdp_net_dir = ckpt_stem + ".net_model"
+    if os.path.isdir(fsdp_net_dir):
+        # FSDP2 distributed checkpoint — load via torch.distributed.checkpoint
+        print(f"  Loading FSDP distributed checkpoint from {fsdp_net_dir} ...")
+        from torch.distributed.checkpoint import FileSystemReader
+        from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
+
+        reader = FileSystemReader(fsdp_net_dir)
+        md = reader.read_metadata()
+        state_dict = {}
+        for key, meta in md.state_dict_metadata.items():
+            if hasattr(meta, "size"):
+                state_dict[key] = torch.empty(meta.size)
+        dcp_load(state_dict, storage_reader=reader, no_dist=True)
+        print(f"  Loaded {len(state_dict)} tensors from FSDP distcp")
+    elif os.path.isdir(args.ckpt_path):
+        # Direct distcp directory path
+        from torch.distributed.checkpoint import FileSystemReader
+        from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
+
+        reader = FileSystemReader(args.ckpt_path)
+        md = reader.read_metadata()
+        state_dict = {}
+        for key, meta in md.state_dict_metadata.items():
+            if hasattr(meta, "size"):
+                state_dict[key] = torch.empty(meta.size)
+        dcp_load(state_dict, storage_reader=reader, no_dist=True)
+        print(f"  Loaded {len(state_dict)} tensors from distcp directory")
+    else:
+        # Regular .pt/.pth checkpoint
+        ckpt = torch.load(args.ckpt_path, map_location="cpu", weights_only=False)
+        if isinstance(ckpt, dict):
+            if "model" in ckpt and isinstance(ckpt["model"], dict) and "net" in ckpt["model"]:
+                state_dict = ckpt["model"]["net"]
+            elif "net" in ckpt:
+                state_dict = ckpt["net"]
+            else:
+                state_dict = ckpt
         else:
             state_dict = ckpt
-    else:
-        state_dict = ckpt
 
     # Keys in checkpoint use plain names (e.g. "patch_embedding.weight")
     # Model wraps everything under _core, so keys are "_core.xxx"
@@ -255,7 +290,7 @@ def load_vae(vae_path, device):
         prefixed = {"model." + k: v for k, v in state_dict.items()}
         vae.load_state_dict(prefixed, strict=True)
 
-    vae = vae.to(device)
+    vae = vae.to(device=device)
     vae.eval()
     return vae
 
@@ -605,23 +640,31 @@ def encode_reference_video(vae, video_frames_np, mask_path, device, dtype):
     # Convert to tensor
     video_tensor = frames_to_tensor(video_frames_np)  # [1, 3, N, H, W]
 
-    # Load pixel-level mask
+    # Load pixel-level mask — use cv2 bilinear resize to match precomputation
+    # (preprocess_v2v_integrated.py uses cv2.INTER_LINEAR)
     mask_img = Image.open(mask_path).convert("L")
-    mask_pixel = np.array(mask_img.resize((W, H), Image.LANCZOS)).astype(np.float32) / 255.0
-    mask_pixel_binary = (mask_pixel > 0.5).astype(np.float32)
+    mask_np = np.array(mask_img).astype(np.float32) / 255.0
+    if mask_np.shape[0] != H or mask_np.shape[1] != W:
+        mask_np = cv2.resize(mask_np, (W, H), interpolation=cv2.INTER_LINEAR)
+    mask_pixel_binary = (mask_np > 0.5).astype(np.float32)
 
     # Apply spatial mask (all frames)
     masked_video_tensor = apply_spatial_mask(video_tensor, mask_pixel_binary, mask_all_frames=True)
 
-    # VAE encode both unmasked and masked (VAE requires float32)
+    # VAE encode in bf16 to match precomputation pipeline (preprocess_v2v_integrated.py
+    # encodes with bf16 VAE + bf16 input).  Temporarily cast VAE to bf16 for encode,
+    # then restore to fp32 for decode later.
+    original_dtype = next(vae.parameters()).dtype
+    vae.to(dtype=torch.bfloat16)
     with torch.no_grad():
         source_latents = vae.encode(
-            [video_tensor[0].to(dtype=torch.float32)], device=device
+            [video_tensor[0].to(dtype=torch.bfloat16)], device=device
         )  # [1, 16, T_lat, H_lat, W_lat]
 
         masked_latents = vae.encode(
-            [masked_video_tensor[0].to(dtype=torch.float32)], device=device
+            [masked_video_tensor[0].to(dtype=torch.bfloat16)], device=device
         )  # [1, 16, T_lat, H_lat, W_lat]
+    vae.to(dtype=original_dtype)
 
     ref_latent = source_latents[:, :, :1].to(dtype=dtype)  # [1, 16, 1, H_lat, W_lat]
     ref_sequence = source_latents.to(dtype=dtype)  # [1, 16, T_lat, H_lat, W_lat]
@@ -1115,9 +1158,10 @@ def run_inference(
             t_next = t_list_t[step_idx + 1]
 
             # Forward pass — model.forward() handles _build_y, rescale_t, _forward_ar internally
+            # Keep timesteps in float64 to match CausVidModel._student_sample_loop precision
             x0_pred = model(
                 noisy_input,
-                t_cur.float().expand(B),
+                t_cur.expand(B),
                 condition=condition,
                 cur_start_frame=cur_start_frame,
                 store_kv=False,
@@ -1130,7 +1174,7 @@ def run_inference(
                 # Add noise for next step (SDE: fresh random noise)
                 eps = torch.randn_like(x0_pred)
                 noisy_input = model.noise_scheduler.forward_process(
-                    x0_pred, eps, t_next.float().expand(B),
+                    x0_pred, eps, t_next.expand(B),
                 )
             else:
                 # Final step — clean output
@@ -1141,7 +1185,7 @@ def run_inference(
 
         # Update KV cache with denoised output (context for next block)
         cache_input = x0_pred
-        t_cache = torch.full((B,), context_noise, device=device, dtype=dtype)
+        t_cache = torch.full((B,), context_noise, device=device, dtype=torch.float64)
         if context_noise > 0:
             cache_eps = torch.randn_like(x0_pred)
             cache_input = model.noise_scheduler.forward_process(
