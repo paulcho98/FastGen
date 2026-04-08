@@ -547,7 +547,10 @@ class CausalSelfAttention(nn.Module):
             kv_cache_size = kv_cache["k"].shape[1]
             if cache_local_end_override is not None:
                 local_end = cache_local_end_override
-                global_end = cache_local_end_override  # In no-eviction mode, they're equal
+                # global_end tracks the actual sequence position (not cache buffer position).
+                # After sliding-window eviction, global_end > local_end.
+                # current_start IS the global position of already-cached content.
+                global_end = current_start
             else:
                 global_end = kv_cache["global_end_index"].item()
                 local_end = kv_cache["local_end_index"].item()
@@ -1446,14 +1449,19 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
     ) -> None:
         """Allocate KV caches for all transformer blocks.
 
-        When ``local_attn_size > 0``, the cache is sized to hold exactly
-        ``local_attn_size * frame_seqlen`` tokens (the rolling window).
-        Otherwise it is sized for the full sequence (``total_tokens``).
+        During training, always allocates the full sequence size to avoid
+        in-place eviction — gradient checkpointing recomputes forward passes
+        that read from cache, so the buffer must remain stable between forward
+        and backward (see docs/kv-cache-eviction-gradient-checkpointing.md).
+
+        During inference (no gradient checkpointing), uses the smaller
+        ``local_attn_size * frame_seqlen`` cache with rolling eviction to
+        save memory on long sequences.
         """
         n = self._num_heads
         d = self._dim // n
 
-        if self.local_attn_size > 0:
+        if not self.training and self.local_attn_size > 0:
             cache_tokens = self.local_attn_size * frame_seqlen
         else:
             cache_tokens = total_tokens
