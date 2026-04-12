@@ -20,11 +20,27 @@ import logging
 from typing import Any, Dict, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 
 from fastgen.methods.omniavatar_self_forcing import OmniAvatarSelfForcingModel
 from fastgen.methods.reward.sync_c_scorer import SyncCScorer
 
 logger = logging.getLogger(__name__)
+
+
+def _reduce(x: torch.Tensor, op) -> torch.Tensor:
+    """Reduce a 0-d tensor across ranks, returning a 0-d tensor.
+
+    No-op when torch.distributed is not initialized (single-rank / unit test
+    path). For SUM, divides by world_size to get a mean; for MIN/MAX, leaves
+    the value as-is.
+    """
+    y = x.detach().clone().float().reshape(())
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(y, op=op)
+        if op == dist.ReduceOp.SUM:
+            y = y / dist.get_world_size()
+    return y
 
 
 class OmniAvatarSelfForcingReDMD(OmniAvatarSelfForcingModel):
@@ -108,13 +124,20 @@ class OmniAvatarSelfForcingReDMD(OmniAvatarSelfForcingModel):
         mean_weight = weight.mean()
         weighted = mean_weight * vsd_loss
 
+        sync_c_mean_r = _reduce(sync_c.mean(), dist.ReduceOp.SUM)
+        sync_c_min_r  = _reduce(sync_c.min(),  dist.ReduceOp.MIN)
+        sync_c_max_r  = _reduce(sync_c.max(),  dist.ReduceOp.MAX)
+        weight_mean_r = _reduce(weight.mean(), dist.ReduceOp.SUM)
+        weight_min_r  = _reduce(weight.min(),  dist.ReduceOp.MIN)
+        weight_max_r  = _reduce(weight.max(),  dist.ReduceOp.MAX)
+
         log_map = {
-            "reward_sync_c_mean": float(sync_c.mean().item()),
-            "reward_sync_c_min": float(sync_c.min().item()),
-            "reward_sync_c_max": float(sync_c.max().item()),
-            "reward_weight_mean": float(mean_weight.item()),
-            "reward_weight_min": float(weight.min().item()),
-            "reward_weight_max": float(weight.max().item()),
+            "reward_sync_c_mean": float(sync_c_mean_r.item()),
+            "reward_sync_c_min": float(sync_c_min_r.item()),
+            "reward_sync_c_max": float(sync_c_max_r.item()),
+            "reward_weight_mean": float(weight_mean_r.item()),
+            "reward_weight_min": float(weight_min_r.item()),
+            "reward_weight_max": float(weight_max_r.item()),
             "vsd_loss_unweighted": float(vsd_loss.detach().item()),
             "vsd_loss_weighted": float(weighted.detach().item()),
         }
