@@ -96,3 +96,45 @@ class SyncCScorer(nn.Module):
             )
         mfcc = self.mfcc(audio.unsqueeze(0))  # [1, 13, M]
         return mfcc.unsqueeze(1)              # [1, 1, 13, M]
+
+    def _lip_windows(self, video: torch.Tensor) -> torch.Tensor:
+        """[1, 3, F, 224, 224] -> [F-4, 3, 5, 224, 224] — 5-frame stride-1 lip windows."""
+        F_ = video.shape[2]
+        if F_ < 5:
+            raise ValueError(f"Need at least 5 frames, got {F_}")
+        w = video.unfold(2, 5, 1).squeeze(0)            # [3, N, 224, 224, 5]
+        return w.permute(1, 0, 4, 2, 3).contiguous()
+
+    def _aud_windows(self, mfcc: torch.Tensor) -> torch.Tensor:
+        """[1, 1, 13, M] -> [N, 1, 13, 20] — 20-MFCC stride-4 audio windows.
+
+        Stride 4 because MFCC is 100 fps, video is 25 fps (4 MFCC frames per video
+        frame), so consecutive audio windows align with consecutive lip windows.
+        """
+        M = mfcc.shape[-1]
+        if M < 20:
+            raise ValueError(f"Need at least 20 MFCC frames, got {M}")
+        w = mfcc.unfold(-1, 20, 4).squeeze(0).squeeze(0)  # [13, N, 20]
+        return w.permute(1, 0, 2).unsqueeze(1)
+
+    def _offset_search(self, lip_emb: torch.Tensor, aud_emb: torch.Tensor) -> torch.Tensor:
+        """[N, 1024] x [N, 1024] -> scalar sync-C margin.
+
+        Slides audio relative to lip across `[-vshift, +vshift]` frames, computes
+        the mean pairwise L2 distance at each shift, and returns
+        `median(mean_dists) - min(mean_dists)` — higher = more confident sync.
+        """
+        N = min(lip_emb.shape[0], aud_emb.shape[0])
+        lip_emb, aud_emb = lip_emb[:N], aud_emb[:N]
+        dists = []
+        for shift in range(-self.vshift, self.vshift + 1):
+            if shift < 0:
+                l, a = lip_emb[-shift:], aud_emb[:N + shift]
+            elif shift > 0:
+                l, a = lip_emb[:N - shift], aud_emb[shift:]
+            else:
+                l, a = lip_emb, aud_emb
+            d = F.pairwise_distance(l, a).mean()
+            dists.append(d)
+        mean_dists = torch.stack(dists, dim=0)
+        return mean_dists.median() - mean_dists.min()
