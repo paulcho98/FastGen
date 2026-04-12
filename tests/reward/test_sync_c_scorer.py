@@ -1,3 +1,4 @@
+import os
 import pytest
 import torch
 import torch.nn as nn
@@ -93,3 +94,89 @@ def test_offset_search_perfect_alignment_scores_high(scorer):
     # Perfect sync: lip == aud → min distance at shift 0 is exactly 0
     conf = scorer._offset_search(emb, emb)
     assert conf > 0.5, f"confidence should be clearly positive, got {conf}"
+
+
+def test_reward_from_frames_returns_dict_with_MQ_alias(scorer):
+    scorer.face_crop_size = 224
+    scorer.audio_sample_rate = 16000
+    scorer.target_sample_rate = 16000
+    scorer.vshift = 15
+    scorer.mfcc = torchaudio.transforms.MFCC(
+        sample_rate=16000, n_mfcc=13,
+        melkwargs={"n_fft": 512, "win_length": 400, "hop_length": 160,
+                   "n_mels": 40, "center": False},
+    )
+
+    # Stub out the heavy SyncNet-v2 forward — deterministic random embeddings
+    class _FakeNet(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._anchor = torch.nn.Linear(1, 1)  # for _device()/_dtype() helpers
+        def forward_lip(self, x):
+            g = torch.Generator().manual_seed(0)
+            return F.normalize(torch.randn(x.shape[0], 1024, generator=g), dim=-1)
+        def forward_aud(self, x):
+            g = torch.Generator().manual_seed(1)
+            return F.normalize(torch.randn(x.shape[0], 1024, generator=g), dim=-1)
+    object.__setattr__(scorer, "net", _FakeNet())
+
+    video = torch.randint(0, 256, (81, 3, 128, 128), dtype=torch.uint8)
+    audio = torch.randn(int(16000 * 3.24))
+    out = scorer.reward_from_frames([video], [audio])
+
+    assert set(out.keys()) >= {"sync_c", "MQ"}
+    assert out["sync_c"].shape == (1,)
+    assert torch.equal(out["sync_c"], out["MQ"])  # MQ is an alias
+
+
+def test_reward_from_frames_batched(scorer):
+    scorer.face_crop_size = 224
+    scorer.audio_sample_rate = 16000
+    scorer.target_sample_rate = 16000
+    scorer.vshift = 15
+    scorer.mfcc = torchaudio.transforms.MFCC(
+        sample_rate=16000, n_mfcc=13,
+        melkwargs={"n_fft": 512, "win_length": 400, "hop_length": 160,
+                   "n_mels": 40, "center": False},
+    )
+
+    class _FakeNet(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._anchor = torch.nn.Linear(1, 1)
+        def forward_lip(self, x):
+            return F.normalize(torch.randn(x.shape[0], 1024), dim=-1)
+        def forward_aud(self, x):
+            return F.normalize(torch.randn(x.shape[0], 1024), dim=-1)
+    object.__setattr__(scorer, "net", _FakeNet())
+
+    videos = [torch.randint(0, 256, (81, 3, 128, 128), dtype=torch.uint8) for _ in range(4)]
+    audios = [torch.randn(int(16000 * 3.24)) for _ in range(4)]
+    out = scorer.reward_from_frames(videos, audios)
+    assert out["sync_c"].shape == (4,)
+
+
+def test_reward_from_frames_mismatched_batch_raises(scorer):
+    with pytest.raises(AssertionError, match="video/audio batch mismatch"):
+        scorer.reward_from_frames(
+            [torch.randint(0, 256, (81, 3, 64, 64), dtype=torch.uint8)],
+            [torch.randn(16000), torch.randn(16000)],
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not os.path.exists("/home/work/.local/eval_metrics/checkpoints/auxiliary/syncnet_v2.model"),
+    reason="SyncNet-v2 checkpoint not present",
+)
+def test_real_scorer_gpu_runs():
+    from fastgen.methods.reward.sync_c_scorer import SyncCScorer
+    s = SyncCScorer(
+        checkpoint_path="/home/work/.local/eval_metrics/checkpoints/auxiliary/syncnet_v2.model",
+        device="cuda",
+    )
+    video = torch.randint(0, 256, (81, 3, 224, 224), dtype=torch.uint8)
+    audio = torch.randn(int(16000 * 3.24))
+    out = s.reward_from_frames([video], [audio])
+    assert out["sync_c"].shape == (1,)
+    assert torch.isfinite(out["sync_c"]).all()

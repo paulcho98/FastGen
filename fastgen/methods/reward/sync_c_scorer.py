@@ -69,7 +69,7 @@ class SyncCScorer(nn.Module):
                 "n_mels": 40,
                 "center": False,
             },
-        )
+        ).to(device=device, dtype=dtype)
 
     def _device(self):
         return next(self.net.parameters()).device
@@ -138,3 +138,39 @@ class SyncCScorer(nn.Module):
             dists.append(d)
         mean_dists = torch.stack(dists, dim=0)
         return mean_dists.median() - mean_dists.min()
+
+    @torch.no_grad()
+    def reward_from_frames(
+        self,
+        video_tensors: List[torch.Tensor],
+        audio_tensors: List[torch.Tensor],
+        prompts: Optional[List[str]] = None,
+        use_norm: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """Score a batch of talking-head clips.
+
+        Args:
+            video_tensors: list of `[F, 3, H, W]` uint8 face-aligned frames.
+            audio_tensors: list of `[L]` float waveforms, time-aligned with frame 0.
+            prompts: unused, kept for VideoVLMRewardInference interface compat.
+            use_norm: unused, kept for interface compat.
+
+        Returns:
+            dict with:
+              - `sync_c`: `[B]` scalar tensor, higher = more confident lip sync.
+              - `MQ`: alias of `sync_c` so existing Re-DMD callers need no change.
+        """
+        assert len(video_tensors) == len(audio_tensors), "video/audio batch mismatch"
+        confs = [self._score_single(v, a) for v, a in zip(video_tensors, audio_tensors)]
+        sync_c = torch.stack(confs, dim=0)
+        return {"sync_c": sync_c, "MQ": sync_c}
+
+    def _score_single(self, video: torch.Tensor, audio: torch.Tensor) -> torch.Tensor:
+        """End-to-end scoring for one sample."""
+        video = self._prep_video(video)
+        mfcc = self._prep_audio(audio)
+        lip_windows = self._lip_windows(video)
+        aud_windows = self._aud_windows(mfcc)
+        lip_emb = self.net.forward_lip(lip_windows.to(self._dtype()))
+        aud_emb = self.net.forward_aud(aud_windows.to(self._dtype()))
+        return self._offset_search(lip_emb, aud_emb)
