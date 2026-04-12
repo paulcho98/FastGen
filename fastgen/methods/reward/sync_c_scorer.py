@@ -1,6 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """SyncNet-v2 sync-C reward scorer. Design reference:
 /home/work/.local/hyunbin/Reward-Forcing/docs/sync_c_scorer_design.md
 """
+
+from __future__ import annotations
+
 from typing import Dict, List, Optional
 
 import torch
@@ -51,8 +57,6 @@ class SyncCScorer(nn.Module):
         self.target_sample_rate = 16000
         self.face_crop_size = face_crop_size
         self.vshift = vshift
-        self.device = device
-        self.dtype = dtype
 
         # torchaudio MFCC: 13 coeffs, 25 ms win / 10 ms hop at 16 kHz
         self.mfcc = torchaudio.transforms.MFCC(
@@ -65,11 +69,17 @@ class SyncCScorer(nn.Module):
                 "n_mels": 40,
                 "center": False,
             },
-        ).to(device)
+        )
+
+    def _device(self):
+        return next(self.net.parameters()).device
+
+    def _dtype(self):
+        return next(self.net.parameters()).dtype
 
     def _prep_video(self, video: torch.Tensor) -> torch.Tensor:
         """[F, 3, H, W] uint8 -> [1, 3, F, 224, 224] float in [0, 1]."""
-        video = video.to(self.device).float() / 255.0
+        video = video.to(self._device()).float() / 255.0
         video = F.interpolate(
             video, size=(self.face_crop_size, self.face_crop_size),
             mode="bilinear", align_corners=False,
@@ -78,7 +88,8 @@ class SyncCScorer(nn.Module):
 
     def _prep_audio(self, audio: torch.Tensor) -> torch.Tensor:
         """[L] float waveform -> [1, 1, 13, M] MFCC."""
-        audio = audio.to(self.device).float()
+        assert audio.dim() == 1, f"expected 1-D waveform, got shape {tuple(audio.shape)}"
+        audio = audio.to(self._device()).float()
         if self.audio_sample_rate != self.target_sample_rate:
             audio = torchaudio.functional.resample(
                 audio, self.audio_sample_rate, self.target_sample_rate,
