@@ -16,17 +16,15 @@ where r is a scalar sync-C from SyncNet-v2 (detached, no gradient). See
 scorer contract.
 """
 
-import logging
 import os
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 
+import fastgen.utils.logging_utils as logger
 from fastgen.methods.omniavatar_self_forcing import OmniAvatarSelfForcingModel
 from fastgen.methods.reward.sync_c_scorer import SyncCScorer
-
-logger = logging.getLogger(__name__)
 
 
 def _reduce(x: torch.Tensor, op) -> torch.Tensor:
@@ -52,17 +50,22 @@ class OmniAvatarSelfForcingReDMD(OmniAvatarSelfForcingModel):
     """
 
     def __init__(self, config):
+        # NOTE: don't initialize self.reward_scorer / self._reward_running_mean
+        # here — base Model.__init__ calls self.build_model() during super().__init__,
+        # and build_model sets these attrs. A post-super `= None` would clobber
+        # the scorer back to None and silently disable the reward path.
         super().__init__(config)
-        self.reward_scorer: Optional[SyncCScorer] = None
-        # EMA running mean of sync_c, used only when config.center_reward is True.
-        self._reward_running_mean: Optional[float] = None
 
     def build_model(self):
         """Build base-class components, then load the SyncCScorer."""
         super().build_model()
 
+        # Initialize per-run state here (runs every time build_model is called)
+        self._reward_running_mean: Optional[float] = None
+
         rcfg = getattr(self.config, "reward", None)
         if rcfg is None or not getattr(rcfg, "enabled", True):
+            self.reward_scorer = None
             logger.info("Re-DMD reward disabled — running as vanilla OmniAvatar SF.")
             return
 
