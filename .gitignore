@@ -182,3 +182,5 @@ wandb/
 
 # vscode
 *.vscode/
+# Re-DMD smoke debug artifacts
+logs/
