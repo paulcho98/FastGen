@@ -23,6 +23,52 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 
+def _load_raw_waveform_for_reward(
+    audio_path: str,
+    target_sample_rate: int,
+    target_length: int,
+) -> torch.Tensor:
+    """Load a wav, mono-collapse, resample to target_sample_rate, pad/truncate to target_length.
+
+    Returns a 1-D float32 tensor of exactly target_length samples. Used by the
+    SyncCScorer-based Re-DMD reward.
+    """
+    import scipy.io.wavfile as wavfile
+    from scipy import signal
+
+    sr, wav = wavfile.read(audio_path)
+
+    # Convert to float32 in [-1, 1] range
+    if wav.dtype == np.int16:
+        wav = wav.astype(np.float32) / 32768.0
+    elif wav.dtype != np.float32:
+        wav = wav.astype(np.float32)
+
+    # Convert to torch tensor
+    wav = torch.from_numpy(wav)
+
+    # Handle stereo -> mono
+    if wav.ndim == 2:
+        wav = wav.mean(dim=1)
+
+    # Resample if needed
+    if sr != target_sample_rate:
+        # Use scipy resample for simplicity
+        num_samples_new = int(len(wav) * target_sample_rate / sr)
+        wav_np = wav.numpy()
+        wav_np = signal.resample(wav_np, num_samples_new)
+        wav = torch.from_numpy(wav_np)
+
+    # Pad or truncate to target_length
+    L = target_length
+    if wav.shape[0] < L:
+        wav = torch.nn.functional.pad(wav, (0, L - wav.shape[0]))
+    else:
+        wav = wav[:L]
+
+    return wav.to(torch.float32)
+
+
 class OmniAvatarDataset(Dataset):
     """
     Dataset for OmniAvatar V2V training data with precomputed tensors.
@@ -48,12 +94,21 @@ class OmniAvatarDataset(Dataset):
         num_video_frames: int = 81,
         latent_h: int = 64,
         latent_w: int = 64,
+        load_raw_audio: bool = False,
+        raw_audio_sample_rate: int = 16000,
+        raw_audio_num_frames: int = 81,
+        raw_audio_fps: float = 25.0,
     ):
         self.use_ref_sequence = use_ref_sequence
         self.load_ode_path = load_ode_path
         self.num_video_frames = num_video_frames
         self.latent_h = latent_h
         self.latent_w = latent_w
+        self.load_raw_audio = load_raw_audio
+        self.raw_audio_sample_rate = raw_audio_sample_rate
+        self.raw_audio_num_frames = raw_audio_num_frames
+        self.raw_audio_fps = raw_audio_fps
+        self.raw_audio_length = int(self.raw_audio_num_frames / self.raw_audio_fps * self.raw_audio_sample_rate)
 
         # Read sample directories from text file
         with open(data_list_path) as f:
@@ -153,6 +208,14 @@ class OmniAvatarDataset(Dataset):
             # Always include key so default_collate doesn't fail on mixed-key batches.
             audio_wav_path = os.path.join(sample_dir, "audio.wav")
             result["audio_path"] = audio_wav_path if os.path.exists(audio_wav_path) else ""
+
+            # Load raw audio waveform if requested (for SyncCScorer reward)
+            if self.load_raw_audio and isinstance(result.get("audio_path"), str) and os.path.exists(result["audio_path"]):
+                result["audio_waveform"] = _load_raw_waveform_for_reward(
+                    result["audio_path"],
+                    target_sample_rate=self.raw_audio_sample_rate,
+                    target_length=self.raw_audio_length,
+                )
 
             # --- Reference sequence latents (optional) ---
             if self.use_ref_sequence:
