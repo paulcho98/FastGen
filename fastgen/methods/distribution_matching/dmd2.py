@@ -183,14 +183,27 @@ class DMD2Model(FastGenModel):
             CFG-adjusted teacher_x0
         """
         assert self.config.guidance_scale is not None, "guidance_scale must be provided"
-        # classifier-free guidance
+        # classifier-free guidance (always run negative pass for FSDP consistency)
         with torch.no_grad():
             kwargs = {"condition": neg_condition, "fwd_pred_type": "x0"}
             if self.config.skip_layers is not None:
                 kwargs["skip_layers"] = self.config.skip_layers
             teacher_x0_neg = self.teacher(perturbed_data, t, **kwargs)
 
-        teacher_x0 = teacher_x0 + (self.config.guidance_scale - 1) * (teacher_x0 - teacher_x0_neg)
+        # Compute effective per-sample guidance scale
+        ts_cfg = self.config.timestep_cfg
+        if ts_cfg.enabled:
+            in_range = (t >= ts_cfg.t_lo) & (t <= ts_cfg.t_hi)
+            view_shape = [-1] + [1] * (teacher_x0.ndim - 1)
+            effective_scale = torch.where(
+                in_range,
+                torch.tensor(self.config.guidance_scale, device=t.device, dtype=teacher_x0.dtype),
+                torch.tensor(1.0, device=t.device, dtype=teacher_x0.dtype),
+            ).view(view_shape)
+        else:
+            effective_scale = self.config.guidance_scale
+
+        teacher_x0 = teacher_x0 + (effective_scale - 1) * (teacher_x0 - teacher_x0_neg)
         return teacher_x0
 
     def _student_update_step(

@@ -17,7 +17,7 @@ RUN_NAME="sf_sink1_window7_dynrope_2step"
 /home/work/.local/miniconda3/envs/hb_fastgen/bin/torchrun \
     --nproc_per_node=4 \
     train.py \
-    --config=fastgen/configs/experiments/OmniAvatar/config_sf_sink1_window7.py \
+    --config=fastgen/configs/experiments/OmniAvatar/config_sf_sink1_window7_tscfg.py \
     - trainer.resume=False \
     log_config.group="omniavatar_sf" \
     log_config.name="${RUN_NAME}" \

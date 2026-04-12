@@ -98,6 +98,19 @@ class SampleTConfig:
 
 
 @attrs.define(slots=False)
+class TimestepCFGConfig:
+    """Timestep-conditional classifier-free guidance.
+
+    When enabled, CFG uses the configured guidance_scale only when t is in [t_lo, t_hi].
+    Outside the range, effective guidance_scale is 1.0 (no CFG effect).
+    Both teacher forward passes always run for FSDP consistency.
+    """
+    enabled: bool = False
+    t_lo: float = 0.0
+    t_hi: float = 1.0
+
+
+@attrs.define(slots=False)
 class BaseModelConfig:
     # Use factory functions to ensure each instance gets its own copy
     net: dict = attrs.field(factory=lambda: copy.deepcopy(EDMConfig))
@@ -106,6 +119,8 @@ class BaseModelConfig:
 
     # guidance scale for classifier-free guidance in teacher diffusion model. None means no guidance.
     guidance_scale: Optional[float] = None
+    # timestep-conditional CFG (applies when guidance_scale is not None)
+    timestep_cfg: TimestepCFGConfig = attrs.field(factory=TimestepCFGConfig)
 
     # enable skip layer guidance (currently only wan network has the skip_layers option in cfg)
     skip_layers: List[int] | None = None

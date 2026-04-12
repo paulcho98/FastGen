@@ -36,6 +36,9 @@ def create_config():
     config.model.sample_t_cfg.t_list = [0.999, 0.833, 0.0]
     config.model.student_sample_steps = 2
 
-    config.log_config.name = "sf_sink1_window7_dynrope_2step"
+    # Enable timestep-conditional CFG for this experiment
+    config.model.timestep_cfg.enabled = True
+
+    config.log_config.name = "sf_sink1_window7_dynrope_2step_tscfg"
 
     return config

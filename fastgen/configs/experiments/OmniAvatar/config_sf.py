@@ -105,6 +105,11 @@ def create_config():
     config.model.input_shape = [16, 21, 64, 64]
     config.model.fake_score_pred_type = "x0"
     config.model.guidance_scale = 4.5
+    # Timestep-conditional CFG: only apply CFG in medium-noise range (50-step indices 20-40)
+    # t > 0.882 (high noise) and t < 0.556 (low noise): no CFG effect
+    config.model.timestep_cfg.enabled = False  # enable per-experiment in child configs
+    config.model.timestep_cfg.t_lo = 0.556
+    config.model.timestep_cfg.t_hi = 0.882
 
     # Networks: 14B teacher + 1.3B student + 1.3B fake_score
     config.model.net = CausalOmniAvatar_V2V_1_3B_Student
