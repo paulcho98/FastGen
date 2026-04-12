@@ -17,6 +17,7 @@ scorer contract.
 """
 
 import logging
+import os
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -141,7 +142,66 @@ class OmniAvatarSelfForcingReDMD(OmniAvatarSelfForcingModel):
             "vsd_loss_unweighted": float(vsd_loss.detach().item()),
             "vsd_loss_weighted": float(weighted.detach().item()),
         }
+
+        # Per-rank first-sample values via all_gather (gives rank-level visibility in wandb)
+        if dist.is_available() and dist.is_initialized():
+            world_size = dist.get_world_size()
+            local_sync_c = sync_c[0:1].detach().float()    # [1] — rank-local first sample
+            local_weight = weight[0:1].detach().float()    # [1]
+            gathered_sync_c = [torch.zeros_like(local_sync_c) for _ in range(world_size)]
+            gathered_weight = [torch.zeros_like(local_weight) for _ in range(world_size)]
+            dist.all_gather(gathered_sync_c, local_sync_c)
+            dist.all_gather(gathered_weight, local_weight)
+            for r in range(world_size):
+                log_map[f"reward_sync_c_r{r}"] = float(gathered_sync_c[r].item())
+                log_map[f"reward_weight_r{r}"] = float(gathered_weight[r].item())
+        else:
+            # Single-rank fallback (unit tests and 1-GPU runs) — log all batch items as r0..rN-1
+            for b in range(sync_c.shape[0]):
+                log_map[f"reward_sync_c_r{b}"] = float(sync_c[b].item())
+                log_map[f"reward_weight_r{b}"] = float(weight[b].item())
+
         return weighted, log_map
+
+    # ------------------------------------------------------------------
+    # single_train_step override: stash iteration for _maybe_save_debug_video
+    # ------------------------------------------------------------------
+
+    def single_train_step(self, data: Dict[str, Any], iteration: int):
+        self._current_iteration = iteration
+        return super().single_train_step(data, iteration)
+
+    # ------------------------------------------------------------------
+    # Optional MP4 debug save (Feature B)
+    # ------------------------------------------------------------------
+
+    def _maybe_save_debug_video(self, pixels: torch.Tensor, iteration: int) -> None:
+        """Save the first sample's decoded video to disk for manual inspection.
+
+        Only fires on rank 0, only when config.save_reward_debug_video is True.
+        Writes an MP4 at config.reward_debug_dir/gen_iter{iteration:06d}.mp4.
+        """
+        if not getattr(self.config, "save_reward_debug_video", False):
+            return
+        # Rank-0 only
+        if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+            return
+
+        debug_dir = getattr(self.config, "reward_debug_dir", "logs/redmd_debug")
+        os.makedirs(debug_dir, exist_ok=True)
+
+        # pixels: [B, 3, T_pix, H, W] in [-1, 1]
+        sample = pixels[0].clamp(-1.0, 1.0)             # [3, T, H, W]
+        sample = ((sample + 1.0) * 127.5).to(torch.uint8)  # uint8 [3, T, H, W]
+        sample = sample.permute(1, 2, 3, 0).contiguous().cpu()  # [T, H, W, 3] for torchvision.io
+
+        out_path = os.path.join(debug_dir, f"gen_iter{iteration:06d}.mp4")
+        try:
+            from torchvision.io import write_video
+            write_video(out_path, sample, fps=25)
+            logger.info(f"[Re-DMD debug] saved decoded video at {out_path} ({tuple(sample.shape)})")
+        except Exception as e:
+            logger.warning(f"[Re-DMD debug] failed to save debug video: {e}")
 
     # ------------------------------------------------------------------
     # Task 7: _student_update_step with VAE decode + sync-C reward
@@ -197,6 +257,7 @@ class OmniAvatarSelfForcingReDMD(OmniAvatarSelfForcingModel):
         if self.reward_scorer is not None and "audio_waveform" in data:
             with torch.no_grad():
                 pixels = self._decode_gen_to_pixels(gen_data)           # [B, 3, T_pix, H, W] in [-1, 1]
+                self._maybe_save_debug_video(pixels, iteration=getattr(self, "_current_iteration", 0))
                 videos_u8 = self._pixels_to_uint8_face_crop(pixels)     # list of B [T_pix, 3, H, W] uint8
                 audios = list(data["audio_waveform"].unbind(0))         # list of B [L]
             weighted_vsd, reward_log = self._apply_reward_weighting(vsd_loss, videos_u8, audios)

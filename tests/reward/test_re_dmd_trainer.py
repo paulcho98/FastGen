@@ -208,3 +208,55 @@ def test_student_update_step_bypasses_reward_when_scorer_missing():
 
     assert "total_loss" in loss_map
     assert "reward_sync_c_mean" not in loss_map
+
+
+def test_per_rank_log_keys_in_single_rank_path():
+    """When torch.distributed is not initialized, per-rank keys fall back to
+    per-batch-item keys (r0, r1, ...)."""
+    model = _make_model(beta=0.25, scorer_sync_c=2.0)
+    videos = [torch.randint(0, 256, (81, 3, 224, 224), dtype=torch.uint8) for _ in range(3)]
+    audios = [torch.randn(51840) for _ in range(3)]
+    vsd = torch.tensor(1.0)
+    _, log_map = model._apply_reward_weighting(vsd, videos, audios)
+    # 3 samples -> 3 per-rank keys
+    assert "reward_sync_c_r0" in log_map
+    assert "reward_sync_c_r1" in log_map
+    assert "reward_sync_c_r2" in log_map
+    assert "reward_weight_r0" in log_map
+    assert abs(log_map["reward_sync_c_r0"] - 2.0) < 1e-6
+
+
+def test_maybe_save_debug_video_disabled_by_default(tmp_path):
+    """With save_reward_debug_video False (default), no file is written."""
+    from fastgen.methods.omniavatar_self_forcing_re_dmd import OmniAvatarSelfForcingReDMD
+
+    model = OmniAvatarSelfForcingReDMD.__new__(OmniAvatarSelfForcingReDMD)
+    cfg = type("Cfg", (), {})()
+    # no save_reward_debug_video -> defaults to False
+    model.config = cfg
+
+    pixels = torch.zeros(1, 3, 81, 64, 64)
+    model._maybe_save_debug_video(pixels, iteration=0)
+
+    # No files should have been created anywhere under tmp_path
+    assert not any(tmp_path.rglob("*.mp4"))
+
+
+def test_maybe_save_debug_video_writes_mp4_when_enabled(tmp_path):
+    """With the flag on and a writable debug_dir, we get an mp4 file."""
+    from fastgen.methods.omniavatar_self_forcing_re_dmd import OmniAvatarSelfForcingReDMD
+
+    model = OmniAvatarSelfForcingReDMD.__new__(OmniAvatarSelfForcingReDMD)
+    cfg = type("Cfg", (), {})()
+    cfg.save_reward_debug_video = True
+    cfg.reward_debug_dir = str(tmp_path)
+    model.config = cfg
+
+    # 5 frames is the minimum SyncNet window but here we just need a small video
+    pixels = torch.zeros(1, 3, 10, 64, 64)  # [B=1, 3, T=10, H=64, W=64]
+    model._maybe_save_debug_video(pixels, iteration=42)
+
+    mp4s = list(tmp_path.glob("*.mp4"))
+    assert len(mp4s) == 1
+    assert mp4s[0].name == "gen_iter000042.mp4"
+    assert mp4s[0].stat().st_size > 0
