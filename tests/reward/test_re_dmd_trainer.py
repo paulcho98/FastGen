@@ -91,3 +91,120 @@ def test_clamping_bounds_weight():
     # sync_c=10 clamped to 2 → weight = exp(1*2) ≈ 7.39, NOT exp(10) ≈ 22026
     assert abs(log_map["reward_weight_mean"] - math.exp(2.0)) < 1e-3
     assert log_map["reward_sync_c_max"] == 2.0
+
+
+def test_student_update_step_integrates_reward():
+    """_student_update_step should:
+      (a) compute vsd_loss (mocked),
+      (b) VAE-decode gen_data (mocked),
+      (c) call reward scorer with decoded pixels + audio_waveform,
+      (d) multiply vsd_loss by exp(beta * sync_c),
+      (e) include reward/weight stats in the returned loss_map.
+    """
+    from fastgen.methods.omniavatar_self_forcing_re_dmd import OmniAvatarSelfForcingReDMD
+
+    model = OmniAvatarSelfForcingReDMD.__new__(OmniAvatarSelfForcingReDMD)
+
+    cfg = type("Cfg", (), {})()
+    cfg.reward_beta = 0.25
+    cfg.center_reward = False
+    cfg.clamp_reward = None
+    cfg.gan_loss_weight_gen = 0.0
+    cfg.guidance_scale = None
+    model.config = cfg
+    model.reward_scorer = _FakeScorer(sync_c=3.0)
+    model._reward_running_mean = None
+
+    # Fake generator output + deps
+    gen_latent = torch.randn(1, 16, 21, 8, 8, requires_grad=True)
+    model.gen_data_from_net = lambda *a, **kw: gen_latent
+
+    class _FakeSched:
+        def forward_process(self, x, eps, t):
+            return x + 0.1 * eps
+
+    class _FakeVAE:
+        def decode(self, x):
+            # list in -> list out; one decoded pixel tensor per sample
+            return [torch.zeros(3, 81, 64, 64) for _ in x]
+
+    class _FakeNet:
+        def __init__(self):
+            self.noise_scheduler = _FakeSched()
+            self.vae = _FakeVAE()
+
+        def clear_caches(self):
+            pass
+
+    model.net = _FakeNet()
+    model.fake_score = lambda x, t, condition, fwd_pred_type: torch.zeros_like(gen_latent)
+    model._compute_teacher_prediction_gan_loss = lambda p, t, condition: (
+        torch.zeros_like(gen_latent),
+        torch.tensor(0.0),
+    )
+    model._get_outputs = lambda gen_data, input_student, condition=None: {}
+
+    data = {"audio_waveform": torch.randn(1, 51840)}
+    condition = {}
+    neg_condition = {}
+    input_s = torch.randn_like(gen_latent)
+    t_student = torch.tensor([0.5])
+    t = torch.tensor([0.5])
+    eps = torch.randn_like(gen_latent)
+
+    loss_map, outputs = model._student_update_step(
+        input_s, t_student, t, eps, data,
+        condition=condition, neg_condition=neg_condition,
+    )
+
+    assert "reward_sync_c_mean" in loss_map
+    assert "reward_weight_mean" in loss_map
+    assert "vsd_loss_unweighted" in loss_map
+    assert "total_loss" in loss_map
+    assert abs(float(loss_map["reward_sync_c_mean"]) - 3.0) < 1e-6
+
+
+def test_student_update_step_bypasses_reward_when_scorer_missing():
+    """If reward_scorer is None (config.reward.enabled=False), behave like base class:
+    no reward_* keys, vsd_loss used directly.
+    """
+    from fastgen.methods.omniavatar_self_forcing_re_dmd import OmniAvatarSelfForcingReDMD
+
+    model = OmniAvatarSelfForcingReDMD.__new__(OmniAvatarSelfForcingReDMD)
+    cfg = type("Cfg", (), {})()
+    cfg.gan_loss_weight_gen = 0.0
+    cfg.guidance_scale = None
+    model.config = cfg
+    model.reward_scorer = None
+
+    gen_latent = torch.randn(1, 16, 21, 8, 8, requires_grad=True)
+    model.gen_data_from_net = lambda *a, **kw: gen_latent
+
+    class _FakeSched:
+        def forward_process(self, x, eps, t):
+            return x + 0.1 * eps
+
+    class _FakeNet:
+        def __init__(self):
+            self.noise_scheduler = _FakeSched()
+        def clear_caches(self):
+            pass
+
+    model.net = _FakeNet()
+    model.fake_score = lambda x, t, condition, fwd_pred_type: torch.zeros_like(gen_latent)
+    model._compute_teacher_prediction_gan_loss = lambda p, t, condition: (
+        torch.zeros_like(gen_latent),
+        torch.tensor(0.0),
+    )
+    model._get_outputs = lambda gen_data, input_student, condition=None: {}
+
+    data = {}
+    loss_map, outputs = model._student_update_step(
+        torch.randn_like(gen_latent),
+        torch.tensor([0.5]), torch.tensor([0.5]),
+        torch.randn_like(gen_latent), data,
+        condition={}, neg_condition={},
+    )
+
+    assert "total_loss" in loss_map
+    assert "reward_sync_c_mean" not in loss_map
