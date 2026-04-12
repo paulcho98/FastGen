@@ -299,10 +299,14 @@ class OmniAvatarSelfForcingReDMD(OmniAvatarSelfForcingModel):
                 "Re-DMD needs VAE for reward decode. Set config.vae_path in the "
                 "rewarded config so _load_vae instantiates the VAEWrapper."
             )
-        decoded_list = self.net.vae.decode(
+        decoded = self.net.vae.decode(
             [gen_latent[b].float() for b in range(gen_latent.shape[0])]
         )
-        return torch.stack(decoded_list, dim=0)
+        # WanVideoVAE.decode returns a stacked Tensor [B, C, T, H, W],
+        # not a list, so guard against both cases.
+        if isinstance(decoded, torch.Tensor):
+            return decoded
+        return torch.stack(decoded, dim=0)
 
     def _pixels_to_uint8_face_crop(self, pixels: torch.Tensor) -> list:
         """``[B, 3, T_pix, H_pix, W_pix]`` float in ``[-1, 1]`` -> list of B tensors

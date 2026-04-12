@@ -25,9 +25,29 @@ from fastgen.configs.callbacks import (
 
 
 @attrs.define(slots=False)
+class RewardConfig:
+    """Config for the Re-DMD reward scorer (SyncNet-v2 sync-C)."""
+    enabled: bool = True
+    checkpoint_path: str = ""
+    input_fps: float = 25.0
+    audio_sample_rate: int = 16000
+    vshift: int = 15
+
+
+@attrs.define(slots=False)
 class OmniAvatarModelConfig(SFModelConfig):
     # Separate fake_score config (allows 1.3B fake_score with 14B teacher)
     fake_score: Optional[DictConfig] = None
+
+    # Re-DMD reward config. None = reward disabled (vanilla SF).
+    reward: Optional[RewardConfig] = None
+    reward_beta: float = 0.25
+    center_reward: bool = False
+    clamp_reward: Optional[list] = None
+
+    # Diagnostic video dump at every generator step (rank 0 only).
+    save_reward_debug_video: bool = False
+    reward_debug_dir: str = "logs/redmd_debug"
 
 
 @attrs.define(slots=False)

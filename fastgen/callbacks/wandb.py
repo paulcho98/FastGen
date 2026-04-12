@@ -267,7 +267,8 @@ class _LossDictRecord:
     def add(self, loss_dict: Optional[Dict[str, torch.Tensor]]) -> None:
         if loss_dict is not None:
             for loss_name, loss_val in loss_dict.items():
-                self.loss_dict[loss_name] = self.loss_dict.get(loss_name, 0.0) + loss_val.float().item()
+                scalar = loss_val.float().item() if torch.is_tensor(loss_val) else float(loss_val)
+                self.loss_dict[loss_name] = self.loss_dict.get(loss_name, 0.0) + scalar
                 self.iter_count_dict[loss_name] = self.iter_count_dict.get(loss_name, 0) + 1
 
     def reset(self) -> None:

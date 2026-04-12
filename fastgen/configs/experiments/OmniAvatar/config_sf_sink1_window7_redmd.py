@@ -16,9 +16,8 @@ Design reference:
   /home/work/.local/hyunbin/Reward-Forcing/docs/sync_c_scorer_design.md
 """
 
-import types
-
 import fastgen.configs.experiments.OmniAvatar.config_sf_sink1_window7_tscfg as _tscfg_base
+from fastgen.configs.methods.config_omniavatar_sf import RewardConfig
 from fastgen.methods.omniavatar_self_forcing_re_dmd import OmniAvatarSelfForcingReDMD
 
 
@@ -35,16 +34,16 @@ def create_config():
     # ------------------------------------------------------------------ #
     # Reward sub-config                                                   #
     # ------------------------------------------------------------------ #
-    # model is an attrs class (slots=False), so arbitrary attributes are ok.
-    # reward is a plain namespace; build_model reads it via getattr().
-    reward_cfg = types.SimpleNamespace(
+    # Use RewardConfig (attrs class) so the value survives OmegaConf
+    # serialization when train.py does config.model_class.config = config.model.
+    # SimpleNamespace is NOT OmegaConf-compatible and gets stripped.
+    config.model.reward = RewardConfig(
         enabled=True,
         checkpoint_path="/home/work/.local/eval_metrics/checkpoints/auxiliary/syncnet_v2.model",
         input_fps=25.0,
         audio_sample_rate=16000,
         vshift=15,
     )
-    config.model.reward = reward_cfg
 
     # Top-level reward knobs (read by _apply_reward_weighting)
     # sync-C values are roughly in [0, 10]; beta=0.25 keeps exp(beta*r) in [1, ~12].
