@@ -70,3 +70,17 @@ On Claude Code instance:
 - `config_df_test.py` / `config_kd_test.py`: 20-iter smoke tests with stdout loss logging
 - Run: `CUDA_VISIBLE_DEVICES=0 python train.py --config fastgen/configs/experiments/OmniAvatar/config_df_test.py`
 - Uses `StdoutLoggerCallback` (no wandb needed)
+
+## Config / Instantiation Gotchas
+- `config.model_class._target_` (not `config.model._target_`) is the dispatch target; `config.model` is the attrs instance passed as `config=` kwarg.
+- `config.log_config.{name,wandb_mode}`; `WANDB_MODE` env var is **ignored** — override via config.
+- `config.model` is `attrs.define(slots=False)` but OmegaConf strips dynamic attrs on serialize. Declare typed `@attrs.define` classes for sub-configs (see `RewardConfig` in `config_omniavatar_sf.py`).
+- `Model.__init__` calls `self.build_model()` during super chain — don't reassign attrs after `super().__init__()` or you'll clobber build_model state.
+- `WanVideoVAE.decode` returns a stacked Tensor `[B,C,T,H,W]`, not a list.
+- `data` dict flows intact from `single_train_step` → `_student_update_step` (`omniavatar_self_forcing.py:85`); dataset custom keys survive.
+- Logger: `import fastgen.utils.logging_utils as logger` uses loguru + `@rank0_if_not_debug` — only rank 0 emits INFO. For all-rank debug: `print(..., file=sys.stderr, flush=True)`.
+- Port 29500 needs ~30s TIME_WAIT cooldown between back-to-back torchrun launches.
+- From a git worktree, `sys.path[0]=''` (CWD) wins over the editable install's MetaPathFinder — so imports resolve to the worktree correctly. Verify: `python -c "import fastgen; print(fastgen.__file__)"`.
+
+## Re-DMD sync-C reward (branch `feat/redmd-sync-c`)
+Full guide: `docs/redmd_sync_c.md`. Launch: `scripts/train_sf_sink1_window7_redmd.sh` (β=0.25 default). Smoke (4-GPU, 10 iters, MP4 dump): `scripts/smoke_test_redmd.sh`.
