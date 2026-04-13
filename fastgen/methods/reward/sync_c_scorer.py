@@ -57,19 +57,13 @@ class SyncCScorer(nn.Module):
         self.target_sample_rate = 16000
         self.face_crop_size = face_crop_size
         self.vshift = vshift
+        self.mfcc_n = mfcc_n
 
-        # torchaudio MFCC: 13 coeffs, 25 ms win / 10 ms hop at 16 kHz
-        self.mfcc = torchaudio.transforms.MFCC(
-            sample_rate=self.target_sample_rate,
-            n_mfcc=mfcc_n,
-            melkwargs={
-                "n_fft": 512,
-                "win_length": int(0.025 * self.target_sample_rate),
-                "hop_length": int(mfcc_hop_ms / 1000 * self.target_sample_rate),
-                "n_mels": 40,
-                "center": False,
-            },
-        ).to(device=device, dtype=dtype)
+        # MFCC is computed via python_speech_features in _prep_audio to match
+        # joonson's eval pipeline exactly (nfilt=26, preemph=0.97, ceplifter=22,
+        # appendEnergy=True, rectangular window). torchaudio's defaults differ
+        # in 5 of those params and meaningfully shift the cepstral distribution
+        # away from what the audio encoder's BN running stats expect.
 
     def _device(self):
         return next(self.net.parameters()).device
@@ -78,24 +72,52 @@ class SyncCScorer(nn.Module):
         return next(self.net.parameters()).dtype
 
     def _prep_video(self, video: torch.Tensor) -> torch.Tensor:
-        """[F, 3, H, W] uint8 -> [1, 3, F, 224, 224] float in [0, 1]."""
-        video = video.to(self._device()).float() / 255.0
+        """[F, 3, H, W] uint8 (RGB) -> [1, 3, F, 224, 224] float in [0, 255] (BGR).
+
+        Matches joonson eval pipeline (`syncnet_eval.py:79-91` + `syncnet_detect.py`):
+        cv2.imread returns BGR and the eval code never divides by 255. The model's
+        first Conv3d + BatchNorm3d carry running stats keyed to that distribution.
+        Two corrections vs naive feed:
+          1. No /255 — keep float in [0, 255] so BN running stats apply correctly.
+             Otherwise post-BN activations collapse and sync-C drops ~10-100x.
+          2. RGB -> BGR — match cv2.imread channel order so first-conv R/B filters
+             see the data they were trained on (lip color is a strong sync cue).
+        """
+        video = video.to(self._device()).float()
         video = F.interpolate(
             video, size=(self.face_crop_size, self.face_crop_size),
             mode="bilinear", align_corners=False,
         )
+        video = video[:, [2, 1, 0], :, :]  # RGB -> BGR
         return video.permute(1, 0, 2, 3).unsqueeze(0)
 
     def _prep_audio(self, audio: torch.Tensor) -> torch.Tensor:
-        """[L] float waveform -> [1, 1, 13, M] MFCC."""
+        """[L] float waveform in [-1, 1] -> [1, 1, 13, M] MFCC matching joonson eval.
+
+        Uses python_speech_features.mfcc with library defaults (matching
+        syncnet_eval.py:97-99): nfilt=26, preemph=0.97, ceplifter=22,
+        appendEnergy=True (C0 = log frame energy), rectangular window.
+
+        Waveform is scaled by 32768 before MFCC: joonson's pipeline reads
+        wavfile.read() output (int16 magnitudes), and appendEnergy makes C0
+        magnitude-dependent. Without this scaling, C0 is ~21 nats lower than
+        what the audio encoder's BatchNorm running stats expect.
+        """
+        from python_speech_features import mfcc as _psf_mfcc
+
         assert audio.dim() == 1, f"expected 1-D waveform, got shape {tuple(audio.shape)}"
         audio = audio.to(self._device()).float()
         if self.audio_sample_rate != self.target_sample_rate:
             audio = torchaudio.functional.resample(
                 audio, self.audio_sample_rate, self.target_sample_rate,
             )
-        mfcc = self.mfcc(audio.unsqueeze(0))  # [1, 13, M]
-        return mfcc.unsqueeze(1)              # [1, 1, 13, M]
+        # python_speech_features is numpy-only — CPU round-trip ~10ms,
+        # negligible vs ~5s training step.
+        audio_np = (audio.detach().cpu().numpy() * 32768.0).astype("float32")
+        mfcc_np = _psf_mfcc(audio_np, samplerate=self.target_sample_rate, numcep=self.mfcc_n)  # [T, 13]
+        mfcc = torch.from_numpy(mfcc_np).to(device=self._device(), dtype=self._dtype())
+        mfcc = mfcc.t().contiguous().unsqueeze(0)  # [1, 13, T]
+        return mfcc.unsqueeze(1)                    # [1, 1, 13, T]
 
     def _lip_windows(self, video: torch.Tensor) -> torch.Tensor:
         """[1, 3, F, 224, 224] -> [F-4, 3, 5, 224, 224] — 5-frame stride-1 lip windows."""

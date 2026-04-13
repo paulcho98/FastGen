@@ -12,7 +12,7 @@ export FASTGEN_OUTPUT_ROOT="/tmp/FASTGEN_SF_OUTPUT"
 export SKIP_GT_VAL_UPLOAD=1
 export SKIP_EARLY_SAMPLE_LOG=1
 
-RUN_NAME="sf_sink1_window7_redmd_syncc_beta0p25"
+RUN_NAME="sf_sink1_window7_redmd_syncc_beta0p25_joonson_parity"
 
 /home/work/.local/miniconda3/envs/hb_fastgen/bin/torchrun \
     --nproc_per_node=4 \

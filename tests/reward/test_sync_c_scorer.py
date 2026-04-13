@@ -19,17 +19,7 @@ def scorer():
     s.face_crop_size = 224
     s.audio_sample_rate = 16000
     s.target_sample_rate = 16000
-    s.mfcc = torchaudio.transforms.MFCC(
-        sample_rate=16000,
-        n_mfcc=13,
-        melkwargs={
-            "n_fft": 512,
-            "win_length": 400,
-            "hop_length": 160,
-            "n_mels": 40,
-            "center": False,
-        },
-    )
+    s.mfcc_n = 13
     s.vshift = 15
     return s
 
@@ -39,7 +29,8 @@ def test_prep_video_shape_dtype(scorer):
     out = scorer._prep_video(video)
     assert out.shape == (1, 3, 10, 224, 224)
     assert out.dtype == torch.float32
-    assert out.min() >= 0.0 and out.max() <= 1.0
+    # Updated for joonson-parity: float in [0, 255], not [0, 1]
+    assert out.min() >= 0.0 and out.max() <= 255.0
 
 
 def test_prep_audio_shape_16k(scorer):
