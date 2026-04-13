@@ -9,7 +9,64 @@ L_gen = exp(β · sync_c_detached) · vsd_loss_unweighted
 
 Branch: `feat/redmd-sync-c`. All changes vs. `main` are confined to `fastgen/methods/reward/`, `fastgen/methods/omniavatar_self_forcing_re_dmd.py`, and the rewarded config + launch script — the vanilla SF path is untouched.
 
-Design reference (external): `/home/work/.local/hyunbin/Reward-Forcing/docs/sync_c_scorer_design.md`.
+Optional deeper background — historical design memo from before the port (Reward-Forcing repo): `/home/work/.local/hyunbin/Reward-Forcing/docs/sync_c_scorer_design.md`. Most of its content is now inlined below; the memo also has the original SyncCScorer class sketch and full β calibration walk-through.
+
+---
+
+## Why this scorer (decision rationale)
+
+Three reward-model options were evaluated before settling on the original SyncNet-v2.
+
+### Option 1 — Original eval SyncNet-v2 (chosen ✓)
+
+- **Source:** `joonson/syncnet_python` (Chung-Zisserman lineage), checkpoint distributed via `ByteDance/LatentSync-1.5` at `checkpoints/auxiliary/syncnet_v2.model` (~54 MB, ~20 M params).
+- **Native input:** 224×224 face crop, 5-frame video windows, MFCC-13 @ 16 kHz.
+- **Output:** two 1024-d embeddings (`forward_lip`, `forward_aud`) → offset-margin confidence `sync_c = median(offset_dists) − min(offset_dists)`. Higher = more confident sync.
+- **Differentiable?** No — discrete `argmin` over offset shifts breaks gradients. Not a problem since we use it as a detached scalar reward.
+- **Used as:** scalar in `weight = exp(β · sync_c)`, multiplied onto VSD loss.
+
+### Option 2 — LatentSync's StableSyncNet as differentiable aux loss (rejected)
+
+- **Source:** ByteDance/LatentSync-1.6 (Apache 2.0), `latentsync/models/stable_syncnet.py` (~120 M params).
+- **Used in LatentSync as:** `sync_loss = sync_loss_weight × BCE(cosine_similarity(vision_emb, audio_emb), ones)`. Gradients flow back through frozen StableSyncNet AND through the (frozen-but-grad-enabled) VAE all the way to the UNet.
+- **Why rejected:**
+  - Adds a third loss term (`L = L_dmd + L_aux`), departing from Re-DMD's pure `loss = exp(β·r) · L_dmd` paradigm. We chose to stay faithful to the mechanism we'd already studied empirically in Reward-Forcing.
+  - Requires removing `torch.no_grad()` from VAE decode in the reward path — significant memory cost on top of the already-tight ~109 GB/GPU budget for 14B teacher + 1.3B student + critic + VAE + reward model.
+  - Training-vs-eval metric divergence: LatentSync's BCE-on-cosine-sim loss is not the same quantity as the SyncNet-v2 confidence everyone reports for evaluation.
+
+### Option 3 — StableSyncNet as detached scalar reward (rejected)
+
+- **Same model as Option 2**, but with gradients cut and cosine similarity used as the scalar reward.
+- **Why rejected:**
+  - StableSyncNet has **no built-in confidence/margin score** — `forward()` returns L2-normalized embeddings only. Tellingly, LatentSync's own evaluation script (`eval/eval_sync_conf.py`) imports `SyncNetEval` from `eval/syncnet.py` (a vendored copy of the original SyncNet-v2!) when it wants a sync confidence number.
+  - Cosine similarity is bounded `[-1, 1]`, compressing dynamic range. Compared to MQ (z-scored, typical [-3, +6]) or sync-C (~[0, 10+]), cosine sim makes β calibration brittle — small β changes flip the weight scale dramatically near the bounds.
+  - Larger model (~120 M vs ~20 M) for a less-aligned signal.
+
+### Side-by-side
+
+| Criterion | Option 1 (Eval SyncNet-v2) | Option 2 (StableSyncNet aux loss) | Option 3 (StableSyncNet scalar) |
+|---|---|---|---|
+| Stays within Re-DMD `exp(β·r)·L` paradigm | ✓ | ✗ (third loss term) | ✓ |
+| Built-in confidence score | ✓ (offset margin) | n/a | ✗ (cosine sim only) |
+| Value range comparable to MQ | ✓ (~0–10) | n/a | ✗ ([-1, 1] compressed) |
+| Same model as eval reports | ✓ | ✗ | ✗ |
+| Compute cost per call | ~10–50 ms after prep strip | ~30–50 ms fwd + VAE backward | ~30–50 ms |
+| Memory cost | trivial | requires VAE-grad path | trivial |
+| Differentiable | n/a (don't need) | required | n/a |
+| Model size | ~20 M | ~120 M | ~120 M |
+
+### What about the eval SyncNet-v2's preprocessing overhead?
+
+Off-the-shelf, `eval_sync.py` is disk-heavy: ffmpeg-extract frames → S3FD face detect → scene detect → MFCC via `python_speech_features`. That's ~5–20 s per sample, prohibitive for in-training use.
+
+But once we accept **face-aligned input** (which the OmniAvatar dataset already provides via its preprocessing pipeline), the entire preprocessing chain collapses to: `bilinear-resize to 224 + torchaudio MFCC on GPU + sliding-window unfold`. That's ~30 ms per sample on H200 — **faster** than StableSyncNet's forward, despite the smaller model.
+
+This is what `SyncCScorer` does (see `fastgen/methods/reward/sync_c_scorer.py`). No detector, no ffmpeg, no scipy — pure tensor ops.
+
+### Switching options later (if you want to ablate)
+
+- **To Option 3** (StableSyncNet cosine-sim reward): swap `SyncCScorer` for a StableSyncNet wrapper that returns `cosine_similarity(vision_emb, audio_emb)` as the scalar; everything downstream stays the same.
+- **To Option 2** (StableSyncNet aux loss): different surgery — needs a new loss term in `_student_update_step` instead of the multiplier, plus removing `torch.no_grad()` around the VAE decode. Not a small change.
 
 ---
 
