@@ -363,7 +363,10 @@ class WanModel(torch.nn.Module):
             audio_emb = torch.cat([audio_emb[:, :, :1].repeat(1, 1, 3, 1, 1), audio_emb], 2)  # 1, 768, 44, 1, 1
             audio_emb = self.audio_proj(audio_emb)
 
-            audio_emb = torch.concat([audio_cond_proj(audio_emb) for audio_cond_proj in self.audio_cond_projs], 0)
+            # Stack per-layer projections along dim=1 so audio_emb[b, n] indexes
+            # projection n for batch b. A prior port used torch.concat(..., 0)
+            # + reshape, which silently shuffles (batch, projection) for B>=2.
+            audio_emb = torch.stack([audio_cond_proj(audio_emb) for audio_cond_proj in self.audio_cond_projs], dim=1)
 
         x = torch.cat([x, y], dim=1)
         x = self.patch_embedding(x)
@@ -379,9 +382,6 @@ class WanModel(torch.nn.Module):
             def custom_forward(*inputs):
                 return module(*inputs)
             return custom_forward
-
-        if audio_emb is not None and self.use_audio:
-            audio_emb = audio_emb.reshape(x.shape[0], audio_emb.shape[0] // x.shape[0], -1, *audio_emb.shape[2:])
 
         features = []
         for layer_i, block in enumerate(self.blocks):

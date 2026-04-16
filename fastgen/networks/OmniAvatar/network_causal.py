@@ -1232,20 +1232,13 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         # Step 3: Apply AudioPack  [B, T', 1, 1, hidden_size]
         audio_emb = self.audio_proj(audio_emb)
 
-        # Step 4: Apply per-layer linear projections and stack
+        # Stack per-layer projections along dim=1 so audio_emb[b, n] indexes
+        # projection n for batch b. A prior port used torch.cat(dim=0) + reshape,
+        # which silently shuffles (batch, projection) for B>=2.
         # Each proj: [B, T', 1, 1, hidden_size] -> [B, T', 1, 1, dim]
-        # Concat along batch -> [B * num_projs, T', 1, 1, dim]
-        audio_emb = torch.cat(
-            [proj(audio_emb) for proj in self.audio_cond_projs], dim=0
-        )
-
-        # Step 5: Reshape for per-layer injection
-        # [B * num_projs, T', 1, 1, dim] -> [B, num_projs, T', 1, 1, dim]
-        audio_emb = audio_emb.reshape(
-            x_shape[0],
-            audio_emb.shape[0] // x_shape[0],
-            -1,
-            *audio_emb.shape[2:],
+        # Stacked:    [B, num_projs, T', 1, 1, dim]
+        audio_emb = torch.stack(
+            [proj(audio_emb) for proj in self.audio_cond_projs], dim=1
         )
 
         return audio_emb
