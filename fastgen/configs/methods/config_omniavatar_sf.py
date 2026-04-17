@@ -32,6 +32,12 @@ class RewardConfig:
     input_fps: float = 25.0
     audio_sample_rate: int = 16000
     vshift: int = 15
+    # Opt-in TAEW decoder. Default "vae" preserves WanVideoVAE.decode behavior.
+    # When "taew", the Re-DMD model loads a TAEHVDecoderWrapper from
+    # taew_checkpoint_path and uses it in place of self.net.vae for the
+    # reward-path pixel decode.
+    decoder_kind: str = "vae"
+    taew_checkpoint_path: str = ""
 
 
 @attrs.define(slots=False)
