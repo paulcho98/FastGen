@@ -85,6 +85,40 @@ class OmniAvatarSelfForcingReDMD(OmniAvatarSelfForcingModel):
             f"vshift={getattr(rcfg, 'vshift', 15)}, ckpt={rcfg.checkpoint_path}"
         )
 
+        # Opt-in TAEW decoder for the reward path.
+        self._maybe_init_taew_decoder()
+
+    def _maybe_init_taew_decoder(self):
+        """Build self._taew_decoder if config.reward.decoder_kind == 'taew'.
+
+        Otherwise leave it as None so _decode_gen_to_pixels falls back to
+        self.net.vae.decode() — default behavior, bitwise-identical to
+        what the VAE baseline runs.
+        """
+        rcfg = getattr(self.config, "reward", None)
+        kind = getattr(rcfg, "decoder_kind", "vae") if rcfg is not None else "vae"
+        if kind == "vae":
+            self._taew_decoder = None
+            return
+        if kind == "taew":
+            ckpt = getattr(rcfg, "taew_checkpoint_path", "")
+            if not ckpt:
+                raise ValueError(
+                    "config.reward.decoder_kind='taew' requires "
+                    "config.reward.taew_checkpoint_path to be set."
+                )
+            from fastgen.methods.reward.taehv_decoder import TAEHVDecoderWrapper
+            device_str = (
+                f"cuda:{self.device}" if isinstance(self.device, int) else str(self.device)
+            )
+            self._taew_decoder = TAEHVDecoderWrapper(checkpoint_path=ckpt, device=device_str)
+            logger.info(f"TAEHVDecoderWrapper loaded for reward path: ckpt={ckpt}")
+            return
+        raise ValueError(
+            f"unknown config.reward.decoder_kind={kind!r} "
+            f"(expected 'vae' or 'taew')"
+        )
+
     def _apply_reward_weighting(
         self,
         vsd_loss: torch.Tensor,
@@ -294,10 +328,17 @@ class OmniAvatarSelfForcingReDMD(OmniAvatarSelfForcingModel):
         Raises a clear RuntimeError when ``self.net.vae`` is missing, so the user
         knows to set ``config.vae_path`` in the rewarded config.
         """
+        # TAEW opt-in path — defined when config.reward.decoder_kind == "taew".
+        if getattr(self, "_taew_decoder", None) is not None:
+            return self._taew_decoder.decode(
+                [gen_latent[b].float() for b in range(gen_latent.shape[0])]
+            )
+        # Default: Wan 2.1 full VAE.
         if not hasattr(self.net, "vae") or self.net.vae is None:
             raise RuntimeError(
-                "Re-DMD needs VAE for reward decode. Set config.vae_path in the "
-                "rewarded config so _load_vae instantiates the VAEWrapper."
+                "Re-DMD needs a VAE for reward decode, but self.net.vae is unset. "
+                "Either ensure the base OmniAvatar model loads a VAE, or set "
+                "config.reward.decoder_kind='taew' + taew_checkpoint_path."
             )
         decoded = self.net.vae.decode(
             [gen_latent[b].float() for b in range(gen_latent.shape[0])]
