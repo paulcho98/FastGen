@@ -110,6 +110,10 @@ def parse_args() -> argparse.Namespace:
     # Ablation
     parser.add_argument("--zero_audio", action="store_true", default=False,
                         help="Zero out audio embeddings (for audio ablation analysis)")
+    parser.add_argument("--cfg_drop_text", type=str, default="true",
+                        choices=["true", "false"],
+                        help="If true (default), negative branch uses negative text embedding. "
+                             "If false, negative branch keeps positive text embedding (audio-only CFG).")
 
     # Seed
     parser.add_argument("--seed", type=int, default=42,
@@ -145,6 +149,7 @@ def load_sample(
     mask: torch.Tensor,
     neg_text_embeds: torch.Tensor,
     num_video_frames: int = 81,
+    cfg_drop_text: bool = True,
     device: torch.device = None,
     dtype: torch.dtype = torch.bfloat16,
 ) -> Optional[Dict[str, torch.Tensor]]:
@@ -218,9 +223,13 @@ def load_sample(
             condition["ref_sequence"] = torch.zeros_like(condition["masked_video"])
 
         # Negative condition (for CFG)
-        neg_text = neg_text_embeds.to(device=device, dtype=dtype)
-        if neg_text.dim() == 2:
-            neg_text = neg_text.unsqueeze(0)
+        if cfg_drop_text:
+            neg_text = neg_text_embeds.to(device=device, dtype=dtype)
+            if neg_text.dim() == 2:
+                neg_text = neg_text.unsqueeze(0)
+        else:
+            # audio-only CFG: keep positive text
+            neg_text = condition["text_embeds"]
         neg_condition = {
             "text_embeds": neg_text,                                    # [1, 512, 4096]
             "audio_emb": torch.zeros_like(condition["audio_emb"]),      # [1, 81, 10752]
@@ -405,6 +414,10 @@ def main():
     if global_rank == 0:
         logger.info(f"Loading OmniAvatar teacher: model_size={args.model_size}, in_dim={args.in_dim}")
 
+    if global_rank == 0:
+        cfg_mode = "text+audio (original)" if args.cfg_drop_text == "true" else "audio-only"
+        logger.info(f"CFG drop mode: {cfg_mode}")
+
     teacher = OmniAvatarWan(
         model_size=args.model_size,
         in_dim=args.in_dim,
@@ -519,6 +532,7 @@ def main():
             mask=mask,
             neg_text_embeds=neg_text_embeds,
             num_video_frames=args.num_video_frames,
+            cfg_drop_text=(args.cfg_drop_text == "true"),
             device=device,
             dtype=dtype,
         )
