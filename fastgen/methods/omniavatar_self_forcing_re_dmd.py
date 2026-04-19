@@ -125,24 +125,45 @@ class OmniAvatarSelfForcingReDMD(OmniAvatarSelfForcingModel):
         videos: Any,
         audios: Any,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Per-sample couple `exp(beta * sync_c_i)` with per-sample `vsd_loss_i`.
+        """Self-normalized importance-sampling reward weighting for Re-DMD.
 
-        `vsd_loss` MUST be a [B] tensor (one loss per sample). Internally:
-            weighted_scalar = mean_i( exp(beta * sync_c_i) * vsd_loss_i )
+        `vsd_loss` MUST be a [B] tensor. Internally:
+            w_i            = exp(beta * sync_c_i)             # [B], detached
+            weighted_loss  = sum_i(w_i * vsd_loss_i) / sum_j(w_j)
 
-        This is the algorithmically correct form of Re-DMD's
-        reward-weighted distillation: the per-sample loss is coupled to that
-        sample's own reward BEFORE the batch reduction. The earlier
-        `mean_i(exp(beta*r_i)) * mean_i(L_i)` collapse erased the coupling
-        whenever reward and loss co-varied across the batch — which is the
-        common case (high-reward generations tend to have low VSD loss).
+        Also known as the self-normalized IS estimator. This implements the
+        Z(c) partition-function normalization from the Re-DMD paper (Eq. 11)
+        that the reference Reward-Forcing code dropped — harmlessly at their
+        per-GPU batch=1 (Z reduces to a single weight that cancels), but
+        load-bearing at our batch>1.
 
-        Under per-GPU batch=1 (original Reward-Forcing) the two formulations
-        coincide numerically, so this is effect-free at batch=1 and only
-        starts to matter at batch>=2.
+        Why self-normalize (not just per-sample couple):
+            - Shift invariance in reward: `r_i -> r_i + c` produces
+              `exp(beta*c)` in both numerator and denominator; they cancel,
+              the loss is unchanged. So the weighted loss magnitude does NOT
+              drift with the absolute reward level.
+            - Scale invariance in weights: the loss is a convex combination
+              of per-sample losses with non-negative weights, so
+              `min(L) <= weighted_loss <= max(L)` always. No runaway
+              gradient magnitude from outlier rewards or high-beta regimes.
+            - Additive combinability with auxiliary losses (GAN, R1 reg):
+              without normalization, `mean(w*L)` scales with `E[w] ~ exp(beta*mean_r)`,
+              which can be 3-5 orders of magnitude larger than `gan_loss_gen`
+              at beta=2, clobbering the adversarial signal. Self-normalized
+              keeps the reward-weighted term on a scale commensurate with L.
+
+        Interaction with the centering knob:
+            After this normalization, `center_reward` (subtracting EMA(sync_c)
+            before exp) is a mathematical no-op on the weighted loss — the
+            same shift cancels by the shift-invariance argument above. The
+            knob still affects `reward_weight_*` log entries (since weights
+            are logged pre-normalization), but the gradient signal is
+            unchanged. Clamping still matters because it changes relative
+            weight ratios (the softmax temperature effect is preserved).
 
         Returns:
-            (weighted_loss, log_map). `weighted_loss` is a scalar.
+            (weighted_loss, log_map). `weighted_loss` is a scalar in
+            [min_i(vsd_loss_i), max_i(vsd_loss_i)] (for positive weights).
         """
         with torch.no_grad():
             reward = self.reward_scorer.reward_from_frames(videos, audios)
@@ -173,12 +194,18 @@ class OmniAvatarSelfForcingReDMD(OmniAvatarSelfForcingModel):
         if clamp is not None:
             sync_c = sync_c.clamp(clamp[0], clamp[1])
 
-        weight = torch.exp(beta * sync_c)  # [B]
+        weight = torch.exp(beta * sync_c)  # [B], detached (sync_c is detached)
         # Cast vsd_loss to the same dtype/device as weight so element-wise
         # multiplication doesn't silently upcast/downcast away from the
         # student's compute dtype. vsd_loss shape matches weight.
         vsd_per_sample = vsd_loss.to(dtype=weight.dtype, device=weight.device)
-        weighted = (weight * vsd_per_sample).mean()
+        # Self-normalized IS: Z is the partition function for the reward-tempered
+        # softmax distribution over batch samples. Adding eps guards the B=1
+        # case from any numerical instability (and the underflow case where
+        # all weights are simultaneously near-zero, which shouldn't happen with
+        # finite real `sync_c`).
+        Z = weight.sum().detach() + 1e-8
+        weighted = (weight * vsd_per_sample).sum() / Z
 
         sync_c_mean_r = _reduce(sync_c.mean(), dist.ReduceOp.SUM)
         sync_c_min_r  = _reduce(sync_c.min(),  dist.ReduceOp.MIN)

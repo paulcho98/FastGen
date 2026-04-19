@@ -40,23 +40,31 @@ def _make_model(beta=0.25, center=False, clamp=None, scorer_sync_c=3.0):
     return model
 
 
-def test_weighted_loss_equals_exp_beta_r_times_unweighted():
+def test_weighted_loss_at_batch_size_1_reduces_to_L():
+    """Self-normalized IS: at B=1 the single weight cancels in numerator and
+    denominator, so weighted_loss == vsd_loss exactly. Reward has no effect
+    at B=1 (there's nothing to normalize against). The `reward_weight_mean`
+    log entry still reflects the raw (pre-normalization) `exp(beta*r)` as a
+    diagnostic."""
     model = _make_model(beta=0.25, scorer_sync_c=4.0)
     videos = [torch.randint(0, 256, (81, 3, 224, 224), dtype=torch.uint8)]
     audios = [torch.randn(51840)]
 
-    vsd_loss = torch.tensor([1.5])  # [B=1] per-sample
+    vsd_loss = torch.tensor([1.5])  # [B=1]
     weighted, log_map = model._apply_reward_weighting(vsd_loss, videos, audios)
 
-    expected_weight = math.exp(0.25 * 4.0)
-    assert abs(weighted.item() - expected_weight * 1.5) < 1e-4
+    # At B=1: w*L/w = L
+    assert abs(weighted.item() - 1.5) < 1e-4
     assert abs(log_map["reward_sync_c_mean"] - 4.0) < 1e-6
-    assert abs(log_map["reward_weight_mean"] - expected_weight) < 1e-4
+    # Raw weight still logged for diagnostic purposes
+    assert abs(log_map["reward_weight_mean"] - math.exp(0.25 * 4.0)) < 1e-4
     assert abs(log_map["vsd_loss_unweighted"] - 1.5) < 1e-6
 
 
-def test_weighting_batched():
-    """Multiple samples with uniform sync_c → weighted loss = exp(beta*r)*mean(L)."""
+def test_weighting_batched_uniform_sync_c_collapses_to_mean_L():
+    """Uniform sync_c across a batch → all weights equal → self-normalized
+    weights are uniformly 1/B → weighted_loss = mean(L). Reward has no effect
+    when it's constant across the batch (no discriminative signal)."""
     model = _make_model(beta=0.25, scorer_sync_c=2.0)
     videos = [torch.randint(0, 256, (81, 3, 224, 224), dtype=torch.uint8) for _ in range(4)]
     audios = [torch.randn(51840) for _ in range(4)]
@@ -67,8 +75,8 @@ def test_weighting_batched():
     assert abs(log_map["reward_sync_c_mean"] - 2.0) < 1e-6
     assert log_map["reward_sync_c_min"] == 2.0
     assert log_map["reward_sync_c_max"] == 2.0
-    # Uniform r and uniform L → per-sample coupling collapses to exp(β·r)·L
-    assert abs(weighted.item() - math.exp(0.25 * 2.0) * 1.0) < 1e-4
+    # Uniform r → uniform w → normalized w_i = 1/B → weighted = mean(L) = 1.0
+    assert abs(weighted.item() - 1.0) < 1e-4
 
 
 def test_centering_subtracts_ema_mean():
@@ -275,19 +283,17 @@ class _VaryingScorer:
         return {"sync_c": c, "MQ": c}
 
 
-def test_reward_loss_coupling_is_per_sample():
-    """With non-uniform rewards AND non-uniform per-sample vsd_loss, the
-    weighted loss must equal mean(exp(beta*r_i) * L_i), NOT the broken
-    mean(exp(beta*r_i)) * mean(L_i).
+def test_reward_loss_coupling_is_per_sample_self_normalized():
+    """Non-uniform rewards + non-uniform per-sample vsd_loss.
 
-    This is the algorithmic fix for per-GPU batch > 1: under batch=1 (original
-    Reward-Forcing) the two formulations coincide; under batch > 1 they differ
-    whenever reward and loss co-vary.
+    Self-normalized IS: weighted_loss = sum_i(w_i * L_i) / sum_j(w_j), where
+    w_i = exp(beta * r_i). High-reward samples get proportionally more weight
+    in the batch combination; magnitude is bounded in [min(L), max(L)].
     """
     from fastgen.methods.omniavatar_self_forcing_re_dmd import OmniAvatarSelfForcingReDMD
     model = OmniAvatarSelfForcingReDMD.__new__(OmniAvatarSelfForcingReDMD)
     cfg = type("Cfg", (), {})()
-    cfg.reward_beta = 0.2  # exp(0.2*10)=e^2 ~ 7.39 — large enough to differ visibly
+    cfg.reward_beta = 0.2
     cfg.center_reward = False
     cfg.clamp_reward = None
     model.config = cfg
@@ -299,30 +305,98 @@ def test_reward_loss_coupling_is_per_sample():
 
     # Sample 0: low reward (r=0), high loss (10.0)
     # Sample 1: high reward (r=10), low loss (1.0)
-    # These negatively co-vary, which is exactly the regime where the two
-    # formulations differ most.
     vsd_per_sample = torch.tensor([10.0, 1.0], dtype=torch.float32)
 
     weighted, log_map = model._apply_reward_weighting(vsd_per_sample, videos, audios)
 
     w0 = math.exp(0.2 * 0.0)    # 1.0
     w1 = math.exp(0.2 * 10.0)   # ~7.389
-    expected = (w0 * 10.0 + w1 * 1.0) / 2   # ~8.695
-    broken = (w0 + w1) / 2 * (10.0 + 1.0) / 2  # ~23.07
+    expected = (w0 * 10.0 + w1 * 1.0) / (w0 + w1)   # ~2.073
 
     assert abs(weighted.item() - expected) < 1e-3, (
-        f"per-sample coupling gave {weighted.item()}, expected {expected}; "
-        f"broken batch-mean-collapse would give {broken}"
+        f"self-normalized IS gave {weighted.item()}, expected {expected}"
     )
-    # Logging should still report batch-mean stats sensibly
+    # Must lie in [min(L), max(L)] = [1, 10] — convex combination property
+    assert 1.0 <= weighted.item() <= 10.0
+
+    # Logging entries report batch-mean stats sensibly
     assert abs(log_map["reward_sync_c_mean"] - 5.0) < 1e-6
     assert abs(log_map["vsd_loss_unweighted"] - 5.5) < 1e-6
 
 
-def test_reward_loss_coupling_single_sample_matches_legacy():
-    """Regression guard: B=1 case must give identical numeric result under
-    either formulation (they coincide at B=1). This is what made the bug
-    invisible in the original Reward-Forcing repo (batch_size=1)."""
+def test_reward_weighting_shift_invariance():
+    """Self-normalized IS is invariant under reward shifts:
+        exp(beta * (r_i + c)) / Z_shifted = exp(beta*c) * w_i / (exp(beta*c) * Z) = w_i / Z
+    So adding a constant to all sync_c values must NOT change the weighted loss.
+    This is the property that makes additive combination with GAN losses work:
+    weighted VSD magnitude doesn't drift with the absolute reward level.
+    """
+    from fastgen.methods.omniavatar_self_forcing_re_dmd import OmniAvatarSelfForcingReDMD
+
+    def compute_weighted(sync_c_vec, vsd_vec, beta):
+        model = OmniAvatarSelfForcingReDMD.__new__(OmniAvatarSelfForcingReDMD)
+        cfg = type("Cfg", (), {})()
+        cfg.reward_beta = beta
+        cfg.center_reward = False
+        cfg.clamp_reward = None
+        model.config = cfg
+        model.reward_scorer = _VaryingScorer(sync_c_vec)
+        model._reward_running_mean = None
+        n = len(sync_c_vec)
+        videos = [torch.randint(0, 256, (81, 3, 64, 64), dtype=torch.uint8) for _ in range(n)]
+        audios = [torch.randn(51840) for _ in range(n)]
+        vsd = torch.as_tensor(vsd_vec, dtype=torch.float32)
+        w, _ = model._apply_reward_weighting(vsd, videos, audios)
+        return w.item()
+
+    vsd_vec = [1.0, 5.0, 3.0, 0.5]
+    base = [0.0, 2.0, 4.0, 6.0]
+    shifted = [100.0, 102.0, 104.0, 106.0]  # +100, a large shift
+
+    result_base = compute_weighted(base, vsd_vec, beta=0.5)
+    result_shifted = compute_weighted(shifted, vsd_vec, beta=0.5)
+
+    assert abs(result_base - result_shifted) < 1e-3, (
+        f"shift invariance broken: base={result_base}, shifted={result_shifted}"
+    )
+
+
+def test_reward_weighting_bounded_by_loss_range():
+    """Self-normalized IS is a convex combination of per-sample losses with
+    non-negative weights → weighted_loss must lie in [min(L), max(L)]. This
+    is what makes the loss magnitude stable at high beta or with outlier
+    rewards — the GAN-clobbering scenario from the pre-fix code."""
+    from fastgen.methods.omniavatar_self_forcing_re_dmd import OmniAvatarSelfForcingReDMD
+    model = OmniAvatarSelfForcingReDMD.__new__(OmniAvatarSelfForcingReDMD)
+    cfg = type("Cfg", (), {})()
+    cfg.reward_beta = 2.0   # high beta: unnormalized mean(w*L) would be O(exp(20))
+    cfg.center_reward = False
+    cfg.clamp_reward = None
+    model.config = cfg
+    model.reward_scorer = _VaryingScorer([0.0, 5.0, 10.0, 15.0])
+    model._reward_running_mean = None
+
+    videos = [torch.randint(0, 256, (81, 3, 64, 64), dtype=torch.uint8) for _ in range(4)]
+    audios = [torch.randn(51840) for _ in range(4)]
+    vsd = torch.tensor([2.0, 3.0, 1.5, 4.0], dtype=torch.float32)
+
+    weighted, _ = model._apply_reward_weighting(vsd, videos, audios)
+
+    # Bounded in the convex hull of per-sample losses
+    L_min, L_max = 1.5, 4.0
+    assert L_min <= weighted.item() <= L_max, (
+        f"weighted={weighted.item()} outside [{L_min}, {L_max}]; "
+        f"self-normalized IS must be a convex combination"
+    )
+
+
+def test_reward_weighting_batch_size_1_matches_unweighted():
+    """At B=1, self-normalized IS gives back the unweighted per-sample loss.
+    Note this DIFFERS from the original Reward-Forcing behavior (which gave
+    `exp(beta*r) * L`), because the paper's Z(c) normalization was dropped
+    there. At batch_size=1 Z(c) trivially equals the single sample's weight,
+    so the reward signal vanishes — this is the correct interpretation: at
+    B=1 there's no relative ranking to do."""
     from fastgen.methods.omniavatar_self_forcing_re_dmd import OmniAvatarSelfForcingReDMD
     model = OmniAvatarSelfForcingReDMD.__new__(OmniAvatarSelfForcingReDMD)
     cfg = type("Cfg", (), {})()
@@ -338,4 +412,4 @@ def test_reward_loss_coupling_single_sample_matches_legacy():
     vsd = torch.tensor([1.5], dtype=torch.float32)
 
     weighted, _ = model._apply_reward_weighting(vsd, videos, audios)
-    assert abs(weighted.item() - math.exp(0.25 * 4.0) * 1.5) < 1e-4
+    assert abs(weighted.item() - 1.5) < 1e-4
