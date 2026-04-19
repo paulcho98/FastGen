@@ -51,6 +51,19 @@ class OmniAvatarModelConfig(SFModelConfig):
     center_reward: bool = False
     clamp_reward: Optional[list] = None
 
+    # How to combine per-sample reward weights with per-sample VSD losses.
+    #   - "per_sample" (default): mean_i(exp(beta*r_i) * L_i). Per-sample
+    #       coupling without normalization. Preserves reward magnitude as
+    #       loss-scale signal. Matches the fc56e4a commit's behavior.
+    #   - "self_normalized": sum_i(exp(beta*r_i) * L_i) / sum_j(exp(beta*r_j)).
+    #       Self-normalized importance sampling (paper's Z(c) partition).
+    #       Shift-invariant; loss bounded in [min(L), max(L)]. Better for
+    #       additive combination with GAN/other aux losses.
+    #   - "legacy_batch_mean": mean_i(exp(beta*r_i)) * mean_i(L_i). Original
+    #       Reward-Forcing batch-mean collapse. Decouples reward from loss at
+    #       batch > 1 — provided for direct comparison only; not recommended.
+    reward_weighting_mode: str = "per_sample"
+
     # Diagnostic video dump at every generator step (rank 0 only).
     save_reward_debug_video: bool = False
     reward_debug_dir: str = "logs/redmd_debug"
