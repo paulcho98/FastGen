@@ -340,6 +340,7 @@ class OmniAvatarWan(FastGenNetwork):
         mask_all_frames: bool = True,
         disable_grad_ckpt: bool = False,
         dtype: str = "bf16",
+        expand_audio_checkpoint_scope: bool = False,
         **kwargs,
     ):
         """
@@ -409,6 +410,13 @@ class OmniAvatarWan(FastGenNetwork):
 
         # Gradient checkpointing: enabled by default (like T2V's Wan network)
         self._use_gradient_checkpointing = not disable_grad_ckpt
+        # Opt-in memory optimization: move the audio-conditioning add INSIDE
+        # the checkpoint boundary so its pre-add x is recomputed rather than
+        # retained. Guaranteed-equivalent to the default path (see
+        # tests/test_wan_audio_checkpoint_scope.py). Off by default — turn on
+        # for memory-constrained regimes (GAN on 14B teacher, V2V with 64x64+
+        # latents).
+        self._expand_audio_checkpoint_scope = expand_audio_checkpoint_scope
 
         # Load weights (unless we are in meta device context for FSDP)
         if not self._is_in_meta_context():
@@ -715,6 +723,7 @@ class OmniAvatarWan(FastGenNetwork):
             audio_emb=audio_emb,
             feature_indices=feature_indices if has_features else None,
             return_features_early=return_features_early,
+            expand_audio_checkpoint_scope=self._expand_audio_checkpoint_scope,
         )
 
         # Early exit: model returned just the unpatchified features

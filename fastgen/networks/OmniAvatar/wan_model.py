@@ -350,8 +350,21 @@ class WanModel(torch.nn.Module):
                 audio_emb: Optional[torch.Tensor] = None,
                 feature_indices: Optional[set] = None,
                 return_features_early: bool = False,
+                expand_audio_checkpoint_scope: bool = False,
                 **kwargs,
                 ):
+        """
+        Args:
+            expand_audio_checkpoint_scope: When True (and both training=True and
+                use_gradient_checkpointing=True), the audio-conditioning add
+                (audio_cond_tmp + x) is moved INSIDE the torch.utils.checkpoint
+                boundary along with the block forward. This reduces activation
+                retention — the pre-add x and audio_cond_tmp no longer need to
+                persist in the autograd graph across backward. Mathematically
+                equivalent to the default path (same ops in same order); only
+                activation-saving strategy changes. Guarded by equivalence tests
+                in tests/test_wan_audio_checkpoint_scope.py.
+        """
         t = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, timestep).to(dtype=x.dtype))
         t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
@@ -385,22 +398,44 @@ class WanModel(torch.nn.Module):
 
         features = []
         for layer_i, block in enumerate(self.blocks):
-            # audio cond
-            if self.use_audio:
-                if (layer_i <= len(self.blocks) // 2 and layer_i > 1):
-                    au_idx = layer_i - 2
-                    audio_emb_tmp = audio_emb[:, au_idx].repeat(1, 1, lat_h // 2, lat_w // 2, 1)  # 1, 11, 45, 25, 128
-                    audio_cond_tmp = self.patchify(audio_emb_tmp.permute(0, 4, 1, 2, 3))[0]
-                    x = audio_cond_tmp + x
+            # Compute the audio-conditioning delta for this layer, or None if
+            # this layer doesn't receive audio injection. Extracted up-front so
+            # both the default and expanded-scope paths below are symmetric.
+            audio_cond_tmp = None
+            if self.use_audio and (layer_i <= len(self.blocks) // 2 and layer_i > 1):
+                au_idx = layer_i - 2
+                audio_emb_tmp = audio_emb[:, au_idx].repeat(1, 1, lat_h // 2, lat_w // 2, 1)  # 1, 11, 45, 25, 128
+                audio_cond_tmp = self.patchify(audio_emb_tmp.permute(0, 4, 1, 2, 3))[0]
 
-            if self.training and use_gradient_checkpointing:
+            if (self.training and use_gradient_checkpointing and expand_audio_checkpoint_scope):
+                # Expanded scope: audio add runs INSIDE the checkpoint, so its
+                # activations are recomputed during backward rather than
+                # retained. Mathematically identical to the default branch
+                # below (same ops, same order) — activation strategy only.
+                def _apply_audio_and_block(_block, _audio_cond, _x, _ctx, _tm, _freqs):
+                    if _audio_cond is not None:
+                        _x = _audio_cond + _x
+                    return _block(_x, _ctx, _tm, _freqs)
                 x = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    x, context, t_mod, freqs,
+                    _apply_audio_and_block,
+                    block, audio_cond_tmp, x, context, t_mod, freqs,
                     use_reentrant=False,
                 )
             else:
-                x = block(x, context, t_mod, freqs)
+                # Default scope: audio add runs in the main autograd graph; its
+                # intermediate tensors (pre-add x, audio_cond_tmp, post-add x)
+                # are retained across backward.
+                if audio_cond_tmp is not None:
+                    x = audio_cond_tmp + x
+
+                if self.training and use_gradient_checkpointing:
+                    x = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(block),
+                        x, context, t_mod, freqs,
+                        use_reentrant=False,
+                    )
+                else:
+                    x = block(x, context, t_mod, freqs)
 
             # Feature extraction at requested block indices
             if feature_indices and layer_i in feature_indices:
