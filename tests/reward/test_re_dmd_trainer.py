@@ -45,7 +45,7 @@ def test_weighted_loss_equals_exp_beta_r_times_unweighted():
     videos = [torch.randint(0, 256, (81, 3, 224, 224), dtype=torch.uint8)]
     audios = [torch.randn(51840)]
 
-    vsd_loss = torch.tensor(1.5)
+    vsd_loss = torch.tensor([1.5])  # [B=1] per-sample
     weighted, log_map = model._apply_reward_weighting(vsd_loss, videos, audios)
 
     expected_weight = math.exp(0.25 * 4.0)
@@ -56,24 +56,26 @@ def test_weighted_loss_equals_exp_beta_r_times_unweighted():
 
 
 def test_weighting_batched():
-    """Multiple samples → sync_c mean is the batch mean."""
+    """Multiple samples with uniform sync_c → weighted loss = exp(beta*r)*mean(L)."""
     model = _make_model(beta=0.25, scorer_sync_c=2.0)
     videos = [torch.randint(0, 256, (81, 3, 224, 224), dtype=torch.uint8) for _ in range(4)]
     audios = [torch.randn(51840) for _ in range(4)]
-    vsd_loss = torch.tensor(1.0)
+    vsd_loss = torch.ones(4)
 
     weighted, log_map = model._apply_reward_weighting(vsd_loss, videos, audios)
 
     assert abs(log_map["reward_sync_c_mean"] - 2.0) < 1e-6
     assert log_map["reward_sync_c_min"] == 2.0
     assert log_map["reward_sync_c_max"] == 2.0
+    # Uniform r and uniform L → per-sample coupling collapses to exp(β·r)·L
+    assert abs(weighted.item() - math.exp(0.25 * 2.0) * 1.0) < 1e-4
 
 
 def test_centering_subtracts_ema_mean():
     model = _make_model(beta=0.25, center=True, scorer_sync_c=5.0)
     videos = [torch.randint(0, 256, (81, 3, 64, 64), dtype=torch.uint8)]
     audios = [torch.randn(51840)]
-    vsd = torch.tensor(1.0)
+    vsd = torch.tensor([1.0])  # [B=1]
 
     # First call seeds the running mean with 5.0 → centered reward = 0 → weight = exp(0) = 1
     _, log_map = model._apply_reward_weighting(vsd, videos, audios)
@@ -84,7 +86,7 @@ def test_clamping_bounds_weight():
     model = _make_model(beta=1.0, clamp=(0.0, 2.0), scorer_sync_c=10.0)
     videos = [torch.randint(0, 256, (81, 3, 64, 64), dtype=torch.uint8)]
     audios = [torch.randn(51840)]
-    vsd = torch.tensor(1.0)
+    vsd = torch.tensor([1.0])  # [B=1]
 
     _, log_map = model._apply_reward_weighting(vsd, videos, audios)
 
@@ -216,7 +218,7 @@ def test_per_rank_log_keys_in_single_rank_path():
     model = _make_model(beta=0.25, scorer_sync_c=2.0)
     videos = [torch.randint(0, 256, (81, 3, 224, 224), dtype=torch.uint8) for _ in range(3)]
     audios = [torch.randn(51840) for _ in range(3)]
-    vsd = torch.tensor(1.0)
+    vsd = torch.ones(3)  # [B=3]
     _, log_map = model._apply_reward_weighting(vsd, videos, audios)
     # 3 samples -> 3 per-rank keys
     assert "reward_sync_c_r0" in log_map
@@ -260,3 +262,80 @@ def test_maybe_save_debug_video_writes_mp4_when_enabled(tmp_path):
     assert len(mp4s) == 1
     assert mp4s[0].name == "gen_iter000042.mp4"
     assert mp4s[0].stat().st_size > 0
+
+
+class _VaryingScorer:
+    """Returns the configured per-sample sync_c tensor verbatim."""
+    def __init__(self, sync_c_vec):
+        self._vec = torch.as_tensor(sync_c_vec, dtype=torch.float32)
+
+    def reward_from_frames(self, videos, audios, prompts=None, use_norm=True):
+        assert len(videos) == self._vec.shape[0], "batch size must match sync_c vec"
+        c = self._vec.clone()
+        return {"sync_c": c, "MQ": c}
+
+
+def test_reward_loss_coupling_is_per_sample():
+    """With non-uniform rewards AND non-uniform per-sample vsd_loss, the
+    weighted loss must equal mean(exp(beta*r_i) * L_i), NOT the broken
+    mean(exp(beta*r_i)) * mean(L_i).
+
+    This is the algorithmic fix for per-GPU batch > 1: under batch=1 (original
+    Reward-Forcing) the two formulations coincide; under batch > 1 they differ
+    whenever reward and loss co-vary.
+    """
+    from fastgen.methods.omniavatar_self_forcing_re_dmd import OmniAvatarSelfForcingReDMD
+    model = OmniAvatarSelfForcingReDMD.__new__(OmniAvatarSelfForcingReDMD)
+    cfg = type("Cfg", (), {})()
+    cfg.reward_beta = 0.2  # exp(0.2*10)=e^2 ~ 7.39 — large enough to differ visibly
+    cfg.center_reward = False
+    cfg.clamp_reward = None
+    model.config = cfg
+    model.reward_scorer = _VaryingScorer([0.0, 10.0])
+    model._reward_running_mean = None
+
+    videos = [torch.randint(0, 256, (81, 3, 64, 64), dtype=torch.uint8) for _ in range(2)]
+    audios = [torch.randn(51840) for _ in range(2)]
+
+    # Sample 0: low reward (r=0), high loss (10.0)
+    # Sample 1: high reward (r=10), low loss (1.0)
+    # These negatively co-vary, which is exactly the regime where the two
+    # formulations differ most.
+    vsd_per_sample = torch.tensor([10.0, 1.0], dtype=torch.float32)
+
+    weighted, log_map = model._apply_reward_weighting(vsd_per_sample, videos, audios)
+
+    w0 = math.exp(0.2 * 0.0)    # 1.0
+    w1 = math.exp(0.2 * 10.0)   # ~7.389
+    expected = (w0 * 10.0 + w1 * 1.0) / 2   # ~8.695
+    broken = (w0 + w1) / 2 * (10.0 + 1.0) / 2  # ~23.07
+
+    assert abs(weighted.item() - expected) < 1e-3, (
+        f"per-sample coupling gave {weighted.item()}, expected {expected}; "
+        f"broken batch-mean-collapse would give {broken}"
+    )
+    # Logging should still report batch-mean stats sensibly
+    assert abs(log_map["reward_sync_c_mean"] - 5.0) < 1e-6
+    assert abs(log_map["vsd_loss_unweighted"] - 5.5) < 1e-6
+
+
+def test_reward_loss_coupling_single_sample_matches_legacy():
+    """Regression guard: B=1 case must give identical numeric result under
+    either formulation (they coincide at B=1). This is what made the bug
+    invisible in the original Reward-Forcing repo (batch_size=1)."""
+    from fastgen.methods.omniavatar_self_forcing_re_dmd import OmniAvatarSelfForcingReDMD
+    model = OmniAvatarSelfForcingReDMD.__new__(OmniAvatarSelfForcingReDMD)
+    cfg = type("Cfg", (), {})()
+    cfg.reward_beta = 0.25
+    cfg.center_reward = False
+    cfg.clamp_reward = None
+    model.config = cfg
+    model.reward_scorer = _VaryingScorer([4.0])
+    model._reward_running_mean = None
+
+    videos = [torch.randint(0, 256, (81, 3, 64, 64), dtype=torch.uint8)]
+    audios = [torch.randn(51840)]
+    vsd = torch.tensor([1.5], dtype=torch.float32)
+
+    weighted, _ = model._apply_reward_weighting(vsd, videos, audios)
+    assert abs(weighted.item() - math.exp(0.25 * 4.0) * 1.5) < 1e-4

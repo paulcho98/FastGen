@@ -65,6 +65,7 @@ def variational_score_distillation_loss(
     teacher_x0: torch.Tensor,
     fake_score_x0: torch.Tensor,
     additional_scale: Optional[torch.Tensor] = None,
+    reduction: str = "mean",
 ) -> torch.Tensor:
     """
     Compute the variational score distillation loss.
@@ -73,6 +74,10 @@ def variational_score_distillation_loss(
         teacher_x0 (torch.Tensor): x0-prediction from the teacher
         fake_score_x0 (torch.Tensor): x0-prediction from the fake score
         additional_scale (Optional[torch.Tensor]): Additional scale parameter for the VSD loss.
+        reduction: "mean" (default) returns a scalar; "none" returns a [B]
+            per-sample loss (mean over non-batch dims). Re-DMD's reward path
+            uses "none" so `exp(beta * r_i)` can couple to `L_i` per-sample
+            before the final batch reduction.
 
     Returns:
         loss (torch.Tensor): The variational score distillation loss.
@@ -99,7 +104,13 @@ def variational_score_distillation_loss(
         vsd_grad = (fake_score_x0 - teacher_x0) * w
         pseudo_target = gen_data - vsd_grad
 
-    loss = 0.5 * F.mse_loss(gen_data, pseudo_target, reduction="mean")
+    if reduction == "mean":
+        loss = 0.5 * F.mse_loss(gen_data, pseudo_target, reduction="mean")
+    elif reduction == "none":
+        per_element = 0.5 * (gen_data - pseudo_target).pow(2)
+        loss = per_element.mean(dim=dims)
+    else:
+        raise ValueError(f"reduction must be 'mean' or 'none', got {reduction!r}")
     return loss
 
 

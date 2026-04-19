@@ -125,18 +125,33 @@ class OmniAvatarSelfForcingReDMD(OmniAvatarSelfForcingModel):
         videos: Any,
         audios: Any,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Compute `exp(beta * sync_c)` from the reward scorer and multiply vsd_loss.
+        """Per-sample couple `exp(beta * sync_c_i)` with per-sample `vsd_loss_i`.
+
+        `vsd_loss` MUST be a [B] tensor (one loss per sample). Internally:
+            weighted_scalar = mean_i( exp(beta * sync_c_i) * vsd_loss_i )
+
+        This is the algorithmically correct form of Re-DMD's
+        reward-weighted distillation: the per-sample loss is coupled to that
+        sample's own reward BEFORE the batch reduction. The earlier
+        `mean_i(exp(beta*r_i)) * mean_i(L_i)` collapse erased the coupling
+        whenever reward and loss co-varied across the batch — which is the
+        common case (high-reward generations tend to have low VSD loss).
+
+        Under per-GPU batch=1 (original Reward-Forcing) the two formulations
+        coincide numerically, so this is effect-free at batch=1 and only
+        starts to matter at batch>=2.
 
         Returns:
-            (weighted_loss, log_map)
-
-            `log_map` entries are python floats intended for the trainer's
-            wandb loss dict (parallel to Reward-Forcing's reward_MQ_* and
-            reward_weight_* keys).
+            (weighted_loss, log_map). `weighted_loss` is a scalar.
         """
         with torch.no_grad():
             reward = self.reward_scorer.reward_from_frames(videos, audios)
         sync_c = reward["sync_c"].detach().float()  # [B]
+
+        assert vsd_loss.dim() == 1 and vsd_loss.shape == sync_c.shape, (
+            f"_apply_reward_weighting expects per-sample vsd_loss shape "
+            f"{tuple(sync_c.shape)}, got {tuple(vsd_loss.shape)}"
+        )
 
         beta = float(self.config.reward_beta)
 
@@ -159,8 +174,11 @@ class OmniAvatarSelfForcingReDMD(OmniAvatarSelfForcingModel):
             sync_c = sync_c.clamp(clamp[0], clamp[1])
 
         weight = torch.exp(beta * sync_c)  # [B]
-        mean_weight = weight.mean()
-        weighted = mean_weight * vsd_loss
+        # Cast vsd_loss to the same dtype/device as weight so element-wise
+        # multiplication doesn't silently upcast/downcast away from the
+        # student's compute dtype. vsd_loss shape matches weight.
+        vsd_per_sample = vsd_loss.to(dtype=weight.dtype, device=weight.device)
+        weighted = (weight * vsd_per_sample).mean()
 
         sync_c_mean_r = _reduce(sync_c.mean(), dist.ReduceOp.SUM)
         sync_c_min_r  = _reduce(sync_c.min(),  dist.ReduceOp.MIN)
@@ -176,7 +194,7 @@ class OmniAvatarSelfForcingReDMD(OmniAvatarSelfForcingModel):
             "reward_weight_mean": float(weight_mean_r.item()),
             "reward_weight_min": float(weight_min_r.item()),
             "reward_weight_max": float(weight_max_r.item()),
-            "vsd_loss_unweighted": float(vsd_loss.detach().item()),
+            "vsd_loss_unweighted": float(vsd_per_sample.detach().float().mean().item()),
             "vsd_loss_weighted": float(weighted.detach().item()),
         }
 
@@ -287,26 +305,35 @@ class OmniAvatarSelfForcingReDMD(OmniAvatarSelfForcingModel):
                 perturbed_data, t, teacher_x0, neg_condition=neg_condition
             )
 
-        vsd_loss = variational_score_distillation_loss(gen_data, teacher_x0, fake_score_x0)
+        # Compute per-sample VSD when the reward path is active so per-sample
+        # reward weights couple to per-sample losses before the batch mean.
+        # (See _apply_reward_weighting for the algorithmic rationale.)
+        reward_active = self.reward_scorer is not None and "audio_waveform" in data
+        vsd_reduction = "none" if reward_active else "mean"
+        vsd_loss = variational_score_distillation_loss(
+            gen_data, teacher_x0, fake_score_x0, reduction=vsd_reduction,
+        )
 
         # ---- Re-DMD reward weighting (intervenes here) ----
         reward_log: Dict[str, Any] = {}
-        if self.reward_scorer is not None and "audio_waveform" in data:
+        if reward_active:
             with torch.no_grad():
                 pixels = self._decode_gen_to_pixels(gen_data)           # [B, 3, T_pix, H, W] in [-1, 1]
                 self._maybe_save_debug_video(pixels, iteration=getattr(self, "_current_iteration", 0))
                 videos_u8 = self._pixels_to_uint8_face_crop(pixels)     # list of B [T_pix, 3, H, W] uint8
                 audios = list(data["audio_waveform"].unbind(0))         # list of B [L]
             weighted_vsd, reward_log = self._apply_reward_weighting(vsd_loss, videos_u8, audios)
+            vsd_loss_scalar = vsd_loss.detach().float().mean()
         else:
             weighted_vsd = vsd_loss
-            reward_log = {"vsd_loss_unweighted": float(vsd_loss.detach().item())}
+            vsd_loss_scalar = vsd_loss.detach()
+            reward_log = {"vsd_loss_unweighted": float(vsd_loss_scalar.item())}
 
         loss = weighted_vsd + self.config.gan_loss_weight_gen * gan_loss_gen
 
         loss_map: Dict[str, Any] = {
             "total_loss": loss,
-            "vsd_loss": vsd_loss.detach(),
+            "vsd_loss": vsd_loss_scalar,
             "vsd_loss_weighted": weighted_vsd.detach(),
             "gan_loss_gen": (
                 gan_loss_gen.detach()
