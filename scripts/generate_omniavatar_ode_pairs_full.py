@@ -114,6 +114,10 @@ def parse_args() -> argparse.Namespace:
                         choices=["true", "false"],
                         help="If true (default), negative branch uses negative text embedding. "
                              "If false, negative branch keeps positive text embedding (audio-only CFG).")
+    parser.add_argument("--cfg_crossover", type=int, default=None,
+                        help="If set to K, use guidance_scale=1.0 for steps 0..K-1 and "
+                             "the provided --guidance_scale for steps K..num_steps-1. "
+                             "Schedule CFG: noCFG early, CFG late.")
 
     # Seed
     parser.add_argument("--seed", type=int, default=42,
@@ -308,6 +312,7 @@ def extract_full_ode_trajectory(
     output_dir: str = None,
     device: torch.device = None,
     dtype: torch.dtype = torch.bfloat16,
+    cfg_crossover: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Run teacher ODE solve and save (x_t, x0_pred) at every step.
 
@@ -329,6 +334,7 @@ def extract_full_ode_trajectory(
         "num_steps": num_steps,
         "shift": shift,
         "guidance_scale": guidance_scale,
+        "cfg_crossover": cfg_crossover,
         "latent_shape": list(latent_shape),
     }
     with open(os.path.join(output_dir, "ode_schedule.json"), "w") as f:
@@ -347,12 +353,17 @@ def extract_full_ode_trajectory(
             os.path.join(output_dir, f"step_{step_idx:03d}_xt.pt"),
         )
 
-        # Teacher prediction with CFG
+        # Teacher prediction with CFG — support scheduled CFG via cfg_crossover
+        if cfg_crossover is not None and step_idx < cfg_crossover:
+            effective_cfg = 1.0
+        else:
+            effective_cfg = guidance_scale
+
         x0_cond = teacher(x_t, t_cur, condition=condition, fwd_pred_type="x0")
 
-        if guidance_scale != 1.0:
+        if effective_cfg != 1.0:
             x0_uncond = teacher(x_t, t_cur, condition=neg_condition, fwd_pred_type="x0")
-            x0_pred = x0_uncond + guidance_scale * (x0_cond - x0_uncond)
+            x0_pred = x0_uncond + effective_cfg * (x0_cond - x0_uncond)
         else:
             x0_pred = x0_cond
 
@@ -371,7 +382,7 @@ def extract_full_ode_trajectory(
             x_t = x0_pred
 
         del x0_cond, x0_pred
-        if guidance_scale != 1.0:
+        if effective_cfg != 1.0:
             del x0_uncond
 
     return {
@@ -566,6 +577,7 @@ def main():
                 output_dir=sample_output_dir,
                 device=device,
                 dtype=dtype,
+                cfg_crossover=args.cfg_crossover,
             )
 
             # Also save input_latents (ground truth) for convenience
