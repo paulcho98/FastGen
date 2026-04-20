@@ -15,11 +15,13 @@ Usage:
 """
 
 import argparse
+import csv
 import math
 import os
 import subprocess
 import sys
 import tempfile
+import time
 
 import cv2
 import librosa
@@ -27,6 +29,45 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+
+# ---------------------------------------------------------------------------
+# Timing instrumentation (opt-in via --timing).
+# Uses torch.cuda.synchronize() + time.perf_counter() so GPU timings reflect
+# actual kernel execution, not just launch time.
+# ---------------------------------------------------------------------------
+_TIMING_ENABLED = False
+_TIMING_CURRENT: dict = {}
+_TIMING_ROWS: list = []
+_TIMING_STAGE_ORDER = [
+    "audio_extract", "face_detect", "ref_video_encode", "vae_encode", "audio_encode",
+    "denoise", "vae_decode", "first_frame_latency", "composite", "save_mux",
+    "encode_to_decode", "total_post_load",
+]
+
+
+def _gpu_sync():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+class _Stage:
+    """Context manager that records elapsed seconds for `name` into _TIMING_CURRENT."""
+    def __init__(self, name: str, use_gpu: bool = True):
+        self.name = name
+        self.use_gpu = use_gpu
+        self.t0 = 0.0
+
+    def __enter__(self):
+        if _TIMING_ENABLED and self.use_gpu:
+            _gpu_sync()
+        self.t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, *_):
+        if _TIMING_ENABLED:
+            if self.use_gpu:
+                _gpu_sync()
+            _TIMING_CURRENT[self.name] = time.perf_counter() - self.t0
 
 # ---------------------------------------------------------------------------
 # Path setup
@@ -73,6 +114,16 @@ def parse_args():
                         help="SF-trained student checkpoint (.pth)")
     parser.add_argument("--vae_path", type=str, required=True,
                         help="Path to Wan2.1_VAE.pth")
+    parser.add_argument("--taehv_ckpt", type=str, default=None,
+                        help="Optional path to TAEHV taew2_1.pth. If set, uses the TAEHV "
+                             "tiny decoder for latent->pixel decoding (full Wan VAE is still "
+                             "used for encoding driving video unless --taehv_encode is set).")
+    parser.add_argument("--taehv_encode", action="store_true",
+                        help="Also use TAEHV for encoding the driving video (requires --taehv_ckpt). "
+                             "Default: full Wan VAE encoder.")
+    parser.add_argument("--taehv_streaming", action="store_true",
+                        help="Use StreamingTAEHV for decoding (feeds latents one at a time, "
+                             "records first_frame_latency). Requires --taehv_ckpt.")
     parser.add_argument("--wav2vec_path", type=str, required=True,
                         help="Path to wav2vec2-base-960h directory")
     parser.add_argument("--mask_path", type=str, required=True,
@@ -89,6 +140,9 @@ def parse_args():
     # --- Generation parameters ---
     parser.add_argument("--num_latent_frames", type=int, default=None,
                         help="Override generation length (must be multiple of chunk_size)")
+    parser.add_argument("--min_latent_frames", type=int, default=0,
+                        help="Floor on num_latent; if audio is shorter, pad via zero-audio + ping-pong "
+                             "video. 0 disables. 21 matches FastGen's 81-frame training length.")
     parser.add_argument("--prompt", type=str, default="a person talking",
                         help="Text prompt")
     parser.add_argument("--text_embeds_path", type=str, default=None,
@@ -141,6 +195,11 @@ def parse_args():
                         help="Model dtype")
     parser.add_argument("--fps", type=int, default=25,
                         help="Output video FPS")
+    parser.add_argument("--timing", action="store_true",
+                        help="Enable per-stage timing; excludes model load. "
+                             "Writes timing CSV to --timing_csv.")
+    parser.add_argument("--timing_csv", type=str, default=None,
+                        help="CSV path for timing results (default: <output_path>.timing.csv)")
 
     return parser.parse_args()
 
@@ -261,6 +320,120 @@ def load_diffusion_model(args, device, dtype):
     model = model.to(device=device, dtype=dtype)
     model.eval()
     return model
+
+
+class TAEHVDecoderWrapper:
+    """Drop-in decode-only replacement that mimics WanVideoVAE.decode().
+
+    TAEHV convention:
+      - Input:  diffusion-space latents (same space the denoiser works in).
+                No mean/std scaling is applied here — TAEHV was distilled to
+                consume these directly.
+      - Output: pixels in [0, 1], NTCHW layout.
+    WanVideoVAE convention:
+      - decode() returns pixels in [-1, 1], shape [1, 3, T_video, H, W] (NCTHW).
+    This wrapper converts TAEHV output to Wan's range/layout so downstream
+    code (decode_and_save, LatentSync path) works unchanged.
+    """
+    def __init__(self, checkpoint_path, device):
+        from taehv import TAEHV
+        self.device = device
+        self.taehv = TAEHV(checkpoint_path=checkpoint_path).to(device, torch.float16).eval()
+
+    @torch.no_grad()
+    def decode(self, latents_list, device=None):
+        # latents_list: list of one [C=16, T_lat, H, W] tensor (matches WanVideoVAE.decode signature)
+        target_device = device if device is not None else self.device
+        lat = latents_list[0].to(target_device, dtype=torch.float16)      # [16, T, H, W]
+        lat = lat.permute(1, 0, 2, 3).unsqueeze(0)                        # [1, T, 16, H, W]  NTCHW
+        vid = self.taehv.decode_video(lat, parallel=False)                # [1, T*4, 3, H', W']  in [0, 1]
+        # diagdistill's taehv.py disables the front-trim (line 233), so match Wan's
+        # temporal length convention: num_video = 1 + (num_latent - 1) * 4 = T_lat*4 - frames_to_trim.
+        vid = vid[:, self.taehv.frames_to_trim:]                          # [1, T_lat*4 - 3, 3, H', W']
+        vid = vid.mul(2).sub(1)                                           # -> [-1, 1] (match Wan)
+        return vid.permute(0, 2, 1, 3, 4).float()                         # [1, 3, T_video, H', W']  NCTHW
+
+    @torch.no_grad()
+    def encode(self, videos_list, device=None):
+        """Drop-in replacement for WanVideoVAE.encode().
+
+        Wan convention: input list of [3, T, H, W] in [-1, 1]; returns [N, 16, T_lat, H_lat, W_lat]
+        with T_lat = 1 + (T-1)//4 = ⌈T/4⌉.
+        TAEHV: wants NTCHW in [0, 1], its temporal compression is floor(T/4). We pad the
+        INPUT video to the next multiple of 4 so floor(T_pad/4) = ⌈T/4⌉, matching Wan's T_lat
+        naturally — no latent-side duplication needed.
+        """
+        target_device = device if device is not None else self.device
+        outs = []
+        for vid in videos_list:
+            T = vid.shape[1]
+            T_pad = ((T + 3) // 4) * 4                                    # round up to multiple of 4
+            if T_pad > T:
+                # PREPEND copies of the first frame so TAEHV's latent 0 pools [f0,f0,f0,f0]
+                # = encoding of the static starting frame. This matches Wan's convention where
+                # latent 0 encodes frame 0 alone; latents i>0 encode groups of 4 consecutive frames.
+                pad = vid[:, :1].expand(-1, T_pad - T, -1, -1).contiguous()
+                vid = torch.cat([pad, vid], dim=1)
+            x = vid.to(target_device, dtype=torch.float16)
+            x = x.add(1).div(2)                                           # [-1,1] -> [0,1]
+            x = x.permute(1, 0, 2, 3).unsqueeze(0)                        # [1, T_pad, 3, H, W]  NTCHW
+            lat = self.taehv.encode_video(x, parallel=False, show_progress_bar=False)  # [1, T_pad/4, 16, H', W']
+            lat = lat.permute(0, 2, 1, 3, 4).float()                      # [1, 16, T_pad/4, H', W']
+            outs.append(lat.squeeze(0))                                   # [16, T_pad/4, H', W']
+        return torch.stack(outs)                                          # [N, 16, T_pad/4, H', W']
+
+
+class StreamingTAEHVDecoderWrapper:
+    """Drop-in decoder using StreamingTAEHV — feeds latents one at a time and
+    collects pixel frames as they emerge.
+
+    Same signature as TAEHVDecoderWrapper.decode() so downstream code works
+    unchanged. Additionally records first_frame_latency in _TIMING_CURRENT.
+    """
+    def __init__(self, checkpoint_path, device):
+        from taehv import TAEHV, StreamingTAEHV
+        self.device = device
+        taehv_model = TAEHV(checkpoint_path=checkpoint_path).to(device, torch.float16).eval()
+        self.streaming = StreamingTAEHV(taehv_model)
+
+    @torch.no_grad()
+    def decode(self, latents_list, device=None):
+        target_device = device if device is not None else self.device
+        self.streaming.reset()
+        lat = latents_list[0].to(target_device, dtype=torch.float16)      # [16, T_lat, H, W]
+        lat = lat.permute(1, 0, 2, 3).unsqueeze(0)                        # [1, T_lat, 16, H, W]  NTCHW
+
+        frames = []
+        first_frame_time = None
+        if _TIMING_ENABLED:
+            _gpu_sync()
+        t0 = time.perf_counter()
+
+        for t in range(lat.shape[1]):
+            latent_t = lat[:, t:t+1]                                       # [1, 1, 16, H, W]
+            frame = self.streaming.decode(latent_t)
+            while frame is not None:
+                if first_frame_time is None:
+                    if _TIMING_ENABLED:
+                        _gpu_sync()
+                    first_frame_time = time.perf_counter() - t0
+                frames.append(frame)
+                frame = self.streaming.decode()
+
+        for frame in self.streaming.flush_decoder():
+            if first_frame_time is None:
+                if _TIMING_ENABLED:
+                    _gpu_sync()
+                first_frame_time = time.perf_counter() - t0
+            frames.append(frame)
+
+        if _TIMING_ENABLED and first_frame_time is not None:
+            _TIMING_CURRENT["first_frame_latency"] = first_frame_time
+
+        # Stack [N1CHW, ...] → [1, T, C, H, W] NTCHW, convert to NCTHW [-1, 1]
+        vid = torch.cat(frames, dim=1)                                     # [1, T, 3, H', W']
+        vid = vid.mul(2).sub(1)                                            # [0,1] → [-1,1]
+        return vid.permute(0, 2, 1, 3, 4).float()                         # [1, 3, T, H', W']
 
 
 def load_vae(vae_path, device):
@@ -442,23 +615,23 @@ def get_audio_duration(audio_path):
 
 
 def compute_generation_length(audio_path, override_frames, chunk_size, fps,
-                              min_latent_frames=21):
+                              min_latent_frames=0):
     """Compute generation length in both latent and video frames.
 
     The VAE temporal compression is: num_latent = 1 + (num_video - 1) // 4.
     We round DOWN num_latent to the nearest multiple of chunk_size so the AR
     loop produces complete chunks.
 
-    If audio is shorter than min_latent_frames, we pad up to min_latent_frames
-    to match the training sequence length. Audio encoding already handles
-    zero-padding to the requested length.
+    If ``min_latent_frames`` > 0 and the audio-derived num_latent is shorter,
+    we pad up to ``min_latent_frames`` (FastGen-style): audio zero-pads via
+    wav2vec; video frames are ping-pong extended in adjust_video_length.
 
     Args:
         audio_path: path to audio file (for duration)
         override_frames: explicit num_latent_frames (or None)
         chunk_size: AR chunk size in latent frames
         fps: video frames per second
-        min_latent_frames: minimum latent frames (matches training length, default 21)
+        min_latent_frames: floor on num_latent; 0 disables padding.
 
     Returns:
         (num_latent_frames, num_video_frames)
@@ -479,9 +652,7 @@ def compute_generation_length(audio_path, override_frames, chunk_size, fps,
         num_latent = (num_latent_raw // chunk_size) * chunk_size
         num_latent = max(num_latent, chunk_size)  # at least one chunk
 
-    # Pad to training length if audio is too short (audio encoder zero-pads,
-    # video frames are ping-pong extended in adjust_video_length)
-    if num_latent < min_latent_frames:
+    if min_latent_frames and num_latent < min_latent_frames:
         print(f"  Audio too short ({duration:.2f}s → {num_latent} latent frames), "
               f"padding to {min_latent_frames}")
         num_latent = min_latent_frames
@@ -659,20 +830,30 @@ def encode_reference_video(vae, video_frames_np, mask_path, device, dtype):
     # Apply spatial mask (all frames)
     masked_video_tensor = apply_spatial_mask(video_tensor, mask_pixel_binary, mask_all_frames=True)
 
-    # VAE encode in bf16 to match precomputation pipeline (preprocess_v2v_integrated.py
-    # encodes with bf16 VAE + bf16 input).  Temporarily cast VAE to bf16 for encode,
-    # then restore to fp32 for decode later.
-    original_dtype = next(vae.parameters()).dtype
-    vae.to(dtype=torch.bfloat16)
-    with torch.no_grad():
-        source_latents = vae.encode(
-            [video_tensor[0].to(dtype=torch.bfloat16)], device=device
-        )  # [1, 16, T_lat, H_lat, W_lat]
-
-        masked_latents = vae.encode(
-            [masked_video_tensor[0].to(dtype=torch.bfloat16)], device=device
-        )  # [1, 16, T_lat, H_lat, W_lat]
-    vae.to(dtype=original_dtype)
+    # VAE encode. Wan VAE runs in bf16 (cast temporarily); TAEHV runs in fp16 natively.
+    # vae_encode times ONLY the encode calls; encode_to_decode starts here too.
+    global _e2d_t0
+    if _TIMING_ENABLED:
+        _gpu_sync()
+    _e2d_t0 = time.perf_counter()
+    is_taehv = isinstance(vae, TAEHVDecoderWrapper)
+    if is_taehv:
+        with _Stage("vae_encode", use_gpu=True):
+            with torch.no_grad():
+                source_latents = vae.encode([video_tensor[0]], device=device)
+                masked_latents = vae.encode([masked_video_tensor[0]], device=device)
+    else:
+        original_dtype = next(vae.parameters()).dtype
+        vae.to(dtype=torch.bfloat16)
+        with _Stage("vae_encode", use_gpu=True):
+            with torch.no_grad():
+                source_latents = vae.encode(
+                    [video_tensor[0].to(dtype=torch.bfloat16)], device=device
+                )
+                masked_latents = vae.encode(
+                    [masked_video_tensor[0].to(dtype=torch.bfloat16)], device=device
+                )
+        vae.to(dtype=original_dtype)
 
     ref_latent = source_latents[:, :, :1].to(dtype=dtype)  # [1, 16, 1, H_lat, W_lat]
     ref_sequence = source_latents.to(dtype=dtype)  # [1, 16, T_lat, H_lat, W_lat]
@@ -758,14 +939,16 @@ def build_condition(vae, wav2vec_model, wav2vec_extractor, video_frames_np,
         masked_video, ref_sequence
     """
     print("Encoding reference video ...")
-    ref_latent, masked_latents, ref_sequence, latent_mask = encode_reference_video(
-        vae, video_frames_np, mask_path, device, dtype
-    )
+    with _Stage("ref_video_encode", use_gpu=True):
+        ref_latent, masked_latents, ref_sequence, latent_mask = encode_reference_video(
+            vae, video_frames_np, mask_path, device, dtype
+        )
 
     print("Encoding audio ...")
-    audio_emb = encode_audio(
-        wav2vec_model, wav2vec_extractor, audio_path, num_video_frames, device
-    )
+    with _Stage("audio_encode", use_gpu=True):
+        audio_emb = encode_audio(
+            wav2vec_model, wav2vec_extractor, audio_path, num_video_frames, device
+        )
     audio_emb = audio_emb.to(dtype=dtype)
 
     return {
@@ -1293,8 +1476,10 @@ def verify_kv_cache(model, chunk_size, frame_seqlen, block_idx):
 # ===========================================================================
 
 def main():
+    global _TIMING_ENABLED, _TIMING_CURRENT, _TIMING_ROWS
     args = parse_args()
     validate_args(args)
+    _TIMING_ENABLED = bool(args.timing)
 
     # --- Resolve dtype ---
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
@@ -1314,6 +1499,29 @@ def main():
 
     print("Loading VAE ...")
     vae = load_vae(args.vae_path, device)
+
+    # Decoder selection: full Wan VAE stays loaded for encoding the driving video;
+    # decoding swaps to TAEHV tiny decoder if --taehv_ckpt is provided.
+    if args.taehv_streaming:
+        if not args.taehv_ckpt:
+            raise ValueError("--taehv_streaming requires --taehv_ckpt")
+        print(f"Loading StreamingTAEHV decoder from {args.taehv_ckpt} ...")
+        decoder_vae = StreamingTAEHVDecoderWrapper(args.taehv_ckpt, device)
+    elif args.taehv_ckpt:
+        print(f"Loading TAEHV tiny decoder from {args.taehv_ckpt} ...")
+        decoder_vae = TAEHVDecoderWrapper(args.taehv_ckpt, device)
+    else:
+        decoder_vae = vae
+
+    # Encoder selection: default to full Wan VAE. If --taehv_encode is set,
+    # reuse the same TAEHV model (it implements both encode and decode).
+    if args.taehv_encode:
+        if not args.taehv_ckpt:
+            raise ValueError("--taehv_encode requires --taehv_ckpt")
+        print("Using TAEHV tiny encoder for driving video encoding.")
+        encoder_vae = decoder_vae
+    else:
+        encoder_vae = vae
 
     # Wav2Vec + text only needed when NOT using precomputed tensors for every sample
     wav2vec_model = wav2vec_extractor = None
@@ -1348,25 +1556,31 @@ def main():
             continue
 
         tmp_audio = None
+        _TIMING_CURRENT = {"name": name}
         try:
+          with _Stage("total_post_load", use_gpu=True):
             # --- Resolve audio ---
-            audio_path, tmp_audio = resolve_audio(
-                audio_path=audio_path_sample, video_path=video_path,
-            )
+            with _Stage("audio_extract", use_gpu=False):
+                audio_path, tmp_audio = resolve_audio(
+                    audio_path=audio_path_sample, video_path=video_path,
+                )
 
             # --- Compute generation length ---
             num_latent_frames, num_video_frames = compute_generation_length(
                 audio_path, args.num_latent_frames, args.chunk_size, args.fps,
+                min_latent_frames=args.min_latent_frames,
             )
+            _TIMING_CURRENT["num_video_frames"] = num_video_frames
 
             # --- Optional LatentSync preprocessing ---
             latentsync_metadata = None
             if args.latentsync:
                 print("Running LatentSync face detection ...")
-                latentsync_metadata = preprocess_with_latentsync(
-                    video_path, image_processor, args.face_cache_dir,
-                    num_frames=num_video_frames,
-                )
+                with _Stage("face_detect", use_gpu=False):
+                    latentsync_metadata = preprocess_with_latentsync(
+                        video_path, image_processor, args.face_cache_dir,
+                        num_frames=num_video_frames,
+                    )
                 if latentsync_metadata is None:
                     print(f"  [FAIL] LatentSync preprocessing failed, skipping {name}")
                     failed.append(name)
@@ -1400,18 +1614,20 @@ def main():
                     ref_frames_np = load_and_adjust_video(video_path, num_video_frames)
 
                 print("Building conditioning ...")
+                # ref_video_encode / audio_encode timed inside build_condition().
                 condition = build_condition(
-                    vae, wav2vec_model, wav2vec_extractor, ref_frames_np,
+                    encoder_vae, wav2vec_model, wav2vec_extractor, ref_frames_np,
                     audio_path, text_embeds, args.mask_path,
                     num_video_frames, num_latent_frames, device, dtype,
                 )
 
             # --- Run inference ---
             print("Running inference ...")
-            output_latents = run_inference(
-                model, condition, num_latent_frames, args.t_list,
-                args.chunk_size, args.context_noise, args.seed, device, dtype,
-            )
+            with _Stage("denoise", use_gpu=True):
+                output_latents = run_inference(
+                    model, condition, num_latent_frames, args.t_list,
+                    args.chunk_size, args.context_noise, args.seed, device, dtype,
+                )
 
             # --- Post-processing: decode + save ---
             os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
@@ -1419,53 +1635,70 @@ def main():
             if args.latentsync and latentsync_metadata is not None:
                 # LatentSync compositing path — float-space decode + composite
                 print("VAE decoding (float) ...")
-                latent_for_vae = output_latents[0].to(torch.float32)
-                video_decoded = vae.decode([latent_for_vae], device=device)
-                video_decoded = video_decoded.clamp(-1, 1)
+                with _Stage("vae_decode", use_gpu=True):
+                    latent_for_vae = output_latents[0].to(torch.float32)
+                    video_decoded = decoder_vae.decode([latent_for_vae], device=device)
+                    video_decoded = video_decoded.clamp(-1, 1)
+
+                if _TIMING_ENABLED:
+                    _gpu_sync()
+                    _TIMING_CURRENT["encode_to_decode"] = time.perf_counter() - _e2d_t0
+
                 # [1, 3, T_video, H, W] -> [T, 3, H, W] in [0, 1]
                 generated_float = video_decoded[0].permute(1, 0, 2, 3)  # [3,T,H,W] -> [T,3,H,W]
                 generated_float = ((generated_float + 1) / 2).clamp(0, 1)  # [-1,1] -> [0,1]
 
                 # Composite onto original frames
                 print("Compositing ...")
-                composited_np = composite_with_latentsync_float(
-                    generated_float.cpu(), latentsync_metadata, image_processor,
-                    use_mouth_only_compositing=args.use_mouth_only,
-                )
+                with _Stage("composite", use_gpu=False):
+                    composited_np = composite_with_latentsync_float(
+                        generated_float.cpu(), latentsync_metadata, image_processor,
+                        use_mouth_only_compositing=args.use_mouth_only,
+                    )
 
-                # Save composited video (original resolution) with audio
-                composited_path = output_path
-                save_frames_as_video(composited_np, composited_path, fps=args.fps)
-                video_duration = composited_np.shape[0] / args.fps
-                tmp_composited = composited_path + ".tmp.mp4"
-                os.rename(composited_path, tmp_composited)
-                mux_video_with_audio(tmp_composited, audio_path, composited_path,
-                                     duration_s=video_duration)
-                if os.path.exists(tmp_composited):
-                    os.remove(tmp_composited)
+                with _Stage("save_mux", use_gpu=False):
+                    # Save composited video (original resolution) with audio
+                    composited_path = output_path
+                    save_frames_as_video(composited_np, composited_path, fps=args.fps)
+                    video_duration = composited_np.shape[0] / args.fps
+                    tmp_composited = composited_path + ".tmp.mp4"
+                    os.rename(composited_path, tmp_composited)
+                    mux_video_with_audio(tmp_composited, audio_path, composited_path,
+                                         duration_s=video_duration)
+                    if os.path.exists(tmp_composited):
+                        os.remove(tmp_composited)
 
-                # Also save aligned (512x512) video with audio
-                aligned_path = output_path.replace(".mp4", "_aligned.mp4")
-                aligned_np = ((generated_float.permute(0, 2, 3, 1).cpu().float()) * 255
-                              ).clamp(0, 255).to(torch.uint8).numpy()
-                save_frames_as_video(aligned_np, aligned_path, fps=args.fps)
-                tmp_aligned = aligned_path + ".tmp.mp4"
-                os.rename(aligned_path, tmp_aligned)
-                mux_video_with_audio(tmp_aligned, audio_path, aligned_path,
-                                     duration_s=video_duration)
-                if os.path.exists(tmp_aligned):
-                    os.remove(tmp_aligned)
+                    # Also save aligned (512x512) video with audio
+                    aligned_path = output_path.replace(".mp4", "_aligned.mp4")
+                    aligned_np = ((generated_float.permute(0, 2, 3, 1).cpu().float()) * 255
+                                  ).clamp(0, 255).to(torch.uint8).numpy()
+                    save_frames_as_video(aligned_np, aligned_path, fps=args.fps)
+                    tmp_aligned = aligned_path + ".tmp.mp4"
+                    os.rename(aligned_path, tmp_aligned)
+                    mux_video_with_audio(tmp_aligned, audio_path, aligned_path,
+                                         duration_s=video_duration)
+                    if os.path.exists(tmp_aligned):
+                        os.remove(tmp_aligned)
 
                 print(f"  Saved composited: {composited_path}")
                 print(f"  Saved aligned:    {aligned_path}")
             else:
-                # Standard decode + save (no LatentSync)
+                # Standard decode + save (no LatentSync) — timed as one block
                 print("Decoding and saving ...")
-                decode_and_save(vae, output_latents, audio_path, output_path,
-                                args.fps, device)
+                with _Stage("vae_decode", use_gpu=True):
+                    decode_and_save(decoder_vae, output_latents, audio_path, output_path,
+                                    args.fps, device)
+                if _TIMING_ENABLED:
+                    _gpu_sync()
+                    _TIMING_CURRENT["encode_to_decode"] = time.perf_counter() - _e2d_t0
 
             succeeded.append(name)
             print(f"  Done: {output_path}")
+          # _Stage("total_post_load") has now exited, so its timing is populated.
+          if _TIMING_ENABLED:
+              _TIMING_ROWS.append(dict(_TIMING_CURRENT))
+              parts = [f"{k}={_TIMING_CURRENT[k]:.3f}s" for k in _TIMING_STAGE_ORDER if k in _TIMING_CURRENT]
+              print(f"  [Timing] {', '.join(parts)}")
 
         except Exception as e:
             print(f"  [ERROR] {name}: {e}")
@@ -1490,6 +1723,56 @@ def main():
     if failed:
         print(f"  Failed: {failed}")
     print(f"{'='*60}")
+
+    # ===================================================================
+    # Timing CSV + averages
+    # ===================================================================
+    if _TIMING_ENABLED and _TIMING_ROWS:
+        if args.timing_csv:
+            csv_path = args.timing_csv
+        elif args.output_dir:
+            csv_path = os.path.join(args.output_dir, "timing.csv")
+        elif args.output_path:
+            csv_path = args.output_path + ".timing.csv"
+        else:
+            csv_path = "timing.csv"
+
+        fieldnames = ["name", "num_video_frames"] + _TIMING_STAGE_ORDER
+        os.makedirs(os.path.dirname(os.path.abspath(csv_path)) or ".", exist_ok=True)
+        with open(csv_path, "w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for row in _TIMING_ROWS:
+                out_row = {}
+                for k in fieldnames:
+                    v = row.get(k)
+                    if isinstance(v, float):
+                        out_row[k] = f"{v:.6f}"
+                    elif isinstance(v, int):
+                        out_row[k] = str(v)
+                    else:
+                        out_row[k] = v if v is not None else ""
+                writer.writerow(out_row)
+            avg = {"name": "AVERAGE"}
+            # mean num_video_frames across clips (so sweep can compute fps from CSV alone)
+            nvf = [r["num_video_frames"] for r in _TIMING_ROWS if isinstance(r.get("num_video_frames"), int)]
+            if nvf:
+                avg["num_video_frames"] = f"{sum(nvf)/len(nvf):.2f}"
+            for k in _TIMING_STAGE_ORDER:
+                vals = [r[k] for r in _TIMING_ROWS if isinstance(r.get(k), float)]
+                if vals:
+                    avg[k] = f"{sum(vals)/len(vals):.6f}"
+            writer.writerow(avg)
+        print(f"\n[Timing] wrote {len(_TIMING_ROWS)} rows + average → {csv_path}")
+        print(f"[Timing] per-stage average (s) | FPS (num_video_frames / stage_time):")
+        nvf = [r["num_video_frames"] for r in _TIMING_ROWS if isinstance(r.get("num_video_frames"), int)]
+        mean_nvf = (sum(nvf) / len(nvf)) if nvf else 0.0
+        for k in _TIMING_STAGE_ORDER:
+            vals = [r[k] for r in _TIMING_ROWS if isinstance(r.get(k), float)]
+            if vals:
+                mean_t = sum(vals) / len(vals)
+                fps = (mean_nvf / mean_t) if mean_t > 0 else 0.0
+                print(f"  {k:20s} {mean_t:7.4f} s   {fps:7.2f} fps")
 
 
 if __name__ == "__main__":
