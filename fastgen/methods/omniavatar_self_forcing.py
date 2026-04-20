@@ -65,6 +65,8 @@ class OmniAvatarSelfForcingModel(SelfForcingModel):
         # sufficient. Toggling requires_grad on FSDP2 DTensors leaves stale
         # internal state that breaks gradient checkpointing recomputation.
         self.fake_score.train().requires_grad_(True)
+        if self.config.gan_loss_weight_gen > 0:
+            self.discriminator.train().requires_grad_(True)
 
         input_fs, t_student_fs, t_fs, eps_fs = self._generate_noise_and_time(real_data)
 
@@ -76,6 +78,14 @@ class OmniAvatarSelfForcingModel(SelfForcingModel):
         # This ensures fake_score grads accumulate correctly across grad_accum rounds.
         # The graph is freed here so it doesn't overlap with the student forward.
         (fake_loss_map["total_loss"] / grad_accum_rounds).backward()
+
+        # Freeze discriminator before the student step so the generator GAN loss
+        # backward doesn't accumulate spurious grads in the discriminator.
+        # Safe: the discriminator is fully FSDP-wrapped (auto-wrap path) and has
+        # no gradient checkpointing, so requires_grad_ toggling doesn't trigger
+        # the DTensor stale-state issue that affects the student's blocks.
+        if self.config.gan_loss_weight_gen > 0:
+            self.discriminator.eval().requires_grad_(False)
 
         # --- Step 2: Student forward (returned for trainer's backward) ---
         self.net.clear_caches()
@@ -93,9 +103,12 @@ class OmniAvatarSelfForcingModel(SelfForcingModel):
         return student_loss_map, student_outputs
 
     def get_optimizers(self, iteration: int) -> list:
-        """On student steps, return BOTH optimizers (trainer steps both)."""
+        """On student steps, return all active optimizers (trainer steps all)."""
         if iteration % self.config.student_update_freq == 0:
-            return [self.net_optimizer, self.fake_score_optimizer]
+            opts = [self.net_optimizer, self.fake_score_optimizer]
+            if self.config.gan_loss_weight_gen > 0:
+                opts.append(self.discriminator_optimizer)
+            return opts
         else:
             if self.config.gan_loss_weight_gen > 0:
                 return [self.fake_score_optimizer, self.discriminator_optimizer]
@@ -103,9 +116,12 @@ class OmniAvatarSelfForcingModel(SelfForcingModel):
                 return [self.fake_score_optimizer]
 
     def get_lr_schedulers(self, iteration: int) -> list:
-        """On student steps, return BOTH schedulers (trainer steps both)."""
+        """On student steps, return all active schedulers (trainer steps all)."""
         if iteration % self.config.student_update_freq == 0:
-            return [self.net_lr_scheduler, self.fake_score_lr_scheduler]
+            scheds = [self.net_lr_scheduler, self.fake_score_lr_scheduler]
+            if self.config.gan_loss_weight_gen > 0:
+                scheds.append(self.discriminator_lr_scheduler)
+            return scheds
         else:
             if self.config.gan_loss_weight_gen > 0:
                 return [self.fake_score_lr_scheduler, self.discriminator_lr_scheduler]

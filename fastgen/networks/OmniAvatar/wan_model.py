@@ -407,7 +407,7 @@ class WanModel(torch.nn.Module):
                 audio_emb_tmp = audio_emb[:, au_idx].repeat(1, 1, lat_h // 2, lat_w // 2, 1)  # 1, 11, 45, 25, 128
                 audio_cond_tmp = self.patchify(audio_emb_tmp.permute(0, 4, 1, 2, 3))[0]
 
-            if (self.training and use_gradient_checkpointing and expand_audio_checkpoint_scope):
+            if (torch.is_grad_enabled() and use_gradient_checkpointing and expand_audio_checkpoint_scope):
                 # Expanded scope: audio add runs INSIDE the checkpoint, so its
                 # activations are recomputed during backward rather than
                 # retained. Mathematically identical to the default branch
@@ -428,7 +428,7 @@ class WanModel(torch.nn.Module):
                 if audio_cond_tmp is not None:
                     x = audio_cond_tmp + x
 
-                if self.training and use_gradient_checkpointing:
+                if torch.is_grad_enabled() and use_gradient_checkpointing:
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
                         x, context, t_mod, freqs,
