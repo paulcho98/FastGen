@@ -97,8 +97,10 @@ class OmniAvatarSelfForcingModel(SelfForcingModel):
             condition=condition, neg_condition=neg_condition,
         )
 
-        # Attach fake_score loss for logging (detached — no gradient)
-        student_loss_map["fake_score_loss"] = fake_loss_map["total_loss"].detach()
+        # Attach Step 1 losses for logging (detached — no gradient)
+        for k, v in fake_loss_map.items():
+            if k != "total_loss" and torch.is_tensor(v):
+                student_loss_map[k] = v.detach()
 
         return student_loss_map, student_outputs
 

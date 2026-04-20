@@ -13,8 +13,8 @@
 # Self-normalization bounds weighted VSD in [min(L), max(L)], restoring
 # the GAN term's intended relative strength.
 #
-# Memory budget: batch 8 -> 4, grad_accum 2 -> 4 (effective batch stays 64).
-# Expected VRAM: ~119 GB/H200. If OOM, drop batch further (2 + accum 8).
+# Memory budget: batch 2, grad_accum 4 (effective batch 2*4*4 = 32).
+# Combined step peaks at ~99 GB/H200 (~30 GB headroom). bs=4 OOMs at ~149 GB.
 #
 # Prereqs:
 #   - /home/work/.local/eval_metrics/checkpoints/auxiliary/taew2_1.pth
@@ -58,8 +58,8 @@ echo "  TAEW ckpt:          /home/work/.local/eval_metrics/checkpoints/auxiliary
 echo "  gan_loss_weight:    0.003"
 echo "  Discriminator:      Wan_14B (40 blocks, feature_indices=[21,30,39])"
 echo "  Disc optimizer LR:  5e-6"
-echo "  Dataloader batch:   4 (halved from 8 for GAN VRAM budget)"
-echo "  Grad accum rounds:  4 (effective batch 4 * 4 GPUs * 4 accum = 64)"
+echo "  Dataloader batch:   2 (bs=4 OOMs at ~149 GB on combined step)"
+echo "  Grad accum rounds:  4 (effective batch 2 * 4 GPUs * 4 accum = 32)"
 echo "  Run name:           ${RUN_NAME}"
 echo "  Output root:        ${FASTGEN_OUTPUT_ROOT}"
 echo "  Resume:             ${RESUME}"
@@ -71,6 +71,7 @@ echo ""
     train.py \
     --config=fastgen/configs/experiments/OmniAvatar/config_sf_sink1_window7_redmd_beta2_taew_gan.py \
     - trainer.resume=${RESUME} \
+    dataloader_train.batch_size=2 \
     log_config.group="omniavatar_sf_audiofix" \
     log_config.name="${RUN_NAME}" \
     log_config.project="OmniAvatar-FastGen" \
