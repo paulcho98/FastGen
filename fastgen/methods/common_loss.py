@@ -114,11 +114,12 @@ def variational_score_distillation_loss(
     return loss
 
 
-def gan_loss_generator(fake_logits: torch.Tensor) -> torch.Tensor:
+def gan_loss_generator(fake_logits: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
     """
     Compute the GAN loss for the generator
     Args:
-        fake_logits (torch.Tensor): The logits for the fake data.
+        fake_logits (torch.Tensor): The logits for the fake data, shape [B, D].
+        reduction: 'mean' returns scalar, 'none' returns per-sample [B].
 
     Returns:
         gan_loss (torch.Tensor): The GAN loss for the generator.
@@ -126,7 +127,12 @@ def gan_loss_generator(fake_logits: torch.Tensor) -> torch.Tensor:
     """
 
     assert fake_logits.ndim == 2, f"fake_logits has shape {fake_logits.shape}"
-    gan_loss = F.softplus(-fake_logits).mean()
+    if reduction == "none":
+        gan_loss = F.softplus(-fake_logits).mean(dim=-1)  # [B]
+    elif reduction == "mean":
+        gan_loss = F.softplus(-fake_logits).mean()
+    else:
+        raise ValueError(f"reduction must be 'mean' or 'none', got {reduction!r}")
     return gan_loss
 
 

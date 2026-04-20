@@ -130,7 +130,8 @@ class DMD2Model(FastGenModel):
         return input_student, t_student, t, eps
 
     def _compute_teacher_prediction_gan_loss(
-        self, perturbed_data: torch.Tensor, t: torch.Tensor, condition: Optional[Any] = None
+        self, perturbed_data: torch.Tensor, t: torch.Tensor, condition: Optional[Any] = None,
+        gan_reduction: str = "mean",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute teacher prediction and optionally GAN loss for generator.
 
@@ -138,9 +139,10 @@ class DMD2Model(FastGenModel):
             perturbed_data: Perturbed data tensor
             t: Time steps
             condition: Conditioning information
+            gan_reduction: 'mean' returns scalar GAN loss, 'none' returns per-sample [B].
 
         Returns:
-            tuple of (teacher_x0, fake_feat or None, gan_loss_gen)
+            tuple of (teacher_x0, gan_loss_gen)
         """
         if self.config.gan_loss_weight_gen > 0:
             teacher_x0, fake_feat = self.teacher(
@@ -151,7 +153,7 @@ class DMD2Model(FastGenModel):
                 fwd_pred_type="x0",
             )
             # Compute the GAN loss for the generator
-            gan_loss_gen = gan_loss_generator(self.discriminator(fake_feat))
+            gan_loss_gen = gan_loss_generator(self.discriminator(fake_feat), reduction=gan_reduction)
         else:
             with torch.no_grad():
                 teacher_x0 = self.teacher(

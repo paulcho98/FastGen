@@ -328,8 +328,13 @@ class OmniAvatarSelfForcingReDMD(OmniAvatarSelfForcingModel):
                 perturbed_data, t, condition=condition, fwd_pred_type="x0"
             )
 
+        # When reward is active, compute per-sample losses so reward weights
+        # couple to the combined (VSD + GAN) per-sample loss before reduction.
+        reward_active = self.reward_scorer is not None and "audio_waveform" in data
+        per_sample = "none" if reward_active else "mean"
+
         teacher_x0, gan_loss_gen = self._compute_teacher_prediction_gan_loss(
-            perturbed_data, t, condition=condition
+            perturbed_data, t, condition=condition, gan_reduction=per_sample,
         )
 
         if getattr(self.config, "guidance_scale", None) is not None:
@@ -337,16 +342,11 @@ class OmniAvatarSelfForcingReDMD(OmniAvatarSelfForcingModel):
                 perturbed_data, t, teacher_x0, neg_condition=neg_condition
             )
 
-        # Compute per-sample VSD when the reward path is active so per-sample
-        # reward weights couple to per-sample losses before the batch mean.
-        # (See _apply_reward_weighting for the algorithmic rationale.)
-        reward_active = self.reward_scorer is not None and "audio_waveform" in data
-        vsd_reduction = "none" if reward_active else "mean"
         vsd_loss = variational_score_distillation_loss(
-            gen_data, teacher_x0, fake_score_x0, reduction=vsd_reduction,
+            gen_data, teacher_x0, fake_score_x0, reduction=per_sample,
         )
 
-        # ---- Re-DMD reward weighting (intervenes here) ----
+        # ---- Re-DMD reward weighting on the combined per-sample loss ----
         reward_log: Dict[str, Any] = {}
         if reward_active:
             with torch.no_grad():
@@ -354,24 +354,31 @@ class OmniAvatarSelfForcingReDMD(OmniAvatarSelfForcingModel):
                 self._maybe_save_debug_video(pixels, iteration=getattr(self, "_current_iteration", 0))
                 videos_u8 = self._pixels_to_uint8_face_crop(pixels)     # list of B [T_pix, 3, H, W] uint8
                 audios = list(data["audio_waveform"].unbind(0))         # list of B [L]
-            weighted_vsd, reward_log = self._apply_reward_weighting(vsd_loss, videos_u8, audios)
+            # Combine per-sample VSD + GAN into a single per-sample loss, then
+            # apply reward weighting once. This keeps the 0.003 relative weight
+            # between VSD and GAN invariant to reward magnitude:
+            #   loss = mean(w_i * (vsd_i + 0.003 * gan_i))
+            combined_per_sample = vsd_loss + self.config.gan_loss_weight_gen * gan_loss_gen
+            weighted_loss, reward_log = self._apply_reward_weighting(
+                combined_per_sample, videos_u8, audios,
+            )
             vsd_loss_scalar = vsd_loss.detach().float().mean()
+            gan_loss_gen_scalar = gan_loss_gen.detach().float().mean()
         else:
-            weighted_vsd = vsd_loss
+            weighted_loss = vsd_loss + self.config.gan_loss_weight_gen * gan_loss_gen
             vsd_loss_scalar = vsd_loss.detach()
-            reward_log = {"vsd_loss_unweighted": float(vsd_loss_scalar.item())}
-
-        loss = weighted_vsd + self.config.gan_loss_weight_gen * gan_loss_gen
-
-        loss_map: Dict[str, Any] = {
-            "total_loss": loss,
-            "vsd_loss": vsd_loss_scalar,
-            "vsd_loss_weighted": weighted_vsd.detach(),
-            "gan_loss_gen": (
+            gan_loss_gen_scalar = (
                 gan_loss_gen.detach()
                 if torch.is_tensor(gan_loss_gen)
                 else torch.tensor(float(gan_loss_gen))
-            ),
+            )
+            reward_log = {"vsd_loss_unweighted": float(vsd_loss_scalar.item())}
+
+        loss_map: Dict[str, Any] = {
+            "total_loss": weighted_loss,
+            "vsd_loss": vsd_loss_scalar,
+            "vsd_loss_weighted": weighted_loss.detach(),
+            "gan_loss_gen": gan_loss_gen_scalar,
             **reward_log,
         }
         outputs = self._get_outputs(gen_data, input_student, condition=condition)
