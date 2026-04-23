@@ -79,9 +79,26 @@ The loader (`scripts/inference/inference_causal.py:199-236`) auto-detects:
 
 ---
 
-## 4. Data format (HDTF test set)
+## 4. Input format expected by `inference_causal.py`
 
-This repo was evaluated on `HDTF_original_testset_81frames`. Layout:
+Generic contract (independent of HDTF):
+
+| Argument | Accepted | Notes |
+|---|---|---|
+| `--video_path` | any `cv2.VideoCapture`-readable container (mp4/mov/mkv/avi) | alignment assumes **25 fps** (see `--fps`); training used `_cfr25.mp4` (H.264 CFR 25 fps) |
+| `--audio_path` | any `librosa.load`-readable file (wav/mp3/flac/m4a/ogg) | resampled internally to **16 kHz mono** for wav2vec2; if omitted, extracted from the video via ffmpeg (`pcm_s16le -ar 16000 -ac 1`) |
+| generation length | derived from audio | `num_video_frames = floor(audio_duration * 25)`, `num_latent_frames = num_video_frames // 4` (Wan VAE is 4× temporal). Override with `--num_latent_frames` (must satisfy chunk-size multiple) |
+| `--text_embeds_path` | precomputed `.pt` from Wan's T5 encoder | alternative: `--text_encoder_path <dir>` + `--prompt "<str>"` to compute on the fly |
+| `--mask_path` | 2 KB PNG defining mouth region | static file from LatentSync/StableAvatar |
+| `--face_cache_dir` | dir containing `<video_stem>_face_cache.pt` per clip | required when `--latentsync` is set; auto-recomputes missing entries |
+
+Output: 25 fps H.264 mp4 at `--output_path`. With `--latentsync`, mouth-only composite onto the original reference; without, full-face replacement. Optional `_aligned.mp4` sidecar shows the aligned face crop.
+
+---
+
+## 5. HDTF test-set layout (reference evaluation)
+
+The above contract is what we supply at HDTF eval time via `HDTF_original_testset_81frames`. Layout:
 
 ```
 HDTF_original_testset_81frames/
@@ -103,9 +120,9 @@ HDTF_original_testset_81frames/
 
 ---
 
-## 5. Running inference
+## 6. Running inference
 
-### 5.1. Single clip, single GPU
+### 6.1. Single clip, single GPU
 
 ```bash
 python scripts/inference/inference_causal.py \
@@ -131,7 +148,7 @@ Key flags:
 - `--latentsync` — use LatentSync-style face detection + mouth-only compositing (recommended)
 - `--face_cache_dir` — reuse cached face detections; omit to recompute
 
-### 5.2. Full HDTF eval across multiple checkpoints (parallel across GPUs)
+### 6.2. Full HDTF eval across multiple checkpoints (parallel across GPUs)
 
 A ready-made driver is in `scripts/infer_redmd_taew_audiofix_syncnet_mouthweight.sh` (and `_batched.sh` for the batched variant). Edit the hardcoded paths at the top for your machine, then:
 
@@ -142,13 +159,13 @@ CKPT_STEPS="100 200" GPUS="0 1" \
 
 Outputs land in `$OUT_ROOT/step_0000XXX/<video_stem>.mp4`, one per pair in `hdtf_video_audio_pairs.txt`.
 
-### 5.3. Streaming / TAEHV inference (optional, faster)
+### 6.3. Streaming / TAEHV inference (optional, faster)
 
 See `scripts/inference/inference_streaming.py` for per-chunk AR generation with first-frame-latency measurement. Requires `--taehv_ckpt path/to/taew2_1.pth`.
 
 ---
 
-## 6. Evaluation
+## 7. Evaluation
 
 After inference produces `$OUT_ROOT/step_XXXX/*.mp4`, run:
 
@@ -162,7 +179,7 @@ Metrics covered: sync-C (syncnet confidence), LMD (landmark distance), FID (opti
 
 ---
 
-## 7. Quick sanity check
+## 8. Quick sanity check
 
 After unzipping the checkpoint bundle:
 ```bash
@@ -182,7 +199,7 @@ If that loads without error and prints a tensor count in the thousands, the bund
 
 ---
 
-## 8. Bundle contents (this transfer)
+## 9. Bundle contents (this transfer)
 
 ```
 fastgen_redmd_fsmatched_lr3e6_ckpts.zip
