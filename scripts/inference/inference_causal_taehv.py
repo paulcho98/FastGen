@@ -41,7 +41,12 @@ _TIMING_ROWS: list = []
 _TIMING_STAGE_ORDER = [
     "audio_extract", "face_detect", "ref_video_encode", "vae_encode", "audio_encode",
     "denoise", "vae_decode", "first_frame_latency", "composite", "save_mux",
-    "encode_to_decode", "total_post_load",
+    "whole_generation", "encode_to_decode", "total_post_load",
+    "ablation_1", "ablation_2", "ablation_3", "ablation_4",
+    "ff_full_pipeline", "ff_generation", "ff_pure_generation",
+    "ff_enc_gen_dec", "ff_enc_audio_gen_dec", "ff_pure_enc_to_dec",
+    "streaming_total",
+    "ff_ablation_1", "ff_ablation_2", "ff_ablation_3", "ff_ablation_4",
 ]
 
 
@@ -124,6 +129,12 @@ def parse_args():
     parser.add_argument("--taehv_streaming", action="store_true",
                         help="Use StreamingTAEHV for decoding (feeds latents one at a time, "
                              "records first_frame_latency). Requires --taehv_ckpt.")
+    parser.add_argument("--streaming_pipeline", type=str, default=None,
+                        help="DEPRECATED: use inference_streaming.py instead. "
+                             "'sequential': per-chunk encode→denoise→decode→composite in series. "
+                             "'pipelined': per-chunk encode→denoise→decode on GPU, composite "
+                             "overlapped on CPU background thread (GPU+CPU parallel). "
+                             "Requires --taehv_ckpt and --latentsync.")
     parser.add_argument("--wav2vec_path", type=str, required=True,
                         help="Path to wav2vec2-base-960h directory")
     parser.add_argument("--mask_path", type=str, required=True,
@@ -1166,7 +1177,7 @@ def preprocess_with_latentsync(video_path, image_processor, face_detection_cache
 
 
 def composite_with_latentsync_float(generated_float, latentsync_metadata, image_processor,
-                                     use_mouth_only_compositing=False):
+                                     use_mouth_only_compositing=False, frame_offset=0):
     """Composite generated faces back onto original video, staying in float space.
 
     Unlike composite_with_latentsync (which takes uint8 numpy), this function accepts the
@@ -1175,6 +1186,7 @@ def composite_with_latentsync_float(generated_float, latentsync_metadata, image_
 
     Args:
         generated_float: [T, C, H, W] float tensor in [0, 1]
+        frame_offset: offset into the metadata arrays (for per-chunk streaming)
     """
     import torchvision.transforms.functional as TF_v
 
@@ -1203,20 +1215,21 @@ def composite_with_latentsync_float(generated_float, latentsync_metadata, image_
     composite_frames = []
 
     for i in range(generated_float.shape[0]):
-        if i in detection_failures or boxes[i] is None:
-            composite_frames.append(original_frames[i])
+        gi = i + frame_offset
+        if gi >= len(original_frames):
+            break
+        if gi in detection_failures or boxes[gi] is None:
+            composite_frames.append(original_frames[gi])
             continue
 
         face = generated_float[i]  # [C, H, W] float [0,1]
 
-        # Mouth-only compositing in float space (no uint8 quantization)
         if use_mouth_only_compositing and aligned_faces is not None:
-            mouth_mask = image_processor.mask_image.float()  # [C, H, W] float32
-            original_aligned_float = aligned_faces[i].float() / 255.0  # uint8 → [0,1]
+            mouth_mask = image_processor.mask_image.float()
+            original_aligned_float = aligned_faces[gi].float() / 255.0
             face = face * (1 - mouth_mask) + original_aligned_float * mouth_mask
 
-        # Resize in float space
-        x1, y1, x2, y2 = boxes[i]
+        x1, y1, x2, y2 = boxes[gi]
         height = int(y2 - y1)
         width = int(x2 - x1)
         face_resized = TF_v.resize(
@@ -1224,17 +1237,16 @@ def composite_with_latentsync_float(generated_float, latentsync_metadata, image_
             interpolation=TF_v.InterpolationMode.BICUBIC, antialias=True,
         )
 
-        # Convert [0,1] → [-1,1] for restore_img (NO uint8 round-trip)
         face_resized = face_resized * 2.0 - 1.0
 
         try:
             restored_frame = image_processor.restorer.restore_img(
-                original_frames[i], face_resized, affine_matrices[i]
+                original_frames[gi], face_resized, affine_matrices[gi]
             )
             composite_frames.append(restored_frame)
         except Exception as e:
-            print(f"[LatentSync] Restoration failed for frame {i}: {e}")
-            composite_frames.append(original_frames[i])
+            print(f"[LatentSync] Restoration failed for frame {gi}: {e}")
+            composite_frames.append(original_frames[gi])
 
     return np.stack(composite_frames)
 
@@ -1403,6 +1415,148 @@ def run_inference(
 
 
 @torch.no_grad()
+def run_inference_streaming(
+    model, condition, num_latent_frames, t_list,
+    chunk_size, context_noise, seed, device, dtype,
+):
+    """Streaming version of run_inference — yields denoised latents per chunk.
+
+    Same AR generation logic, but instead of accumulating all chunks and returning
+    at the end, yields each chunk's denoised latents immediately. The caller can
+    decode + composite each chunk as it arrives, reducing first-frame latency.
+
+    Yields:
+        chunk_latents: [1, 16, chunk_size, H_lat, W_lat] per chunk
+    """
+    model.total_num_frames = num_latent_frames
+    model.clear_caches()
+
+    ref_latent = condition["ref_latent"]
+    B = ref_latent.shape[0]
+    C = 16
+    H_lat, W_lat = ref_latent.shape[3], ref_latent.shape[4]
+
+    num_blocks = num_latent_frames // chunk_size
+    assert num_latent_frames % chunk_size == 0
+
+    torch.manual_seed(seed)
+    noise = torch.randn(B, C, num_latent_frames, H_lat, W_lat, device=device, dtype=dtype)
+    t_list_t = torch.tensor(t_list, device=device, dtype=torch.float64)
+
+    for block_idx in range(num_blocks):
+        cur_start_frame = block_idx * chunk_size
+        noisy_input = noise[:, :, cur_start_frame:cur_start_frame + chunk_size]
+
+        for step_idx in range(len(t_list_t) - 1):
+            t_cur = t_list_t[step_idx]
+            t_next = t_list_t[step_idx + 1]
+
+            x0_pred = model(
+                noisy_input, t_cur.expand(B),
+                condition=condition,
+                cur_start_frame=cur_start_frame,
+                store_kv=False, is_ar=True,
+                fwd_pred_type="x0",
+                use_gradient_checkpointing=False,
+            )
+
+            if t_next > 0:
+                eps = torch.randn_like(x0_pred)
+                noisy_input = model.noise_scheduler.forward_process(
+                    x0_pred, eps, t_next.expand(B),
+                )
+            else:
+                noisy_input = x0_pred
+
+        # Yield this chunk's denoised latents immediately
+        yield x0_pred
+
+        # Update KV cache for next block
+        cache_input = x0_pred
+        t_cache = torch.full((B,), context_noise, device=device, dtype=torch.float64)
+        if context_noise > 0:
+            cache_eps = torch.randn_like(x0_pred)
+            cache_input = model.noise_scheduler.forward_process(
+                x0_pred, cache_eps,
+                torch.tensor(context_noise, device=device, dtype=torch.float64).expand(B),
+            )
+
+        model(
+            cache_input, t_cache,
+            condition=condition,
+            cur_start_frame=cur_start_frame,
+            store_kv=True, is_ar=True,
+            fwd_pred_type="x0",
+            use_gradient_checkpointing=False,
+        )
+
+    model.clear_caches()
+
+
+def encode_reference_video_chunk(vae, video_frames_np, mask_path, chunk_start_frame,
+                                  chunk_size_video, device, dtype, latent_mask=None):
+    """Encode a chunk of reference video frames through VAE.
+
+    Used by the streaming pipeline to encode frames on demand per AR chunk,
+    instead of encoding the full video upfront.
+
+    Args:
+        vae: WanVideoVAE or TAEHVDecoderWrapper
+        video_frames_np: [N, H, W, 3] uint8 — FULL video (sliced internally)
+        mask_path: path to LatentSync mask
+        chunk_start_frame: first VIDEO frame index for this chunk
+        chunk_size_video: number of VIDEO frames to encode
+        device, dtype: target device/dtype
+        latent_mask: precomputed [H_lat, W_lat] mask (pass to avoid reloading)
+
+    Returns:
+        (chunk_source_latents, chunk_masked_latents, latent_mask)
+    """
+    H, W = 512, 512
+    latent_h, latent_w = H // 8, W // 8
+
+    # Slice video frames for this chunk
+    end_frame = min(chunk_start_frame + chunk_size_video, len(video_frames_np))
+    chunk_frames = video_frames_np[chunk_start_frame:end_frame]
+
+    video_tensor = frames_to_tensor(chunk_frames)
+
+    # Load mask (reuse if provided)
+    mask_img = Image.open(mask_path).convert("L")
+    mask_np = np.array(mask_img).astype(np.float32) / 255.0
+    if mask_np.shape[0] != H or mask_np.shape[1] != W:
+        mask_np = cv2.resize(mask_np, (W, H), interpolation=cv2.INTER_LINEAR)
+    mask_pixel_binary = (mask_np > 0.5).astype(np.float32)
+
+    masked_video_tensor = apply_spatial_mask(video_tensor, mask_pixel_binary, mask_all_frames=True)
+
+    is_taehv = isinstance(vae, TAEHVDecoderWrapper)
+    if is_taehv:
+        with torch.no_grad():
+            source_latents = vae.encode([video_tensor[0]], device=device)
+            masked_latents = vae.encode([masked_video_tensor[0]], device=device)
+    else:
+        original_dtype = next(vae.parameters()).dtype
+        vae.to(dtype=torch.bfloat16)
+        with torch.no_grad():
+            source_latents = vae.encode(
+                [video_tensor[0].to(dtype=torch.bfloat16)], device=device
+            )
+            masked_latents = vae.encode(
+                [masked_video_tensor[0].to(dtype=torch.bfloat16)], device=device
+            )
+        vae.to(dtype=original_dtype)
+
+    source_latents = source_latents.to(dtype=dtype)
+    masked_latents = masked_latents.to(dtype=dtype)
+
+    if latent_mask is None:
+        latent_mask = load_latentsync_mask(mask_path, latent_h, latent_w).to(device=device, dtype=dtype)
+
+    return source_latents, masked_latents, latent_mask
+
+
+@torch.no_grad()
 def decode_and_save(vae, output_latents, audio_path, output_path, fps, device):
     """VAE decode latents -> save silent video -> mux with audio."""
     import imageio.v3 as iio
@@ -1523,9 +1677,21 @@ def main():
     else:
         encoder_vae = vae
 
-    # Wav2Vec + text only needed when NOT using precomputed tensors for every sample
+    # Eagerly load Wav2Vec + text to avoid warmup artifacts in timing
     wav2vec_model = wav2vec_extractor = None
     text_embeds = None
+    if args.wav2vec_path:
+        print("Loading Wav2Vec2 (eager) ...")
+        wav2vec_model, wav2vec_extractor = load_wav2vec(args.wav2vec_path, device)
+        # Warmup forward pass to compile CUDA kernels
+        _dummy_audio = np.zeros(16000, dtype=np.float32)
+        _dummy_input = wav2vec_extractor(_dummy_audio, return_tensors="pt", sampling_rate=16000)
+        with torch.no_grad():
+            wav2vec_model(_dummy_input.input_values.to(device))
+        print("Wav2Vec2 warmed up.")
+    if args.text_embeds_path or args.prompt:
+        print("Loading text embeddings (eager) ...")
+        text_embeds = load_or_encode_text(args, device, dtype)
 
     # Optional LatentSync ImageProcessor
     image_processor = None
@@ -1576,6 +1742,9 @@ def main():
             latentsync_metadata = None
             if args.latentsync:
                 print("Running LatentSync face detection ...")
+                if _TIMING_ENABLED:
+                    _gpu_sync()
+                _wg_t0 = time.perf_counter()
                 with _Stage("face_detect", use_gpu=False):
                     latentsync_metadata = preprocess_with_latentsync(
                         video_path, image_processor, args.face_cache_dir,
@@ -1593,15 +1762,7 @@ def main():
                     num_latent_frames, device, dtype,
                 )
             else:
-                # Lazy-load Wav2Vec + text on first non-precomputed sample
-                if wav2vec_model is None:
-                    print("Loading Wav2Vec2 ...")
-                    wav2vec_model, wav2vec_extractor = load_wav2vec(
-                        args.wav2vec_path, device,
-                    )
-                if text_embeds is None:
-                    print("Loading text embeddings ...")
-                    text_embeds = load_or_encode_text(args, device, dtype)
+                # Wav2Vec + text already loaded eagerly before the loop
 
                 # Reference frames: aligned faces from LatentSync or raw video
                 if args.latentsync and latentsync_metadata is not None:
@@ -1656,6 +1817,9 @@ def main():
                         use_mouth_only_compositing=args.use_mouth_only,
                     )
 
+                if _TIMING_ENABLED:
+                    _TIMING_CURRENT["whole_generation"] = time.perf_counter() - _wg_t0
+
                 with _Stage("save_mux", use_gpu=False):
                     # Save composited video (original resolution) with audio
                     composited_path = output_path
@@ -1696,6 +1860,14 @@ def main():
             print(f"  Done: {output_path}")
           # _Stage("total_post_load") has now exited, so its timing is populated.
           if _TIMING_ENABLED:
+              ve = _TIMING_CURRENT.get("vae_encode", 0.0)
+              dn = _TIMING_CURRENT.get("denoise", 0.0)
+              vd = _TIMING_CURRENT.get("vae_decode", 0.0)
+              ae = _TIMING_CURRENT.get("audio_encode", 0.0)
+              _TIMING_CURRENT["ablation_1"] = ve + dn + vd
+              _TIMING_CURRENT["ablation_2"] = _TIMING_CURRENT.get("encode_to_decode", ve + dn + vd)
+              _TIMING_CURRENT["ablation_3"] = _TIMING_CURRENT.get("whole_generation", 0.0)
+              _TIMING_CURRENT["ablation_4"] = ae + ve + dn + vd
               _TIMING_ROWS.append(dict(_TIMING_CURRENT))
               parts = [f"{k}={_TIMING_CURRENT[k]:.3f}s" for k in _TIMING_STAGE_ORDER if k in _TIMING_CURRENT]
               print(f"  [Timing] {', '.join(parts)}")

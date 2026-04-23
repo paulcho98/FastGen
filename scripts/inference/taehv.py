@@ -272,7 +272,8 @@ class TAEHV(nn.Module):
             # this still doesn't have correct temporal alignment for certain frame counts
             # (cogvideox seems to pad at the start?), but for multiple-of-4 it's fine.
             return x
-        return x[:, self.frames_to_trim:]
+        # trim disabled — TAEHVDecoderWrapper handles trimming to match Wan's convention
+        return x
 
 class StreamingTAEHV(nn.Module):
     def __init__(self, taehv):
