@@ -131,7 +131,7 @@ app = modal.App("fastgen-redmd-inference", image=image)
 # ---------------------------------------------------------------------------
 
 @app.function(
-    gpu="H100",
+    gpu="H200",
     volumes={ASSETS: VOL},
     timeout=60 * 30,
     max_containers=4,
@@ -220,7 +220,7 @@ def main(
 
 
 @app.function(
-    gpu="H100",
+    gpu="H200",
     volumes={ASSETS: VOL},
     timeout=60 * 30,
     max_containers=4,
