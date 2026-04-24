@@ -86,11 +86,14 @@ export SKIP_EARLY_SAMPLE_LOG=1
 # Loaded via the FastGen checkpointer -> config.model.net.
 export OMNIAVATAR_DF_CKPT="${OMNIAVATAR_DF_CKPT:-/home/work/.local/hyunbin/FastGen-redmd/FASTGEN_OUTPUT/OmniAvatar-FastGen/omniavatar_df_audiofix/df_audiofix_syncnet_trained_shift_5_4gpu_bs16_lr1e5_5000iter/checkpoints/0005000.pth}"
 
-if [[ ! -f "${OMNIAVATAR_DF_CKPT}" ]]; then
+if [[ -n "${OMNIAVATAR_DF_CKPT}" && ! -f "${OMNIAVATAR_DF_CKPT}" ]]; then
     echo "ERROR: OMNIAVATAR_DF_CKPT does not exist: ${OMNIAVATAR_DF_CKPT}" >&2
     echo "       (the syncnet-trained DF run may still be in progress)" >&2
     exit 1
 fi
+# Empty OMNIAVATAR_DF_CKPT is explicitly allowed: it propagates to an empty
+# pretrained_ckpt_path, so trainer.py:82's truthy check skips load_pretrained_ckpt
+# and the student stays at the Wan-base + V2V-adapter init (pre-DF).
 
 # Teacher: mouthweight 14B step-6000 (vs default phase2 step-10500).
 export OMNIAVATAR_TEACHER_CKPT="${OMNIAVATAR_TEACHER_CKPT:-/home/work/output_omniavatar_v2v_maskall_refseq_mouth_weight_4gpu/step-6000.pt}"
