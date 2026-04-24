@@ -78,7 +78,7 @@ RESUME="${RESUME:-False}"
 export OMNIAVATAR_ROOT="${OMNIAVATAR_ROOT:-/home/work/.local/OmniAvatar}"
 export WANDB_API_KEY="${WANDB_API_KEY:-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}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export FASTGEN_OUTPUT_ROOT="/tmp/FASTGEN_SF_OUTPUT_BETA2_AUDIOFIX_TAEW_SYNCNET_MOUTHWEIGHT_FSMATCHED_LR3E6"
+export FASTGEN_OUTPUT_ROOT="${FASTGEN_OUTPUT_ROOT:-/tmp/FASTGEN_SF_OUTPUT_BETA2_AUDIOFIX_TAEW_SYNCNET_MOUTHWEIGHT_FSMATCHED_LR3E6}"
 export SKIP_GT_VAL_UPLOAD=1
 export SKIP_EARLY_SAMPLE_LOG=1
 
@@ -110,7 +110,7 @@ if [[ ! -f "${OMNIAVATAR_STUDENT_CKPT}" ]]; then
     exit 1
 fi
 
-RUN_NAME="sf_sink1_window7_redmd_audiofix_beta2_taew_syncnet_mouthweight_fsmatched_lr3e6"
+RUN_NAME="${RUN_NAME:-sf_sink1_window7_redmd_audiofix_beta2_taew_syncnet_mouthweight_fsmatched_lr3e6}"
 
 echo "============================================="
 echo "  Re-DMD beta=2 Training (audio-fix, TAEW)"
