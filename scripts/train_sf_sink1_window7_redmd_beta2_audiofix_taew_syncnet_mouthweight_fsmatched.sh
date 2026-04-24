@@ -127,6 +127,11 @@ echo "  Resume:           ${RESUME}"
 echo "============================================="
 echo ""
 
+# EXTRA_OVERRIDES (optional, space-separated key=val pairs): appended to the
+# torchrun command so sibling wrappers can toggle features without copying
+# the whole launcher. Example: EXTRA_OVERRIDES="model.reward.enabled=False"
+EXTRA_OVERRIDES="${EXTRA_OVERRIDES:-}"
+
 /home/work/.local/miniconda3/envs/hb_fastgen/bin/torchrun \
     --nproc_per_node=4 \
     train.py \
@@ -136,4 +141,5 @@ echo ""
     log_config.group="omniavatar_sf_audiofix" \
     log_config.name="${RUN_NAME}" \
     log_config.project="OmniAvatar-FastGen" \
-    log_config.wandb_entity="paulhcho"
+    log_config.wandb_entity="paulhcho" \
+    ${EXTRA_OVERRIDES}
