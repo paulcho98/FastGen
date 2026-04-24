@@ -84,7 +84,11 @@ export SKIP_EARLY_SAMPLE_LOG=1
 
 # Student DF init: final ckpt of the syncnet-trained DF run (5000 iters).
 # Loaded via the FastGen checkpointer -> config.model.net.
-export OMNIAVATAR_DF_CKPT="${OMNIAVATAR_DF_CKPT:-/home/work/.local/hyunbin/FastGen-redmd/FASTGEN_OUTPUT/OmniAvatar-FastGen/omniavatar_df_audiofix/df_audiofix_syncnet_trained_shift_5_4gpu_bs16_lr1e5_5000iter/checkpoints/0005000.pth}"
+# Note: uses ${VAR-default} (no colon) so an explicit-empty
+# OMNIAVATAR_DF_CKPT="" from a caller is PRESERVED (means "skip DF init");
+# only an unset env uses the default. ${VAR:-default} would clobber "" with
+# the default, silently re-enabling DF init.
+export OMNIAVATAR_DF_CKPT="${OMNIAVATAR_DF_CKPT-/home/work/.local/hyunbin/FastGen-redmd/FASTGEN_OUTPUT/OmniAvatar-FastGen/omniavatar_df_audiofix/df_audiofix_syncnet_trained_shift_5_4gpu_bs16_lr1e5_5000iter/checkpoints/0005000.pth}"
 
 if [[ -n "${OMNIAVATAR_DF_CKPT}" && ! -f "${OMNIAVATAR_DF_CKPT}" ]]; then
     echo "ERROR: OMNIAVATAR_DF_CKPT does not exist: ${OMNIAVATAR_DF_CKPT}" >&2
