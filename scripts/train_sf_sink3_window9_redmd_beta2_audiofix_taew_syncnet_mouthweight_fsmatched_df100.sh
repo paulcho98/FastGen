@@ -14,12 +14,10 @@
 #    permanent-visible anchor frames may help long-sequence coherence and
 #    identity stability under sync-C reward pressure.
 #
-# Caveat: the DF student was trained with sink=1/window=7 mask, so the
-# weights were optimised for a different attention pattern than this SF
-# training will use. With FlexAttention + dynamic RoPE the mask changes at
-# runtime without architectural mismatch, but the DF init is still a
-# somewhat off-distribution starting point. Monitor the first ~100 SF iters
-# for instability.
+# The DF student saw (sink=3, window=9) attention as one of the 5
+# stochastic configs during training (config_df_shift_5.py:62), so the
+# weights are already exposed to this attention pattern — no dedicated
+# specialization required.
 #
 # For inference on checkpoints from this run, remember to also switch
 # --sink_size and --local_attn_size to 3 and 9 respectively (the existing
@@ -41,7 +39,11 @@
 
 set -euo pipefail
 
-# DF init: step-100 of the 100-iter DF recovery run.
+# DF init: step-100 of the (stochastic-attention) 100-iter DF run.
+# The DF training samples uniformly from 5 attention configs at each step,
+# one of which is exactly (sink=3, window=9). So the DF student already
+# saw this mode during training (1/5 of the time) — no dedicated DF
+# specialization needed for this attention config.
 export OMNIAVATAR_DF_CKPT="${OMNIAVATAR_DF_CKPT-/home/work/.local/hyunbin/FastGen-redmd/FASTGEN_OUTPUT/OmniAvatar-FastGen/omniavatar_df_audiofix/df_audiofix_syncnet_trained_shift_5_4gpu_bs16_lr1e5_100iter/checkpoints/0000100.pth}"
 
 # Distinct output dir and wandb run name (_df100_sink3_window9 suffix).
