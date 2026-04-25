@@ -10,6 +10,8 @@ import time
 from typing import Optional, Dict, Callable, TYPE_CHECKING
 import gc
 
+import numpy as np
+
 
 import torch
 import torchvision
@@ -208,6 +210,35 @@ def _to_wandb_with_audio(
     )
 
 
+def _load_audio_waveform(audio_path: str, target_sr: int = 16000, num_frames: int = 81, fps: float = 25.0) -> Optional[torch.Tensor]:
+    """Load audio waveform from .wav for SyncCScorer. Returns [L] float32 tensor or None."""
+    if not audio_path or not os.path.isfile(audio_path):
+        return None
+    try:
+        import scipy.io.wavfile as wavfile
+        from scipy import signal
+        sr, wav = wavfile.read(audio_path)
+        if wav.dtype == np.int16:
+            wav = wav.astype(np.float32) / 32768.0
+        elif wav.dtype != np.float32:
+            wav = wav.astype(np.float32)
+        wav = torch.from_numpy(wav)
+        if wav.ndim == 2:
+            wav = wav.mean(dim=1)
+        if sr != target_sr:
+            num_samples_new = int(len(wav) * target_sr / sr)
+            wav = torch.from_numpy(signal.resample(wav.numpy(), num_samples_new))
+        target_length = int(num_frames / fps * target_sr)
+        if wav.shape[0] < target_length:
+            wav = torch.nn.functional.pad(wav, (0, target_length - wav.shape[0]))
+        else:
+            wav = wav[:target_length]
+        return wav.to(torch.float32)
+    except Exception as e:
+        logger.warning(f"[SyncEval] Failed to load audio from {audio_path}: {e}")
+        return None
+
+
 @rank0_only
 def init_wandb(config: BaseConfig):
     # wandb login
@@ -319,6 +350,9 @@ class WandbCallback(Callback):
         sample_logging_iter: Optional[int] = None,
         vid_format: str = "mp4",
         fps: int = 16,
+        syncnet_checkpoint_path: Optional[str] = None,
+        syncnet_vshift: int = 15,
+        syncnet_audio_sr: int = 16000,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -331,6 +365,11 @@ class WandbCallback(Callback):
         self._val_audio_paths: list[str | None] = []
         self.vid_format = vid_format
         self.fps = fps
+        self.syncnet_checkpoint_path = syncnet_checkpoint_path
+        self.syncnet_vshift = syncnet_vshift
+        self.syncnet_audio_sr = syncnet_audio_sr
+        self._syncnet_scorer = None
+        self._val_sync_c_scores: list[float] = []
         self.loss_dict_record = _LossDictRecord()
         self.val_loss_dict_record = _LossDictRecord()
 
@@ -344,6 +383,27 @@ class WandbCallback(Callback):
         if self.sample_logging_iter is None:
             self.sample_logging_iter = self.config.trainer.logging_iter
         synchronize()
+
+    def _get_syncnet_scorer(self):
+        if self._syncnet_scorer is not None:
+            return self._syncnet_scorer
+        if not self.syncnet_checkpoint_path:
+            return None
+        try:
+            from fastgen.methods.reward.sync_c_scorer import SyncCScorer
+            self._syncnet_scorer = SyncCScorer(
+                checkpoint_path=self.syncnet_checkpoint_path,
+                input_fps=25.0,
+                audio_sample_rate=self.syncnet_audio_sr,
+                vshift=self.syncnet_vshift,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                dtype=torch.float32,
+            )
+            logger.info(f"[WandbCallback] Loaded SyncCScorer from {self.syncnet_checkpoint_path}")
+        except Exception as e:
+            logger.warning(f"[WandbCallback] Failed to load SyncCScorer: {e}")
+            self.syncnet_checkpoint_path = None
+        return self._syncnet_scorer
 
     def on_dataloader_init_end(
         self, model: FastGenModel, dataloader_train, dataloader_val, iteration: int = 0
@@ -659,6 +719,23 @@ class WandbCallback(Callback):
                         audio_path = ap[0] if os.path.isfile(ap[0]) else None
                 self._val_audio_paths.append(audio_path)
 
+                # SyncNet-v2 evaluation on generated video
+                scorer = self._get_syncnet_scorer()
+                if scorer is not None and audio_path is not None:
+                    try:
+                        audio_wav = _load_audio_waveform(
+                            audio_path, target_sr=self.syncnet_audio_sr,
+                        )
+                        if audio_wav is not None:
+                            pixels = gen_decoded.clamp(-1.0, 1.0)
+                            u8 = ((pixels + 1.0) * 127.5).to(torch.uint8)
+                            face_frames = u8[0].permute(1, 0, 2, 3).contiguous()  # [T, 3, H, W]
+                            sync_c = scorer._score_single(face_frames, audio_wav)
+                            self._val_sync_c_scores.append(sync_c.item())
+                            logger.info(f"[SyncEval] val sample {step}: sync_c={sync_c.item():.3f}")
+                    except Exception as e:
+                        logger.warning(f"[SyncEval] Failed on val sample {step}: {e}")
+
             synchronize()
             gc.collect()
             torch.cuda.empty_cache()
@@ -670,17 +747,27 @@ class WandbCallback(Callback):
             gt_list = []
             for i, (gen_v, gt_v) in enumerate(zip(self._val_gen_videos, self._val_gt_videos)):
                 ap = self._val_audio_paths[i] if i < len(self._val_audio_paths) else None
+                caption = None
+                if i < len(self._val_sync_c_scores):
+                    caption = f"sync_c={self._val_sync_c_scores[i]:.3f}"
                 if ap:
-                    gen_list.append(tensor_to_wandb_video_with_audio(gen_v, ap, fps=self.fps))
+                    gen_list.append(tensor_to_wandb_video_with_audio(gen_v, ap, fps=self.fps, caption=caption))
                     gt_list.append(tensor_to_wandb_video_with_audio(gt_v, ap, fps=self.fps))
                 else:
-                    gen_list.append(wandb.Video(gen_v[0].numpy(), fps=self.fps, format="mp4"))
+                    gen_list.append(wandb.Video(gen_v[0].numpy(), fps=self.fps, format="mp4", caption=caption))
                     gt_list.append(wandb.Video(gt_v[0].numpy(), fps=self.fps, format="mp4"))
             wandb.log({
                 f"val{idx}/generated": gen_list,
                 f"val{idx}/reconstructed": gt_list,
             }, step=iteration)
             logger.info(f"Logged {len(self._val_gen_videos)} val videos at iteration {iteration}")
+            if self._val_sync_c_scores:
+                mean_sync_c = sum(self._val_sync_c_scores) / len(self._val_sync_c_scores)
+                wandb.log({f"val{idx}/sync_c_mean": mean_sync_c}, step=iteration)
+                for i, sc in enumerate(self._val_sync_c_scores):
+                    wandb.log({f"val{idx}/sync_c_sample_{i}": sc}, step=iteration)
+                logger.info(f"[SyncEval] val{idx} mean sync_c: {mean_sync_c:.3f} (n={len(self._val_sync_c_scores)})")
         self._val_gen_videos = []
         self._val_gt_videos = []
         self._val_audio_paths = []
+        self._val_sync_c_scores = []
