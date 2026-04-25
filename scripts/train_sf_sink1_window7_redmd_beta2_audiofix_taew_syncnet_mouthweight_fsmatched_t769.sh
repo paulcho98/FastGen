@@ -43,6 +43,15 @@
 
 set -euo pipefail
 
+# DF init from the schedule-matched DF run (t_list=[0.999, 0.769, 0.0],
+# student_sample_steps=2 — see config_df_shift_5_t769.py and
+# train_omniavatar_df_shift_5_t769_audiofix_syncnet_trained.sh). This DF
+# student was trained on exactly the same 2 noise levels SF inference uses,
+# so there's no train/test mismatch on the noise schedule.
+# Falls back to env override if you want to test against the standard
+# 4-step DF-5000 ckpt for comparison.
+export OMNIAVATAR_DF_CKPT="${OMNIAVATAR_DF_CKPT-/home/work/.local/hyunbin/FastGen-redmd/FASTGEN_OUTPUT/OmniAvatar-FastGen/omniavatar_df_audiofix/df_audiofix_syncnet_trained_shift_5_t769_4gpu_bs16_lr1e5_5000iter/checkpoints/0005000.pth}"
+
 # Distinct output dir and wandb run name.
 export FASTGEN_OUTPUT_ROOT="${FASTGEN_OUTPUT_ROOT:-/tmp/FASTGEN_SF_OUTPUT_BETA2_AUDIOFIX_TAEW_SYNCNET_MOUTHWEIGHT_FSMATCHED_T769}"
 export RUN_NAME="${RUN_NAME:-sf_sink1_window7_redmd_audiofix_beta2_taew_syncnet_mouthweight_fsmatched_t769}"

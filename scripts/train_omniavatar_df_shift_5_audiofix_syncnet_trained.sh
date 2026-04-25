@@ -49,7 +49,9 @@ if [[ ! -f "${OMNIAVATAR_STUDENT_CKPT}" ]]; then
 fi
 
 EFFECTIVE_BS=$((BATCH_SIZE * NGPU))
-RUN_NAME="df_audiofix_syncnet_trained_shift_5_${NGPU}gpu_bs${BATCH_SIZE}_lr1e5_${MAX_ITER}iter"
+# RUN_NAME (optional override): wrappers can set a custom name to avoid
+# colliding with default-named runs (e.g. _t769 schedule variant).
+RUN_NAME="${RUN_NAME:-df_audiofix_syncnet_trained_shift_5_${NGPU}gpu_bs${BATCH_SIZE}_lr1e5_${MAX_ITER}iter}"
 
 echo "============================================="
 echo "  OmniAvatar DF shift=5 (audio-fix, syncnet-trained init)"
@@ -67,10 +69,15 @@ echo "  Resume:          ${RESUME}"
 echo "============================================="
 echo ""
 
+# CONFIG_PATH (optional): override the train-config Python file. Useful for
+# variants with different sample_t_cfg / student_sample_steps (e.g.
+# config_df_shift_5_t769.py for the 2-step SF schedule).
+CONFIG_PATH="${CONFIG_PATH:-fastgen/configs/experiments/OmniAvatar/config_df_shift_5.py}"
+
 /home/work/.local/miniconda3/envs/hb_fastgen/bin/torchrun \
     --nproc_per_node=${NGPU} \
     train.py \
-    --config=fastgen/configs/experiments/OmniAvatar/config_df_shift_5.py \
+    --config=${CONFIG_PATH} \
     - dataloader_train.batch_size=${BATCH_SIZE} \
     trainer.ddp=True \
     trainer.max_iter=${MAX_ITER} \
