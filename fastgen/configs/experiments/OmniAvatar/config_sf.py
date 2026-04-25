@@ -199,6 +199,7 @@ def create_config():
     # Wandb sample logging (video generation) every 100 steps, aligned with validation
     config.trainer.callbacks.wandb.sample_logging_iter = 100
     config.trainer.callbacks.wandb.fps = 25  # OmniAvatar is 25 fps
+    config.trainer.callbacks.wandb.syncnet_checkpoint_path = "/home/work/.local/eval_metrics/checkpoints/auxiliary/syncnet_v2.model"
 
     config.log_config.group = "omniavatar_sf"
     config.log_config.wandb_entity = "paulhcho"
