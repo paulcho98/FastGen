@@ -95,11 +95,16 @@ export RUN_NAME="${RUN_NAME:-df_audiofix_syncnet_trained_shift_5_14b_${NGPU}gpu_
 # Build EXTRA_OVERRIDES from the env-toggled GRAD_ACCUM.  Appended last on
 # the parent's torchrun cmdline so it wins on conflict.  Includes:
 #   - DDP -> FSDP flip (parent hardcodes trainer.ddp=True earlier)
-#   - grad_accum on both `trainer` and `model` (the config sets both;
-#     we override both on the cmdline)
+#   - trainer.grad_accum_rounds (the only one trainer.py reads for the DF
+#     accumulation loop; see fastgen/trainer.py:185 / :309)
+# We do NOT add `model.grad_accum_rounds` here — it's only used by SF's
+# fake_score loss scaling (omniavatar_self_forcing.py:60) and isn't a
+# declared field in the model attrs schema, so OmegaConf rejects it on
+# the cmdline.  The config file's `config.model.grad_accum_rounds = 4`
+# line is a no-op for DF and is harmless.
 # If you set EXTRA_OVERRIDES in env, your value wins entirely (this default
 # is skipped).
-export EXTRA_OVERRIDES="${EXTRA_OVERRIDES:-trainer.ddp=False trainer.fsdp=True trainer.grad_accum_rounds=${GRAD_ACCUM} model.grad_accum_rounds=${GRAD_ACCUM}}"
+export EXTRA_OVERRIDES="${EXTRA_OVERRIDES:-trainer.ddp=False trainer.fsdp=True trainer.grad_accum_rounds=${GRAD_ACCUM}}"
 
 echo "============================================="
 echo "  14B DF FSDP launch settings"
