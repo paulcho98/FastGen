@@ -77,7 +77,18 @@ def create_config():
     # don't lose precision). Non-sharded modules get cast to bf16 too.
     config.model.precision = "bfloat16"
     config.model.precision_fsdp = "float32"
-    config.model.fsdp_meta_init = True
+    # Meta-init disabled: OmniAvatar's wan_model stores RoPE as a Python attr
+    # (`self._core.freqs = precompute_freqs_cis_3d(...)` in wan_model.py:305),
+    # not a registered buffer, and the (Causal)OmniAvatarWan classes don't
+    # implement `reset_parameters()`. With fsdp_meta_init=True, ranks 1+
+    # build freqs as meta complex tensors at construction; the FSDP wrap
+    # path's `to_empty` and state_dict broadcast both skip Python attrs, so
+    # the first forward's `freqs.to(cuda)` would allocate uninitialized GPU
+    # memory on non-rank-0 ranks => garbage RoPE => training broken from
+    # iter 1.  All SF configs leave this False (default) for the same
+    # reason; we follow suit here. Cost: 4x host RAM at construction (~120
+    # GB across 4 ranks for fp32 14B), well within the host's capacity.
+    config.model.fsdp_meta_init = False
 
     # ---- Effective batch 16 = 1/GPU * 4 GPUs * grad_accum 4 ----
     # Wrapper overrides BATCH_SIZE on the cmdline; we set grad_accum here.

@@ -2148,19 +2148,31 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
     def fully_shard(self, **kwargs):
         """Fully shard the network for FSDP2.
 
-        Shards ``self._core`` (a plain ``nn.Module``) instead of ``self`` because
-        the wrapper class inherits from ``ABC`` via
-        ``CausalFastGenNetwork -> FastGenNetwork(ABC)``, which causes FSDP2's
-        ``__class__`` assignment to fail.  This is the same pattern as FastGen's
-        ``Wan/network.py`` which shards ``self.transformer``.
+        We do NOT root-wrap ``self._core`` (the bidirectional ``OmniAvatarWan``
+        does ``fully_shard(self.model, **kwargs)`` because its forward calls
+        ``self.model(...)`` once, triggering the all-gather hook on entry).
+        Our forward instead walks ``_core``'s submodules manually via property
+        accessors (``self.patch_embedding(x)``, ``self.audio_proj(audio)``,
+        ``self.head(x)``, etc.), so the hook on ``_core.__call__`` would never
+        fire — the submodules' params would stay DTensor while the inputs are
+        regular Tensor, producing "mixed Tensor and DTensor" errors.
 
-        We do NOT use ``apply_fsdp_checkpointing`` (checkpoint_wrapper) because
-        the causal blocks have dynamic KV cache / FlexAttention state that causes
-        tensor-count mismatches between forward and recomputation.  Instead, the
-        existing manual ``torch.utils.checkpoint.checkpoint`` calls in
-        ``_forward_full_sequence`` and ``_forward_ar`` handle activation
-        checkpointing correctly by controlling which kwargs reach each block.
-        This matches the reference Self-Forcing implementation's approach.
+        Solution: wrap each submodule that's called via the property layer
+        individually.  Each submodule's own ``__call__`` then carries an
+        all-gather/reduce-scatter hook, mirroring what root-wrapping achieves
+        for the bidirectional class.  This is what guarantees gradients on
+        ``audio_proj``, ``audio_cond_projs[i]``, ``patch_embedding``, etc. are
+        reduce-scattered across ranks like the block params — without this,
+        only the FSDP-wrapped blocks sync their grads, and non-block params
+        drift across ranks each step (since ``trainer.fsdp=True`` precludes
+        DDP, and DDP is the only thing that would otherwise sync them).
+
+        Re. activation checkpointing: we do NOT use ``apply_fsdp_checkpointing``
+        (checkpoint_wrapper) because the causal blocks have dynamic KV cache /
+        FlexAttention state that causes tensor-count mismatches between forward
+        and recomputation.  The manual ``torch.utils.checkpoint.checkpoint``
+        calls in ``_forward_full_sequence`` and ``_forward_ar`` handle this
+        correctly by controlling which kwargs reach each block.
         """
         if self._use_gradient_checkpointing:
             logger.info(
@@ -2168,23 +2180,31 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
                 "(not using apply_fsdp_checkpointing due to KV cache dynamics)"
             )
 
-        # Shard each CausalDiTBlock (>95% of params). We do NOT shard self._core
-        # as a whole because FSDP2 converts all params to DTensor, which breaks
-        # the property-based access pattern (self.patch_embedding, etc.) that
-        # forward methods use — the input Tensor and DTensor weight mix causes
-        # "mixed Tensor and DTensor" errors.  Block-level sharding is sufficient
-        # for memory savings (same as reference Self-Forcing FSDP1 pattern).
+        # Shard each CausalDiTBlock (>95% of params).
         for block in self._core.blocks:
             fully_shard(block, **kwargs)
 
-        # Cast non-sharded modules to compute precision (bf16).
-        # on_train_begin casts everything to precision_fsdp (float32) for FSDP's
-        # optimizer precision. But non-sharded modules (patch_embedding, embeddings,
-        # head, audio) are called directly in forward — they must match the input
-        # dtype (bf16). FSDP1 handles this via unshard hooks; FSDP2 with per-block
-        # sharding doesn't, so we cast them explicitly.
-        compute_dtype = self._default_dtype  # bf16
-        for name, module in self._core.named_children():
-            if name != "blocks":  # blocks are FSDP-wrapped, leave them alone
-                module.to(dtype=compute_dtype)
-                logger.debug(f"Cast non-sharded module '{name}' to {compute_dtype}")
+        # Wrap each non-block submodule that the forward path invokes via a
+        # property accessor.  Without these wraps, the listed modules would
+        # remain plain nn.Parameter on every rank, get rank-local gradients
+        # without any all-reduce, and drift across ranks each optimizer step.
+        # See network_causal.py:1554 (patch_embedding), :1233 (audio_proj),
+        # :1241 (audio_cond_projs[i]), and the property accessors at :1062-:1080.
+        fully_shard(self._core.patch_embedding, **kwargs)
+        fully_shard(self._core.text_embedding, **kwargs)
+        fully_shard(self._core.time_embedding, **kwargs)
+        fully_shard(self._core.time_projection, **kwargs)
+        fully_shard(self._core.head, **kwargs)
+        if hasattr(self._core, "audio_proj"):
+            fully_shard(self._core.audio_proj, **kwargs)
+        if hasattr(self._core, "audio_cond_projs"):
+            # ModuleList itself has no forward; we wrap each Linear because
+            # forward calls each one individually via `proj(audio_emb)`.
+            for proj in self._core.audio_cond_projs:
+                fully_shard(proj, **kwargs)
+
+        # No explicit bf16 cast loop — the MixedPrecisionPolicy passed via
+        # **kwargs (param_dtype=bfloat16) handles compute-dtype casting on
+        # all FSDP-wrapped modules during their unshard hook, so every
+        # submodule wrapped above will run in bf16 in forward and store
+        # fp32 master weights for the optimizer.
