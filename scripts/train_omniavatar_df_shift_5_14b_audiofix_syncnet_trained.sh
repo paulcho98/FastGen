@@ -36,10 +36,25 @@
 # Resume:
 #   RESUME=True bash scripts/train_omniavatar_df_shift_5_14b_audiofix_syncnet_trained.sh
 #
-# Override effective batch (if you need to drop to 8 due to OOM, or push
-# to 32 if H200s have headroom):
-#   EXTRA_OVERRIDES="trainer.ddp=False trainer.fsdp=True trainer.grad_accum_rounds=2 model.grad_accum_rounds=2" \
-#     bash scripts/...14b_audiofix_syncnet_trained.sh
+# Override effective batch via env vars (cleaner than hand-crafting
+# EXTRA_OVERRIDES — the wrapper builds the override string from
+# BATCH_SIZE and GRAD_ACCUM):
+#
+#   # Default: per-GPU 1, grad_accum 4 -> effective 16, ~70-90 GB peak/GPU
+#   bash scripts/train_omniavatar_df_shift_5_14b_audiofix_syncnet_trained.sh
+#
+#   # Faster (10-20% wall-clock) but tighter memory (~85-120 GB peak/GPU,
+#   # OOM risk): per-GPU 2, grad_accum 2 -> effective 16
+#   BATCH_SIZE=2 GRAD_ACCUM=2 bash scripts/...14b_audiofix_syncnet_trained.sh
+#
+#   # Effective batch 8 (drop if first run OOMs even at default): per-GPU
+#   # 1, grad_accum 2
+#   GRAD_ACCUM=2 bash scripts/...14b_audiofix_syncnet_trained.sh
+#
+# Recommendation: start at the default (1 x 4) for the first FSDP run on
+# the causal class at 14B scale.  After iter 50, peak memory is realized;
+# read it from `nvidia-smi`, and if there's >40 GB headroom on every rank,
+# a follow-up run at BATCH_SIZE=2 GRAD_ACCUM=2 is safe and ~10-20% faster.
 # =============================================================================
 
 set -euo pipefail
@@ -47,9 +62,15 @@ set -euo pipefail
 # Use the 14B-specialized config.
 export CONFIG_PATH="fastgen/configs/experiments/OmniAvatar/config_df_shift_5_14b.py"
 
-# Per-GPU batch 1 (vs 16 for 1.3B). With NGPU=4 and grad_accum_rounds=4 in
-# config, effective batch = 1*4*4 = 16.
+# Per-GPU batch 1 (vs 16 for 1.3B). With NGPU=4 and GRAD_ACCUM=4,
+# effective batch = 1*4*4 = 16.  Override via BATCH_SIZE env.
 export BATCH_SIZE="${BATCH_SIZE:-1}"
+
+# Gradient accumulation rounds.  Default 4 (matches config_df_shift_5_14b.py
+# default).  Override here so the wrapper can also reach down into both
+# trainer.grad_accum_rounds and model.grad_accum_rounds via cmdline (the
+# config sets both; we mirror that on the override path).
+GRAD_ACCUM="${GRAD_ACCUM:-4}"
 
 # Save cadence: every 500 iters. Pairs with strip_optim_watcher.sh — that
 # helper strips _optim/ shards from non-latest saves once a strictly-greater
@@ -62,20 +83,36 @@ export SAVE_EVERY="${SAVE_EVERY:-500}"
 export VIZ_EVERY="${VIZ_EVERY:-${SAVE_EVERY}}"
 
 # Distinct RUN_NAME so the output dir does NOT collide with the 1.3B runs.
-# MAX_ITER=3000 default for 14B (vs 5000 for 1.3B) — see header for disk
-# math; bump back to 5000 only after enabling external storage or
-# implementing bf16-state save format.
+# Includes BATCH_SIZE and GRAD_ACCUM in the name so different effective-batch
+# variants land in distinct dirs.  MAX_ITER=3000 default for 14B (vs 5000
+# for 1.3B) — see header for disk math; bump back to 5000 only after
+# enabling external storage or implementing bf16-state save format.
 NGPU="${NGPU:-4}"
 MAX_ITER="${MAX_ITER:-3000}"
-export RUN_NAME="${RUN_NAME:-df_audiofix_syncnet_trained_shift_5_14b_${NGPU}gpu_bs${BATCH_SIZE}_grad4_lr1e5_${MAX_ITER}iter}"
+EFFECTIVE_BATCH=$((BATCH_SIZE * NGPU * GRAD_ACCUM))
+export RUN_NAME="${RUN_NAME:-df_audiofix_syncnet_trained_shift_5_14b_${NGPU}gpu_bs${BATCH_SIZE}_grad${GRAD_ACCUM}_eff${EFFECTIVE_BATCH}_lr1e5_${MAX_ITER}iter}"
 
-# Flip DDP -> FSDP. Order matters: parent's torchrun cmdline has
-# `trainer.ddp=True` baked in; this EXTRA_OVERRIDES is appended AFTER it,
-# so the later trainer.ddp=False wins.
-# (trainer.fsdp=True is also set by config_df_shift_5_14b.py, but include
-# it here too as belt-and-suspenders against any cmdline override that
-# might re-set it.)
-export EXTRA_OVERRIDES="${EXTRA_OVERRIDES:-trainer.ddp=False trainer.fsdp=True}"
+# Build EXTRA_OVERRIDES from the env-toggled GRAD_ACCUM.  Appended last on
+# the parent's torchrun cmdline so it wins on conflict.  Includes:
+#   - DDP -> FSDP flip (parent hardcodes trainer.ddp=True earlier)
+#   - grad_accum on both `trainer` and `model` (the config sets both;
+#     we override both on the cmdline)
+# If you set EXTRA_OVERRIDES in env, your value wins entirely (this default
+# is skipped).
+export EXTRA_OVERRIDES="${EXTRA_OVERRIDES:-trainer.ddp=False trainer.fsdp=True trainer.grad_accum_rounds=${GRAD_ACCUM} model.grad_accum_rounds=${GRAD_ACCUM}}"
+
+echo "============================================="
+echo "  14B DF FSDP launch settings"
+echo "============================================="
+echo "  Per-GPU batch:    ${BATCH_SIZE}"
+echo "  GPUs:             ${NGPU}"
+echo "  Grad accum:       ${GRAD_ACCUM}"
+echo "  Effective batch:  ${EFFECTIVE_BATCH}  (= ${BATCH_SIZE} x ${NGPU} x ${GRAD_ACCUM})"
+echo "  Max iter:         ${MAX_ITER}"
+echo "  Save every:       ${SAVE_EVERY}"
+echo "  Run name:         ${RUN_NAME}"
+echo "  EXTRA_OVERRIDES:  ${EXTRA_OVERRIDES}"
+echo "============================================="
 
 # Delegate to the parent (passes NGPU/MAX_ITER/SAVE_EVERY/RESUME through env).
 exec "$(dirname "$(readlink -f "$0")")/train_omniavatar_df_shift_5_audiofix_syncnet_trained.sh" "$@"
