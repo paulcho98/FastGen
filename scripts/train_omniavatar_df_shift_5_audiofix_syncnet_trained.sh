@@ -74,6 +74,12 @@ echo ""
 # config_df_shift_5_t769.py for the 2-step SF schedule).
 CONFIG_PATH="${CONFIG_PATH:-fastgen/configs/experiments/OmniAvatar/config_df_shift_5.py}"
 
+# EXTRA_OVERRIDES (optional): space-separated key=val pairs appended to the
+# torchrun command. Order matters: cmdline keys before this win on conflict;
+# anything in EXTRA_OVERRIDES wins over earlier cmdline entries. Used by the
+# 14B wrapper to flip trainer.ddp=False trainer.fsdp=True.
+EXTRA_OVERRIDES="${EXTRA_OVERRIDES:-}"
+
 /home/work/.local/miniconda3/envs/hb_fastgen/bin/torchrun \
     --nproc_per_node=${NGPU} \
     train.py \
@@ -86,4 +92,5 @@ CONFIG_PATH="${CONFIG_PATH:-fastgen/configs/experiments/OmniAvatar/config_df_shi
     log_config.group="omniavatar_df_audiofix" \
     log_config.name="${RUN_NAME}" \
     log_config.project="OmniAvatar-FastGen" \
-    log_config.wandb_entity="paulhcho"
+    log_config.wandb_entity="paulhcho" \
+    ${EXTRA_OVERRIDES}
