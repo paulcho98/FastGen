@@ -209,6 +209,16 @@ class ModelWrapper(Stateful):
 
     def __init__(self, model: torch.nn.Module, options: StateDictOptions | None = None):
         self.model = model
+        # Default to strict=False so partial-state saves (e.g., LoRA +
+        # selective-unfreeze runs that filter to trainable params only at
+        # save time, see FSDPCheckpointer.save) can be loaded back without
+        # PyTorch raising on missing frozen-base keys.  The frozen base
+        # values are filled in during model construction (load base
+        # safetensors + V2V mouthweight ckpt), so a strict=False load just
+        # leaves them at their construction-time values — which is exactly
+        # what we want for resume / inference.
+        if options is None:
+            options = StateDictOptions(strict=False)
         self.options = options
 
     def state_dict(self) -> Dict[str, Any]:
@@ -304,8 +314,31 @@ class FSDPCheckpointer(Checkpointer):
         # fsdp should save on all ranks
         for k, v in model_dict.items():
             model_state_dict = ModelWrapper(model=v).state_dict()
+            # Filter to params with requires_grad=True (trainable-only) when
+            # partial-freeze is in effect.  No-op for full-FT runs (where
+            # every param has requires_grad=True; the filter keeps everything).
+            # For LoRA + selective-unfreeze runs at 14B, this collapses save
+            # size from ~56 GB (full base) to ~5 GB (LoRA + unfreeze).
+            #
+            # Non-parameter state (registered buffers, module-level Tensors
+            # that aren't nn.Parameters) is preserved — only nn.Parameters
+            # are filtered.  ``v.named_parameters()`` enumerates only
+            # parameters; anything else in ``model_state_dict`` is kept.
+            params_dict = dict(v.named_parameters())
+            filtered = {
+                key: tensor
+                for key, tensor in model_state_dict.items()
+                if key not in params_dict or params_dict[key].requires_grad
+            }
+            n_kept = len(filtered)
+            n_total = len(model_state_dict)
+            if n_kept < n_total:
+                logger.info(
+                    f"[FSDPCheckpointer] {k}_model: saving {n_kept}/{n_total} state-dict "
+                    f"entries (filtered out {n_total - n_kept} frozen-param entries)"
+                )
             storage_writer = self.get_storage_writer(checkpoint_path=f"{path}.{k}_model")
-            dcp.save(model_state_dict, storage_writer=storage_writer)
+            dcp.save(filtered, storage_writer=storage_writer)
 
         if optimizer_dict is not None:
             for k, v in optimizer_dict.items():
