@@ -1109,6 +1109,64 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
     def audio_cond_projs(self):
         return self._core.audio_cond_projs if hasattr(self._core, 'audio_cond_projs') else None
 
+    def apply_lora_freeze(self) -> None:
+        """Re-apply PEFT's "only LoRA + selective-unfreeze trainable" freeze.
+
+        FastGenModel.build_model (in fastgen/methods/model.py:260) does
+        ``self.net.train().requires_grad_(True)`` unconditionally after
+        instantiating the network, which destroys the freeze that PEFT's
+        ``inject_adapter_in_model`` set up inside ``_load_weights``.  That
+        means by the time the optimizer is constructed (which filters on
+        ``requires_grad``), every parameter looks trainable — including the
+        ~14B base 14B Wan weights — so Adam state is allocated for the
+        entire model and the LoRA + selective-unfreeze regime is silently
+        downgraded to plain full fine-tuning.
+
+        This method is the recovery hook: callers (the OmniAvatar method
+        classes' overridden ``build_model``) invoke it after super to
+        restore the intended freeze.  The logic mirrors PEFT's
+        ``LoraModel._mark_only_adapters_as_trainable`` (freeze every param
+        whose name does not contain the ``"lora_"`` prefix) and then
+        re-applies ``_apply_unfreeze`` for the user-listed submodules.
+
+        Idempotent and safe to call repeatedly.  No-op when:
+        - ``self.merge_lora=True`` (full FT mode, no LoRA layers exist)
+        - PEFT injection didn't actually run (``_load_weights`` took the
+          ``merge_lora=False`` path but the loaded checkpoint contained no
+          LoRA keys; ``_load_weights`` already warned about this case)
+        """
+        if self.merge_lora:
+            return  # full FT mode; no LoRA layers to gate around
+
+        # If no params have the "lora_" prefix, PEFT injection never ran
+        # (see the warning branch in _load_weights for merge_lora=False with
+        # an empty lora_sd).  Re-freezing the base in that case would leave
+        # the model with NOTHING trainable, which is worse than the current
+        # state — bail out and let the optimizer pick up whatever the user
+        # actually has.
+        has_lora = any("lora_" in n for n, _ in self.named_parameters())
+        if not has_lora:
+            return
+
+        n_lora = 0
+        n_frozen = 0
+        for name, param in self.named_parameters():
+            if "lora_" in name:
+                param.requires_grad_(True)
+                n_lora += param.numel()
+            else:
+                param.requires_grad_(False)
+                n_frozen += param.numel()
+
+        # Re-apply the user's selective unfreeze on top of the freeze.
+        self._apply_unfreeze(self.unfreeze_modules)
+
+        logger.info(
+            f"[CausalOmniAvatarWan] apply_lora_freeze: LoRA {n_lora/1e6:.2f}M "
+            f"trainable, base {n_frozen/1e6:.2f}M frozen, then "
+            f"unfreeze_modules re-enabled on top"
+        )
+
     def _apply_unfreeze(self, unfreeze_modules: List[str]) -> None:
         """Re-enable ``requires_grad`` on parameters of specific submodules.
 

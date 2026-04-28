@@ -133,3 +133,181 @@ def test_apply_unfreeze_is_callable():
     from fastgen.networks.OmniAvatar.network_causal import CausalOmniAvatarWan
 
     assert callable(CausalOmniAvatarWan._apply_unfreeze)
+
+
+def test_apply_lora_freeze_is_callable():
+    """Confirm the freeze recovery hook is bound to the real class.
+
+    apply_lora_freeze is the recovery method called by
+    OmniAvatarDiffusionForcingModel.build_model after super wipes
+    requires_grad. It needs to exist on the real class.
+    """
+    from fastgen.networks.OmniAvatar.network_causal import CausalOmniAvatarWan
+
+    assert callable(CausalOmniAvatarWan.apply_lora_freeze)
+
+
+# --- apply_lora_freeze behavior tests on a CPU-only fixture --------------
+#
+# These tests exercise the exact wipe-then-recover cycle that
+# FastGenModel.build_model:260 + OmniAvatarDiffusionForcingModel.build_model
+# triggers. We bind the real CausalOmniAvatarWan.apply_lora_freeze method
+# onto a tiny dummy fixture so we don't need to construct the full 14B
+# model (which requires GPU + heavy weight loading).
+
+
+class _DummyLoraHost(nn.Module):
+    """Stand-in for a PEFT-injected CausalOmniAvatarWan.
+
+    Carries the same attributes apply_lora_freeze inspects:
+      - merge_lora flag
+      - unfreeze_modules list
+      - parameters whose names contain ``"lora_"`` (mimicking PEFT's
+        injected adapters) plus parameters that don't (mimicking the
+        frozen base + the explicitly-unfreezable submodules).
+    """
+
+    def __init__(self, merge_lora=False, unfreeze_modules=None):
+        super().__init__()
+        self.merge_lora = merge_lora
+        self.unfreeze_modules = list(unfreeze_modules) if unfreeze_modules else []
+
+        self._core = nn.Module()
+        # Fake "blocks" with base + LoRA A/B params (mimic PEFT-injected layout).
+        self._core.blocks = nn.ModuleList(
+            [_make_lora_injected_linear(dim=8, rank=4) for _ in range(2)]
+        )
+        # Non-block submodules — these are the user-listed unfreeze targets.
+        self._core.audio_proj = nn.Linear(4, 8)
+        self._core.audio_cond_projs = nn.ModuleList([nn.Linear(8, 8), nn.Linear(8, 8)])
+        self._core.patch_embedding = nn.Linear(16, 8)
+
+
+def _make_lora_injected_linear(dim, rank):
+    """A nn.Module shaped like PEFT's LoraLinear for testing.
+
+    The naming convention mirrors PEFT (parameters with "lora_" in their
+    name should be treated as trainable adapter weights, all others as
+    frozen base) — apply_lora_freeze relies on that prefix.
+    """
+    mod = nn.Module()
+    # Frozen base (PEFT's `base_layer`).
+    mod.base_layer = nn.Linear(dim, dim)
+    # Trainable LoRA adapters — the names must contain "lora_" so
+    # apply_lora_freeze identifies them.
+    mod.lora_A = nn.Linear(dim, rank, bias=False)
+    mod.lora_B = nn.Linear(rank, dim, bias=False)
+    return mod
+
+
+def _bind_apply_lora_freeze(host):
+    """Attach the real CausalOmniAvatarWan methods to the dummy host."""
+    from fastgen.networks.OmniAvatar.network_causal import CausalOmniAvatarWan
+
+    host._apply_unfreeze = CausalOmniAvatarWan._apply_unfreeze.__get__(host)
+    host.apply_lora_freeze = CausalOmniAvatarWan.apply_lora_freeze.__get__(host)
+
+
+def test_apply_lora_freeze_restores_freeze_after_wipe():
+    """The exact bug: build_model wipes requires_grad, recovery restores it."""
+    host = _DummyLoraHost(
+        merge_lora=False,
+        unfreeze_modules=["_core.audio_proj", "_core.patch_embedding"],
+    )
+    _bind_apply_lora_freeze(host)
+
+    # Simulate FastGenModel.build_model:260 wiping the freeze.
+    host.train().requires_grad_(True)
+    n_total = sum(p.numel() for p in host.parameters())
+    n_trainable_pre = sum(p.numel() for p in host.parameters() if p.requires_grad)
+    assert n_trainable_pre == n_total, "wipe should leave all params trainable"
+
+    # Apply the recovery hook.
+    host.apply_lora_freeze()
+
+    # LoRA params must stay trainable.
+    for n, p in host.named_parameters():
+        if "lora_" in n:
+            assert p.requires_grad is True, f"LoRA param {n} should be trainable"
+
+    # Block base_layer params must be frozen.
+    for n, p in host.named_parameters():
+        if "base_layer" in n:
+            assert p.requires_grad is False, f"base_layer param {n} should be frozen"
+
+    # Listed unfreeze submodules must be trainable.
+    for p in host._core.audio_proj.parameters():
+        assert p.requires_grad is True
+    for p in host._core.patch_embedding.parameters():
+        assert p.requires_grad is True
+
+    # Non-listed submodule (audio_cond_projs) is NOT in unfreeze_modules,
+    # and its params don't carry the "lora_" prefix → must end up frozen.
+    for p in host._core.audio_cond_projs.parameters():
+        assert p.requires_grad is False, "non-listed submodule should be frozen"
+
+
+def test_apply_lora_freeze_idempotent():
+    """Calling apply_lora_freeze multiple times yields identical state."""
+    host = _DummyLoraHost(
+        merge_lora=False,
+        unfreeze_modules=["_core.audio_proj"],
+    )
+    _bind_apply_lora_freeze(host)
+
+    host.train().requires_grad_(True)
+    host.apply_lora_freeze()
+    state_after_first = {n: p.requires_grad for n, p in host.named_parameters()}
+
+    # Wipe and re-apply.
+    host.train().requires_grad_(True)
+    host.apply_lora_freeze()
+    state_after_second = {n: p.requires_grad for n, p in host.named_parameters()}
+
+    assert state_after_first == state_after_second
+
+
+def test_apply_lora_freeze_noop_when_merge_lora_true():
+    """If merge_lora=True, no LoRA layers exist and recovery should not freeze
+    anything — the model is in plain full-FT mode."""
+    host = _DummyLoraHost(
+        merge_lora=True,  # full FT mode
+        unfreeze_modules=[],
+    )
+    _bind_apply_lora_freeze(host)
+
+    host.train().requires_grad_(True)  # all trainable (full FT default)
+    host.apply_lora_freeze()  # should be a no-op
+
+    n_total = sum(p.numel() for p in host.parameters())
+    n_trainable = sum(p.numel() for p in host.parameters() if p.requires_grad)
+    assert n_trainable == n_total, "full-FT mode should keep everything trainable"
+
+
+def test_apply_lora_freeze_noop_when_no_lora_params():
+    """If merge_lora=False but no params have 'lora_' in their name (PEFT
+    injection didn't actually run), apply_lora_freeze should bail out
+    rather than freezing the entire base — that would leave the model
+    with NOTHING trainable, which is worse."""
+
+    class _NoLoraHost(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.merge_lora = False
+            self.unfreeze_modules = []
+            self._core = nn.Module()
+            self._core.audio_proj = nn.Linear(4, 8)
+            self._core.blocks = nn.ModuleList([nn.Linear(8, 8)])
+
+    host = _NoLoraHost()
+    _bind_apply_lora_freeze(host)
+
+    host.train().requires_grad_(True)
+    host.apply_lora_freeze()  # should be a no-op (no lora_ params present)
+
+    n_total = sum(p.numel() for p in host.parameters())
+    n_trainable = sum(p.numel() for p in host.parameters() if p.requires_grad)
+    assert n_trainable == n_total, (
+        "no-lora-params case should leave everything trainable; "
+        "freezing the base with no LoRA to compensate would brick the run"
+    )

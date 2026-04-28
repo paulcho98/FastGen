@@ -44,9 +44,33 @@ class OmniAvatarDiffusionForcingModel(KDModel):
     def build_model(self):
         """Build model and optionally load VAE for visual logging."""
         super().build_model()
+        # FastGenModel.build_model (model.py:260) unconditionally does
+        # `self.net.train().requires_grad_(True)` after instantiating the
+        # network, which destroys the LoRA freeze that PEFT's
+        # inject_adapter_in_model set up inside _load_weights.  Re-apply
+        # the freeze here so the optimizer (constructed downstream by
+        # init_optimizers, which filters on requires_grad) only sees the
+        # intended trainable subset (LoRA A/B + user-listed unfreeze
+        # modules).  No-op when merge_lora=True or when PEFT injection
+        # didn't actually run (apply_lora_freeze handles both).
+        if hasattr(self.net, "apply_lora_freeze"):
+            self.net.apply_lora_freeze()
+
         vae_path = getattr(self.config, "vae_path", "") or ""
         if vae_path and os.path.exists(vae_path):
             self._load_vae(vae_path)
+
+    def init_optimizers(self):
+        """Initialize optimizers, with a defensive LoRA freeze re-apply.
+
+        Belt-and-suspenders against any post-build_model code path that
+        might also reset requires_grad (e.g., FSDP wrap converting params
+        to DTensors and not preserving requires_grad in some PyTorch
+        versions).  apply_lora_freeze is idempotent.
+        """
+        if hasattr(self.net, "apply_lora_freeze"):
+            self.net.apply_lora_freeze()
+        super().init_optimizers()
 
     def _load_vae(self, vae_path: str):
         """Load WanVideoVAE for decoding generated samples in wandb visual logging.
