@@ -146,10 +146,37 @@ class OmniAvatarSelfForcingModel(SelfForcingModel):
                 self.fake_score = instantiate(fake_score_config)
             synchronize()
 
+        # Restore PEFT-applied freeze after FastGenModel.build_model:260's
+        # `self.net.train().requires_grad_(True)` wipe.  Same recovery hook
+        # used in OmniAvatarDiffusionForcingModel.  Defensive on fake_score
+        # too — it's not subject to the wipe today (which only touches
+        # self.net), but if a future config sets merge_lora=False on
+        # fake_score with selective unfreeze, this catches drift from any
+        # later mutation.  Idempotent and a no-op when merge_lora=True.
+        if hasattr(self.net, "apply_lora_freeze"):
+            self.net.apply_lora_freeze()
+        if hasattr(self, "fake_score") and hasattr(self.fake_score, "apply_lora_freeze"):
+            self.fake_score.apply_lora_freeze()
+
         # Load VAE for wandb visual logging (same logic as OmniAvatarDiffusionForcing)
         vae_path = getattr(self.config, "vae_path", "") or ""
         if vae_path and os.path.exists(vae_path):
             self._load_vae(vae_path)
+
+    def init_optimizers(self):
+        """Defensive LoRA freeze re-apply right before optimizer construction.
+
+        Belt-and-suspenders against any post-build_model code path
+        (e.g., FSDP wrap converting params to DTensors and not preserving
+        requires_grad in some PyTorch versions) that might reset
+        requires_grad on frozen params.  apply_lora_freeze is idempotent
+        and a no-op when LoRA isn't in use on the network.
+        """
+        if hasattr(self.net, "apply_lora_freeze"):
+            self.net.apply_lora_freeze()
+        if hasattr(self, "fake_score") and hasattr(self.fake_score, "apply_lora_freeze"):
+            self.fake_score.apply_lora_freeze()
+        super().init_optimizers()
 
     def _load_vae(self, vae_path: str):
         """Load WanVideoVAE for visual logging in wandb callback."""
