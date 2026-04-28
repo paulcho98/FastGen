@@ -51,3 +51,65 @@ def test_construction_smoke():
     host = _DummyHost()
     assert hasattr(host, "_core")
     assert hasattr(host._core, "audio_proj")
+
+
+def test_unfreeze_specific_submodule_re_enables_grad():
+    """After freezing all params, _apply_unfreeze re-enables requires_grad
+    on the parameters of the specified submodule and leaves others alone."""
+    host = _DummyHost()
+
+    # Simulate PEFT freezing the base
+    _set_all_requires_grad(host, value=False)
+    for p in host.parameters():
+        assert p.requires_grad is False
+
+    # Unfreeze just _core.audio_proj
+    host._apply_unfreeze(["_core.audio_proj"])
+
+    # audio_proj params should be trainable
+    for p in host._core.audio_proj.parameters():
+        assert p.requires_grad is True, "audio_proj.weight/bias should be trainable"
+
+    # Everything else should remain frozen
+    for p in host._core.audio_cond_projs.parameters():
+        assert p.requires_grad is False
+    for p in host._core.blocks.parameters():
+        assert p.requires_grad is False
+
+
+def test_unfreeze_modulelist_unfreezes_all_children():
+    """Unfreezing a ModuleList path re-enables grad on every child Linear."""
+    host = _DummyHost()
+    _set_all_requires_grad(host, value=False)
+
+    host._apply_unfreeze(["_core.audio_cond_projs"])
+
+    for proj in host._core.audio_cond_projs:
+        for p in proj.parameters():
+            assert p.requires_grad is True
+    # Other submodules untouched
+    for p in host._core.audio_proj.parameters():
+        assert p.requires_grad is False
+
+
+def test_unfreeze_empty_list_is_noop():
+    """Passing an empty (or None) unfreeze list does not change requires_grad."""
+    host = _DummyHost()
+    _set_all_requires_grad(host, value=False)
+
+    host._apply_unfreeze([])
+
+    for p in host.parameters():
+        assert p.requires_grad is False
+
+
+def test_unfreeze_unknown_path_raises_attribute_error():
+    """Walking get_submodule for a non-existent path is a hard error.
+
+    Choosing strict-failure over silent skip so a typo in the config is
+    caught immediately rather than silently leaving the intended module
+    frozen for the entire training run.
+    """
+    host = _DummyHost()
+    with pytest.raises(AttributeError):
+        host._apply_unfreeze(["_core.does_not_exist"])

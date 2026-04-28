@@ -1103,6 +1103,43 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
     def audio_cond_projs(self):
         return self._core.audio_cond_projs if hasattr(self._core, 'audio_cond_projs') else None
 
+    def _apply_unfreeze(self, unfreeze_modules: List[str]) -> None:
+        """Re-enable ``requires_grad`` on parameters of specific submodules.
+
+        Used in conjunction with PEFT LoRA injection (``merge_lora=False``):
+        ``inject_adapter_in_model`` freezes the entire base and only leaves
+        LoRA A/B trainable.  This helper selectively un-freezes the
+        submodules listed in ``unfreeze_modules`` so they participate in
+        training as full fine-tunes.
+
+        Paths are dotted module paths relative to ``self``.  Common values:
+
+        - ``"_core.audio_proj"`` — the AudioPack audio input projection
+        - ``"_core.audio_cond_projs"`` — the per-block audio cross-attn projections
+        - ``"_core.patch_embedding"`` — the V2V channel-input Conv3d
+
+        Failure mode is intentionally strict: if a path is not resolvable
+        via ``self.get_submodule``, ``AttributeError`` is raised so a
+        config typo is caught at construction time rather than silently
+        leaving the intended module frozen for the whole run.
+
+        Args:
+            unfreeze_modules: list of dotted module paths relative to self.
+                Empty list or ``None`` is a no-op.
+        """
+        if not unfreeze_modules:
+            return
+        for path in unfreeze_modules:
+            module = self.get_submodule(path)  # raises AttributeError if missing
+            n_params_unfrozen = 0
+            for p in module.parameters():
+                p.requires_grad_(True)
+                n_params_unfrozen += p.numel()
+            logger.info(
+                f"[CausalOmniAvatarWan] unfreeze: re-enabled requires_grad on "
+                f"{n_params_unfrozen / 1e6:.2f}M params in '{path}'"
+            )
+
     def _finish_init(self, base_model_paths, omniavatar_ckpt_path):
         """Load weights and cast to default dtype (called at end of __init__)."""
         if not self._is_in_meta_context():
