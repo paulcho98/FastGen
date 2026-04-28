@@ -36,10 +36,13 @@ set -euo pipefail
 # Use the LoRA-specialized config.
 export CONFIG_PATH="fastgen/configs/experiments/OmniAvatar/config_df_shift_5_14b_lora.py"
 
-# Per-GPU batch + grad accum: same as the full-FT 14B wrapper by default.
-# The user can override either via env.  With smaller optim state, we
-# may have headroom for BATCH_SIZE=4 or higher in a follow-up run, but
-# keep it conservative for the first launch.
+# Per-GPU batch + grad accum: effective batch 16 like the full-FT 14B
+# wrapper, but a different per-GPU/accum split.  Full-FT uses BATCH_SIZE=1
+# GRAD_ACCUM=4 (1*4*4=16) because Adam state on 14B fp32 dominates per-GPU
+# memory; LoRA's optim state is tiny, so we have headroom for BATCH_SIZE=2
+# GRAD_ACCUM=2 (2*4*2=16) which trades a bit of activation memory for
+# fewer microbatches per effective step.  After the first launch confirms
+# memory headroom, BATCH_SIZE=4 GRAD_ACCUM=1 may be feasible.
 export BATCH_SIZE="${BATCH_SIZE:-2}"
 GRAD_ACCUM="${GRAD_ACCUM:-2}"
 

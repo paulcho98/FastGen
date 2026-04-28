@@ -967,6 +967,12 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         # ["_core.audio_proj", "_core.audio_cond_projs", "_core.patch_embedding"])
         # alongside LoRA on the transformer blocks.  Ignored when merge_lora=True.
         self.unfreeze_modules: List[str] = list(unfreeze_modules) if unfreeze_modules else []
+        if self.unfreeze_modules and self.merge_lora:
+            logger.warning(
+                f"[CausalOmniAvatarWan] unfreeze_modules={self.unfreeze_modules} is set "
+                f"but merge_lora=True; the unfreeze list will be ignored. "
+                f"Set merge_lora=False to use selective unfreeze with LoRA injection."
+            )
         self.mask_all_frames = mask_all_frames
         self.local_attn_size = local_attn_size
         self.sink_size = sink_size
@@ -2191,6 +2197,13 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
                         raise ImportError(
                             "merge_lora=False requires the `peft` package."
                         )
+            elif not self.merge_lora and self.unfreeze_modules:
+                logger.warning(
+                    f"[CausalOmniAvatarWan] merge_lora=False with unfreeze_modules={self.unfreeze_modules}, "
+                    f"but the loaded checkpoint contains no LoRA weights. PEFT injection was skipped, so "
+                    f"_apply_unfreeze will not run; the model is loaded as a plain full fine-tune. "
+                    f"Verify that omniavatar_ckpt_path points at a checkpoint with LoRA adapters."
+                )
         else:
             logger.info(
                 "[CausalOmniAvatarWan] No omniavatar_ckpt_path, using base/random init only"
