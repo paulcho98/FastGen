@@ -68,8 +68,8 @@ Watch for:
 - The `[merge_lora] Merged ... LoRA pairs` line should NOT appear (we
   go through the PEFT-inject branch instead, which logs
   `[CausalOmniAvatarWan] PEFT LoRA: N loaded`).
-- An `[unfreeze]` log line per entry in `unfreeze_modules`, summing to
-  ~100M unfrozen params.
+- A `[CausalOmniAvatarWan] unfreeze: re-enabled` log line per entry in
+  `unfreeze_modules`, summing to ~100M unfrozen params.
 - The `param_count` callback should report **trainable** << **total**
   (e.g., trainable ~150M, total 14294M for the 14B configuration).
 - FSDP wrap completes without "mixed Tensor and DTensor" errors.
