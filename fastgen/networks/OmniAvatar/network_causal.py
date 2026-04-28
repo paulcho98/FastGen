@@ -907,6 +907,7 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         merge_lora: bool = True,
         lora_rank: int = 128,
         lora_alpha: int = 64,
+        unfreeze_modules: Optional[List[str]] = None,  # NEW: see _apply_unfreeze
         net_pred_type: str = "flow",
         schedule_type: str = "rf",
         mask_all_frames: bool = True,
@@ -959,6 +960,13 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         self.merge_lora = merge_lora
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
+        # Paths (relative to self, dotted) of submodules whose parameters
+        # should keep requires_grad=True even when PEFT injection has frozen
+        # the rest of the base model.  Used with merge_lora=False to enable
+        # selective full fine-tuning of specific components (e.g.,
+        # ["_core.audio_proj", "_core.audio_cond_projs", "_core.patch_embedding"])
+        # alongside LoRA on the transformer blocks.  Ignored when merge_lora=True.
+        self.unfreeze_modules: List[str] = list(unfreeze_modules) if unfreeze_modules else []
         self.mask_all_frames = mask_all_frames
         self.local_attn_size = local_attn_size
         self.sink_size = sink_size
