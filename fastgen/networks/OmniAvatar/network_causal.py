@@ -2181,6 +2181,12 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
                             f"[CausalOmniAvatarWan] PEFT LoRA: "
                             f"{len(mapped_lora_sd) - len(unexpected)} loaded"
                         )
+                        # Selectively re-enable requires_grad on submodules
+                        # that should be fully fine-tuned alongside the LoRA
+                        # adapters (e.g., audio_proj, audio_cond_projs,
+                        # patch_embedding).  No-op when unfreeze_modules is
+                        # empty.  See _apply_unfreeze for full rationale.
+                        self._apply_unfreeze(self.unfreeze_modules)
                     except ImportError:
                         raise ImportError(
                             "merge_lora=False requires the `peft` package."

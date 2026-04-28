@@ -113,3 +113,23 @@ def test_unfreeze_unknown_path_raises_attribute_error():
     host = _DummyHost()
     with pytest.raises(AttributeError):
         host._apply_unfreeze(["_core.does_not_exist"])
+
+
+def test_init_signature_has_unfreeze_modules():
+    """Confirm the new kwarg is in the real CausalOmniAvatarWan signature."""
+    import inspect
+    from fastgen.networks.OmniAvatar.network_causal import CausalOmniAvatarWan
+
+    sig = inspect.signature(CausalOmniAvatarWan.__init__)
+    assert "unfreeze_modules" in sig.parameters, (
+        "CausalOmniAvatarWan.__init__ should accept an unfreeze_modules kwarg"
+    )
+    # Default should be None (i.e., no-op when not provided)
+    assert sig.parameters["unfreeze_modules"].default is None
+
+
+def test_apply_unfreeze_is_callable():
+    """Confirm the helper is bound to the real class."""
+    from fastgen.networks.OmniAvatar.network_causal import CausalOmniAvatarWan
+
+    assert callable(CausalOmniAvatarWan._apply_unfreeze)
