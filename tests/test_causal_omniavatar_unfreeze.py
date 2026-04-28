@@ -144,7 +144,31 @@ def test_apply_lora_freeze_is_callable():
     """
     from fastgen.networks.OmniAvatar.network_causal import CausalOmniAvatarWan
 
+    assert callable(CausalOmniAvatarWan._apply_unfreeze)
     assert callable(CausalOmniAvatarWan.apply_lora_freeze)
+
+
+def test_omniavatarwan_apply_lora_freeze_is_callable():
+    """Bidirectional OmniAvatarWan must also have apply_lora_freeze.
+
+    Used by OmniAvatarSelfForcingModel.build_model to recover the freeze
+    on fake_score (defensive: fake_score isn't subject to the wipe today,
+    but for symmetry the method should exist on both classes).
+    """
+    from fastgen.networks.OmniAvatar.network import OmniAvatarWan
+
+    assert callable(OmniAvatarWan._apply_unfreeze)
+    assert callable(OmniAvatarWan.apply_lora_freeze)
+
+
+def test_omniavatarwan_init_signature_has_unfreeze_modules():
+    """Confirm OmniAvatarWan.__init__ accepts unfreeze_modules with default None."""
+    import inspect
+    from fastgen.networks.OmniAvatar.network import OmniAvatarWan
+
+    sig = inspect.signature(OmniAvatarWan.__init__)
+    assert "unfreeze_modules" in sig.parameters
+    assert sig.parameters["unfreeze_modules"].default is None
 
 
 # --- apply_lora_freeze behavior tests on a CPU-only fixture --------------

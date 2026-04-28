@@ -335,6 +335,7 @@ class OmniAvatarWan(FastGenNetwork):
         merge_lora: bool = True,
         lora_rank: int = 128,
         lora_alpha: int = 64,
+        unfreeze_modules: Optional[List[str]] = None,  # Used with merge_lora=False; see apply_lora_freeze
         net_pred_type: str = "flow",
         schedule_type: str = "rf",
         mask_all_frames: bool = True,
@@ -384,6 +385,21 @@ class OmniAvatarWan(FastGenNetwork):
         self.merge_lora = merge_lora
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
+        # Paths (relative to self, dotted) of submodules whose parameters
+        # should keep requires_grad=True even when PEFT injection has frozen
+        # the rest of the base model.  Used with merge_lora=False to enable
+        # selective full fine-tuning of specific components alongside LoRA
+        # on the transformer blocks.  For OmniAvatarWan (bidirectional), the
+        # WanModel lives at self.model, so paths look like "model.audio_proj"
+        # rather than the causal class's "_core.audio_proj".  Ignored when
+        # merge_lora=True.
+        self.unfreeze_modules: List[str] = list(unfreeze_modules) if unfreeze_modules else []
+        if self.unfreeze_modules and self.merge_lora:
+            logger.warning(
+                f"[OmniAvatarWan] unfreeze_modules={self.unfreeze_modules} is set "
+                f"but merge_lora=True; the unfreeze list will be ignored. "
+                f"Set merge_lora=False to use selective unfreeze with LoRA injection."
+            )
         self.mask_all_frames = mask_all_frames
 
         dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
@@ -591,6 +607,87 @@ class OmniAvatarWan(FastGenNetwork):
                         )
         else:
             logger.info("[OmniAvatarWan] No omniavatar_ckpt_path provided, using base/random init only")
+
+    # ------------------------------------------------------------------
+    # LoRA freeze utilities (used by merge_lora=False training paths)
+    # ------------------------------------------------------------------
+
+    def _apply_unfreeze(self, unfreeze_modules: List[str]) -> None:
+        """Re-enable ``requires_grad`` on parameters of specific submodules.
+
+        Used in conjunction with PEFT LoRA injection (``merge_lora=False``):
+        ``inject_adapter_in_model`` freezes the entire base and only leaves
+        LoRA A/B trainable.  This helper selectively un-freezes the
+        submodules listed in ``unfreeze_modules`` so they participate in
+        training as full fine-tunes.
+
+        Paths are dotted module paths relative to ``self``.  For
+        ``OmniAvatarWan`` (bidirectional) the WanModel lives at ``self.model``
+        (not ``self._core`` as in the causal class), so the typical paths
+        look like:
+
+        - ``"model.audio_proj"``
+        - ``"model.audio_cond_projs"``
+        - ``"model.patch_embedding"``
+
+        Failure mode is intentionally strict: a non-resolvable path raises
+        ``AttributeError`` so a config typo is caught at construction time.
+
+        Args:
+            unfreeze_modules: list of dotted module paths relative to self.
+                Empty list or ``None`` is a no-op.
+        """
+        if not unfreeze_modules:
+            return
+        for path in unfreeze_modules:
+            module = self.get_submodule(path)  # raises AttributeError if missing
+            n_params_unfrozen = 0
+            for p in module.parameters():
+                p.requires_grad_(True)
+                n_params_unfrozen += p.numel()
+            logger.info(
+                f"[OmniAvatarWan] unfreeze: re-enabled requires_grad on "
+                f"{n_params_unfrozen / 1e6:.2f}M params in '{path}'"
+            )
+
+    def apply_lora_freeze(self) -> None:
+        """Re-apply PEFT's "only LoRA + selective-unfreeze trainable" freeze.
+
+        Symmetric counterpart to ``CausalOmniAvatarWan.apply_lora_freeze``.
+        While the bidirectional ``OmniAvatarWan`` is not currently subject
+        to ``FastGenModel.build_model:260``'s wipe (that line only operates
+        on ``self.net``, not ``self.fake_score`` or ``self.teacher``), this
+        method exists for symmetry and as a defensive hook for the SF
+        method class to call uniformly on both networks without dispatching
+        on type.
+
+        Idempotent and safe to call repeatedly.  No-op when:
+        - ``self.merge_lora=True`` (full FT mode, no LoRA layers exist)
+        - PEFT injection didn't actually run (no ``"lora_"`` params present)
+        """
+        if self.merge_lora:
+            return
+        has_lora = any("lora_" in n for n, _ in self.named_parameters())
+        if not has_lora:
+            return
+
+        n_lora = 0
+        n_frozen = 0
+        for name, param in self.named_parameters():
+            if "lora_" in name:
+                param.requires_grad_(True)
+                n_lora += param.numel()
+            else:
+                param.requires_grad_(False)
+                n_frozen += param.numel()
+
+        self._apply_unfreeze(self.unfreeze_modules)
+
+        logger.info(
+            f"[OmniAvatarWan] apply_lora_freeze: LoRA {n_lora/1e6:.2f}M "
+            f"trainable, base {n_frozen/1e6:.2f}M frozen, then "
+            f"unfreeze_modules re-enabled on top"
+        )
 
     # ------------------------------------------------------------------
     # V2V conditioning
