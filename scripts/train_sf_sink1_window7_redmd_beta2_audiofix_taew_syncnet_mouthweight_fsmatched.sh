@@ -81,6 +81,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export FASTGEN_OUTPUT_ROOT="${FASTGEN_OUTPUT_ROOT:-/tmp/FASTGEN_SF_OUTPUT_BETA2_AUDIOFIX_TAEW_SYNCNET_MOUTHWEIGHT_FSMATCHED_LR3E6}"
 export SKIP_GT_VAL_UPLOAD=1
 export SKIP_EARLY_SAMPLE_LOG=1
+export NEG_TEXT_EMB_PATH="${NEG_TEXT_EMB_PATH:-/home/work/stableavatar_data/neg_text_emb.pt}"
 
 # Student DF init: final ckpt of the syncnet-trained DF run (5000 iters).
 # Loaded via the FastGen checkpointer -> config.model.net.
