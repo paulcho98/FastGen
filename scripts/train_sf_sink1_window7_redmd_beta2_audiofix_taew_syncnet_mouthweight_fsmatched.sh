@@ -139,10 +139,16 @@ echo ""
 # the whole launcher. Example: EXTRA_OVERRIDES="model.reward.enabled=False"
 EXTRA_OVERRIDES="${EXTRA_OVERRIDES:-}"
 
+# CONFIG_PATH (optional): override the train-config Python file. Default is
+# the 1.3B beta=2 + TAEW config; sibling wrappers (e.g. the 14B LoRA SF
+# variant) override this to point at a different config without forking
+# the whole launcher.
+CONFIG_PATH="${CONFIG_PATH:-fastgen/configs/experiments/OmniAvatar/config_sf_sink1_window7_redmd_beta2_taew.py}"
+
 /home/work/.local/miniconda3/envs/hb_fastgen/bin/torchrun \
     --nproc_per_node=4 \
     train.py \
-    --config=fastgen/configs/experiments/OmniAvatar/config_sf_sink1_window7_redmd_beta2_taew.py \
+    --config=${CONFIG_PATH} \
     - trainer.resume=${RESUME} \
     model.fake_score_optimizer.lr=3e-6 \
     log_config.group="omniavatar_sf_audiofix" \
