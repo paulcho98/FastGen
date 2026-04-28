@@ -83,6 +83,66 @@ tmux new -s df14b_lora -d \
    2>&1 | tee /tmp/train_df_14b_lora_3000iter.log"
 ```
 
+## SF support
+
+The same regime extends to SF training (Re-DMD with TAEW decoder).
+At 14B, full-FT both student and fake_score doesn't fit on H200 (it
+would need ~56 GB sharded Adam state alone + 3 × 14 GB params + activations
+from a 2-step student rollout + teacher forward + fake_score forward
+× 2).  LoRA + selective unfreeze on both student and fake_score is
+mandatory at this scale.
+
+The freeze-recovery hook lives on both model classes:
+- `CausalOmniAvatarWan.apply_lora_freeze` — for the causal student
+- `OmniAvatarWan.apply_lora_freeze` — for the bidirectional fake_score (and
+  defensively for the bidirectional teacher, though the teacher is always
+  frozen via `model.py:204` regardless)
+
+`OmniAvatarSelfForcingModel.build_model` calls `apply_lora_freeze` on both
+`self.net` and `self.fake_score` after `super().build_model()` (which has
+the wipe at `FastGenModel.build_model:260`), and `init_optimizers` does
+the same right before optimizer construction (defensive against any FSDP
+wrap behavior that resets `requires_grad` on DTensor params).
+
+For 14B SF, see `fastgen/configs/experiments/OmniAvatar/config_sf_14b_lora_t769.py`
+and the matching wrapper
+`scripts/train_sf_..._fsmatched_t769_14b_lora.sh`.
+
+Path-prefix difference:
+- Student (`CausalOmniAvatarWan._core.X`) → `_core.audio_proj`, etc.
+- Fake_score (`OmniAvatarWan.model.X`) → `model.audio_proj`, etc.
+
+## Storage-efficient saves
+
+`FSDPCheckpointer.save` filters the saved `state_dict` to entries whose
+parameter has `requires_grad=True`, leaving non-parameter state (buffers,
+running stats) in place.  Generic across all training methods — for
+full-FT runs the filter is a no-op.
+
+For 14B LoRA + selective-unfreeze, this collapses each save's
+`<step>.net_model/` from ~56 GB (full base) to ~5 GB (LoRA + unfreeze
+trainable only).  `ModelWrapper` defaults to `StateDictOptions(strict=False)`
+so loads of trainable-only saves succeed: frozen base values come from
+the base safetensors + V2V mouthweight ckpt during model construction,
+and the saved checkpoint's smaller key set just overlays the trainable
+subset on top.
+
+## Post-hoc conversion of legacy full-state saves
+
+Saves from training runs that pre-date the checkpointer filter (e.g.,
+the 14B DF LoRA run currently in flight at the time this doc was added)
+contain the full model state.  Convert them to trainable-only via
+`scripts/post_hoc_convert_lora_saves.py` once the run completes:
+
+```bash
+python scripts/post_hoc_convert_lora_saves.py <run_dir>
+```
+
+The script loads each save via the standard `build_model` path then
+re-saves with the new filter.  Each conversion takes ~20 s on 4× H200,
+so ~5 min total for a 10-save run.  Frees ~510 GB of disk for the 14B DF
+LoRA run.
+
 ## Open questions / known limitations
 
 - **LoRA rank**: 128 matches the V2V mouthweight adapter we initialize

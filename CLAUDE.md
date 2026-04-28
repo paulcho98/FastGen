@@ -84,3 +84,18 @@ On Claude Code instance:
 
 ## Re-DMD sync-C reward (branch `feat/redmd-sync-c`)
 Full guide: `docs/redmd_sync_c.md`. Launch: `scripts/train_sf_sink1_window7_redmd.sh` (β=0.25 default). Smoke (4-GPU, 10 iters, MP4 dump): `scripts/smoke_test_redmd.sh`.
+
+## Convention: 14B = LoRA default, 1.3B = full FT
+
+Any 14B trained component (DF student, future SF student, future SF fake_score) defaults to LoRA + selective-unfreeze training. Full-FT 14B is reserved for ablation studies — it doesn't fit on H200 for SF (3 networks × 14B + activations) and is wasteful for DF (saves are 60 GB/full-FT vs 5 GB/LoRA). 1.3B configs continue to use full FT (default `merge_lora=True`).
+
+Concrete configs:
+- 14B DF LoRA: `config_df_shift_5_14b_lora.py`, `config_df_shift_5_14b_lora_t769.py`
+- 14B SF LoRA: `config_sf_14b_lora_t769.py` (student + fake_score both 14B + LoRA)
+- 14B DF full-FT (ablation only): `config_df_shift_5_14b.py`
+
+Implementation details (see `docs/lora_selective_unfreeze.md`):
+- `merge_lora=False` + `unfreeze_modules=[...]` is the standard recipe — LoRA on transformer blocks via PEFT, full FT on the audio path + patch_embedding.
+- The freeze recovery hook `apply_lora_freeze` lives on both `CausalOmniAvatarWan` and `OmniAvatarWan`. Called from `OmniAvatarDiffusionForcingModel.build_model` and `OmniAvatarSelfForcingModel.build_model` after `super()` to undo the `FastGenModel.build_model:260` `requires_grad_(True)` wipe.
+- `FSDPCheckpointer.save` filters to `requires_grad=True` keys → tiny saves for partial-freeze runs, no-op for full-FT.
+- Path-prefix difference for `unfreeze_modules`: causal class uses `_core.X`, bidirectional uses `model.X`.
