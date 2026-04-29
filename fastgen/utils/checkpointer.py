@@ -440,9 +440,51 @@ class FSDPCheckpointer(Checkpointer):
             model_wrapper = ModelWrapper(model=v)
             model_state_dict = model_wrapper.state_dict()
             assert os.path.exists(f"{path}.{k}_model"), f"Key {k} does not exist in FSDP model dict"
+            # Skip on ranks where parameters live on the meta device:
+            # - This load path runs in two contexts: pretrained_ckpt_path
+            #   (BEFORE FSDP wrap, model is unsharded) and resume (AFTER FSDP
+            #   wrap, model is sharded with real per-rank tensors).
+            # - Pre-FSDP-wrap, with fsdp_meta_init=True, only rank 0 holds
+            #   real weights; ranks 1-3 hold meta tensors. dcp.load on a meta
+            #   state_dict materializes those tensors, allocating real memory
+            #   on every rank and defeating the meta-init memory savings —
+            #   which combined with the bf16->fp32 cast in on_train_begin
+            #   can push the cgroup over its memory cap.
+            # - The skip is safe because model_to_fsdp(sync_module_states=True)
+            #   broadcasts rank-0's loaded state to all ranks during FSDP wrap
+            #   via set_model_state_dict(broadcast_from_rank0=True), filling
+            #   the per-rank shards with the loaded values.
+            # - Post-FSDP-wrap (resume path), parameters are real DTensors with
+            #   per-rank shards — never on meta — so this check is False and
+            #   the load proceeds normally.
+            has_meta_params = any(p.is_meta for p in v.parameters())
+            if has_meta_params:
+                logger.info(
+                    f"[FSDPCheckpointer] {k}_model: skipping load on rank with "
+                    f"meta-device parameters; FSDP wrap will broadcast rank-0 "
+                    f"weights via sync_module_states"
+                )
+                continue
             storage_reader = self.get_storage_reader(checkpoint_path=f"{path}.{k}_model")
+            # Symmetric to save filter: only load trainable param entries.
+            # Frozen base params remain at the model's current state (from
+            # PEFT injection + pretrained init).  Non-parameter entries
+            # (registered buffers) pass through.  No-op for full-FT runs.
+            params_dict = dict(v.named_parameters())
+            filtered_state_dict = {
+                key: tensor
+                for key, tensor in model_state_dict.items()
+                if key not in params_dict or params_dict[key].requires_grad
+            }
+            n_kept = len(filtered_state_dict)
+            n_total = len(model_state_dict)
+            if n_kept < n_total:
+                logger.info(
+                    f"[FSDPCheckpointer] {k}_model: loading {n_kept}/{n_total} "
+                    f"state-dict entries (skipping {n_total - n_kept} frozen-param entries)"
+                )
             dcp.load(
-                state_dict=model_state_dict,
+                state_dict=filtered_state_dict,
                 storage_reader=storage_reader,
             )
             model_wrapper.load_state_dict(model_state_dict)
