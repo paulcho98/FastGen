@@ -285,9 +285,14 @@ class FastGenModel(torch.nn.Module):
                         f"Skipping pre-FSDP cast for {net_name}: parameters on meta "
                         f"device (will be filled by FSDP sync_module_states broadcast)"
                     )
-                    continue
-                logger.debug(f"Casting {net_name} to dtype={self.precision_fsdp} (pre-FSDP).")
-                net.to(dtype=self.precision_fsdp)
+                else:
+                    logger.debug(f"Casting {net_name} to dtype={self.precision_fsdp} (pre-FSDP).")
+                    net.to(dtype=self.precision_fsdp)
+                # Synchronize on every rank, even those that skipped the cast,
+                # so the per-iteration barrier (which the .to() side enters
+                # via synchronize() below) is matched by the meta side too.
+                # Otherwise rank 0 calls synchronize() and meta ranks don't,
+                # causing a NCCL ALLREDUCE deadlock.
                 synchronize()
 
             # Move EMA networks as they aren't handled by FSDP
