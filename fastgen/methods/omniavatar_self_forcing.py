@@ -64,7 +64,13 @@ class OmniAvatarSelfForcingModel(SelfForcingModel):
         # pattern. The no_grad() inside _fake_score_discriminator_update_step is
         # sufficient. Toggling requires_grad on FSDP2 DTensors leaves stale
         # internal state that breaks gradient checkpointing recomputation.
-        self.fake_score.train().requires_grad_(True)
+        #
+        # For fake_score: only set train() mode (BN/Dropout); leave
+        # requires_grad as configured by build_model.apply_lora_freeze
+        # (LoRA mode) or super().build_model (full FT). Calling
+        # requires_grad_(True) here would wipe the LoRA freeze, making
+        # the trainable-only checkpoint filter save the full 14B base.
+        self.fake_score.train()
         if self.config.gan_loss_weight_gen > 0:
             self.discriminator.train().requires_grad_(True)
 
