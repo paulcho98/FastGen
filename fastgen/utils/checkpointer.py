@@ -437,10 +437,15 @@ class FSDPCheckpointer(Checkpointer):
 
         for k, v in model_dict.items():
             logger.info(f"Loading the FSDP model dict for key {k}...")
-            model_wrapper = ModelWrapper(model=v)
-            model_state_dict = model_wrapper.state_dict()
             assert os.path.exists(f"{path}.{k}_model"), f"Key {k} does not exist in FSDP model dict"
-            # Skip on ranks where parameters live on the meta device:
+            # Skip on ranks where parameters live on the meta device.  This
+            # check MUST come before constructing the ModelWrapper / calling
+            # state_dict(), because get_model_state_dict on a non-FSDP-wrapped
+            # meta-init model can materialize the meta tensors as a side
+            # effect, defeating the very memory savings we're trying to
+            # protect.
+            #
+            # Context for the skip:
             # - This load path runs in two contexts: pretrained_ckpt_path
             #   (BEFORE FSDP wrap, model is unsharded) and resume (AFTER FSDP
             #   wrap, model is sharded with real per-rank tensors).
@@ -465,6 +470,8 @@ class FSDPCheckpointer(Checkpointer):
                     f"weights via sync_module_states"
                 )
                 continue
+            model_wrapper = ModelWrapper(model=v)
+            model_state_dict = model_wrapper.state_dict()
             storage_reader = self.get_storage_reader(checkpoint_path=f"{path}.{k}_model")
             # Symmetric to save filter: only load trainable param entries.
             # Frozen base params remain at the model's current state (from
