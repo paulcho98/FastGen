@@ -27,7 +27,7 @@ from torch.distributed.fsdp import fully_shard
 
 from fastgen.networks.network import FastGenNetwork
 from fastgen.networks.noise_schedule import NET_PRED_TYPES
-from fastgen.networks.OmniAvatar.wan_model import WanModel
+from fastgen.networks.OmniAvatar.wan_model import WanModel, precompute_freqs_cis_3d
 import fastgen.utils.logging_utils as logger
 
 # ---------------------------------------------------------------------------
@@ -407,6 +407,13 @@ class OmniAvatarWan(FastGenNetwork):
 
         cfg = MODEL_CONFIGS[model_size]
 
+        # head_dim is stored on self so reset_parameters can recompute
+        # self.model.freqs after FSDP's to_empty under fsdp_meta_init=True.
+        # WanModel internally also computes head_dim = dim // num_heads in
+        # its __init__ to set self.freqs, but doesn't store either dim or
+        # num_heads in a way reset_parameters can easily reach.
+        self._head_dim = cfg["dim"] // cfg["num_heads"]
+
         # Build the WanModel DiT
         self.model = WanModel(
             dim=cfg["dim"],
@@ -649,6 +656,24 @@ class OmniAvatarWan(FastGenNetwork):
                 f"[OmniAvatarWan] unfreeze: re-enabled requires_grad on "
                 f"{n_params_unfrozen / 1e6:.2f}M params in '{path}'"
             )
+
+    def reset_parameters(self) -> None:
+        """Recompute non-persistent state after FSDP's `to_empty(device=cuda)`.
+
+        Symmetric to ``CausalOmniAvatarWan.reset_parameters``.  Required when
+        ``fsdp_meta_init=True``: ranks 1+ build the model on the meta device,
+        so ``self.model.freqs`` (a Python tuple of complex tensors, not a
+        registered buffer) is constructed as meta tensors.  After ``to_empty``
+        materializes params/buffers and ``set_model_state_dict`` broadcasts
+        rank 0's state, the non-buffer ``freqs`` attribute is never restored
+        on non-rank-0 ranks unless we recompute it here.
+
+        Without this hook, non-rank-0 ranks would have meta freqs at forward
+        time and ``meta.to(cuda)`` allocates uninitialized memory -> wrong
+        RoPE rotations -> training silently broken.
+        """
+        self.model.freqs = precompute_freqs_cis_3d(self._head_dim)
+        super().reset_parameters()  # FastGenNetwork.reset_parameters reseeds noise scheduler
 
     def apply_lora_freeze(self) -> None:
         """Re-apply PEFT's "only LoRA + selective-unfreeze trainable" freeze.

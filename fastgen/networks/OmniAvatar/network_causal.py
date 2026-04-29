@@ -1041,8 +1041,12 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
         self._core.head = CausalHead(dim, out_dim, patch_size, eps)
 
         # --- RoPE frequencies ---
-        head_dim = dim // num_heads
-        self._core.freqs = _precompute_freqs_cis_3d(head_dim)
+        # Stored on self (not just _core) so reset_parameters can recompute
+        # them after FSDP's to_empty() under fsdp_meta_init=True.  freqs is a
+        # Python attribute (not a registered buffer), so to_empty + state_dict
+        # broadcast both skip it; reset_parameters needs head_dim to recompute.
+        self._head_dim = dim // num_heads
+        self._core.freqs = _precompute_freqs_cis_3d(self._head_dim)
 
         # --- Audio ---
         if self.use_audio:
@@ -1108,6 +1112,31 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
     @property
     def audio_cond_projs(self):
         return self._core.audio_cond_projs if hasattr(self._core, 'audio_cond_projs') else None
+
+    def reset_parameters(self) -> None:
+        """Recompute non-persistent state after FSDP's `to_empty(device=cuda)`.
+
+        Required when ``fsdp_meta_init=True``: ranks 1+ build the model on
+        the meta device, so ``self._core.freqs`` (a Python tuple of complex
+        tensors, NOT a registered buffer) is constructed as meta tensors.
+        After ``to_empty`` materializes params/buffers as fresh CUDA memory
+        with uninitialized values, ``set_model_state_dict`` broadcasts rank
+        0's state — but the broadcast covers parameters + registered buffers
+        only, so the non-buffer ``freqs`` attribute is never restored on
+        non-rank-0 ranks.
+
+        ``reset_parameters`` is the framework's hook for re-initializing
+        such state.  Here we recompute ``self._core.freqs`` from scratch
+        using the stored ``self._head_dim``; the precompute_freqs_cis_3d
+        function returns CPU tensors which the forward path's lazy
+        ``self.freqs.to(device)`` migration will move to the GPU correctly.
+
+        Without this hook, non-rank-0 ranks would have meta freqs at
+        forward time and ``meta.to(cuda)`` allocates uninitialized memory
+        -> wrong RoPE rotations -> training silently broken from iter 1.
+        """
+        self._core.freqs = _precompute_freqs_cis_3d(self._head_dim)
+        super().reset_parameters()  # FastGenNetwork.reset_parameters reseeds noise scheduler
 
     def apply_lora_freeze(self) -> None:
         """Re-apply PEFT's "only LoRA + selective-unfreeze trainable" freeze.

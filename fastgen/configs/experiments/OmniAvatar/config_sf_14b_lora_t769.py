@@ -127,7 +127,21 @@ def create_config():
     config.trainer.fsdp_sharding_group_size = None
     config.model.precision = "bfloat16"
     config.model.precision_fsdp = "float32"
-    config.model.fsdp_meta_init = False
+    # Meta-init enabled (3-network 14B SF): only rank 0 loads weights into
+    # host RAM (~168 GB total), other ranks construct on meta device with
+    # ~0 RAM.  Without this, all 4 ranks duplicate-load 3 x 14B = ~672 GB
+    # peak host RAM during construction + transient cast overhead, which
+    # exceeded the host's available pool and triggered an OOM-kill on rank
+    # 3 during model.on_train_begin's bf16->fp32 cast at the smoke launch.
+    #
+    # The Python-attribute RoPE bug that originally blocked us from using
+    # meta-init at 14B DF (see config_df_shift_5_14b.py:80-91 for full
+    # context) is now fixed: both CausalOmniAvatarWan and OmniAvatarWan
+    # implement reset_parameters() that recomputes self._core.freqs (or
+    # self.model.freqs) from a stored self._head_dim attribute.  The FSDP
+    # wrap path's reset_parameters call after to_empty materializes the
+    # freqs correctly on every rank.
+    config.model.fsdp_meta_init = True
 
     return config
 
