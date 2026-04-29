@@ -398,17 +398,38 @@ class FSDPCheckpointer(Checkpointer):
                 # no checkpoint found, starting from iteration 0
                 return 0
         if path.endswith(".pth"):
-            # switch to basic checkpointer
-            logger.debug(f"Loading non-FSDP model from {path}")
-            return super().load(
-                model_dict,
-                optimizer_dict=optimizer_dict,
-                scheduler_dict=scheduler_dict,
-                grad_scaler=grad_scaler,
-                callbacks=callbacks,
-                path=path,
-                device=device,
+            # An FSDPCheckpointer-saved checkpoint stores model/optim shards
+            # in sibling `<step>.{k}_model/` and `<step>.{k}_optim/` dirs and
+            # writes only metadata (iteration, scheduler, callbacks, grad_scaler)
+            # into the .pth file — there is NO `"model"` key in that .pth.
+            # The regular `Checkpointer.load` at L156 indexes `state["model"]`
+            # unconditionally and would KeyError.  Detect the FSDP layout by
+            # looking for any sibling `*.<k>_model/` dir, and if present, fall
+            # through to the FSDP load path below (treating the .pth as a
+            # metadata stub for an FSDP-saved bundle).
+            stripped_path = path[:-4]
+            has_fsdp_layout = any(
+                os.path.isdir(f"{stripped_path}.{k}_model") for k in model_dict.keys()
             )
+            if has_fsdp_layout:
+                logger.info(
+                    f"Loading FSDP model (.pth metadata stub at {path}, "
+                    f"sharded state in sibling *.{{k}}_model dirs)"
+                )
+                path = stripped_path
+                # fall through to the FSDP code path below
+            else:
+                # regular DDP-saved single-file checkpoint
+                logger.debug(f"Loading non-FSDP model from {path}")
+                return super().load(
+                    model_dict,
+                    optimizer_dict=optimizer_dict,
+                    scheduler_dict=scheduler_dict,
+                    grad_scaler=grad_scaler,
+                    callbacks=callbacks,
+                    path=path,
+                    device=device,
+                )
         if not os.path.exists(f"{path}.pth"):
             logger.critical(f"Checkpoint file not found at {path}")
             return 0
