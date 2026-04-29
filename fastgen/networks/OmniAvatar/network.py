@@ -441,10 +441,46 @@ class OmniAvatarWan(FastGenNetwork):
         # latents).
         self._expand_audio_checkpoint_scope = expand_audio_checkpoint_scope
 
-        # Load weights (unless we are in meta device context for FSDP)
+        # Load weights (unless we are in meta device context for FSDP).
+        #
+        # On non-meta-init ranks: full path — load base safetensors + V2V
+        # LoRA ckpt, optionally PEFT-inject, apply selective unfreeze, cast.
+        #
+        # On meta-init ranks: SKIP the disk loads (saves host RAM, the whole
+        # point of meta-init) but STILL run PEFT structural injection so the
+        # module graph matches rank 0's.  Without this, set_model_state_dict
+        # post-FSDP-wrap would fail with "Missing key(s)" because rank 0 has
+        # 'q.base_layer.weight' (LoraLinear-wrapped) and ranks 1+ have
+        # plain 'q.weight'.  See _inject_peft_structure_for_meta for details.
         if not self._is_in_meta_context():
             self._load_weights(base_model_paths, omniavatar_ckpt_path)
             self.model.to(self._default_dtype)
+        else:
+            self._inject_peft_structure_for_meta()
+
+    def _inject_peft_structure_for_meta(self) -> None:
+        """Apply PEFT injection on meta-init ranks without touching disk.
+
+        Symmetric to ``CausalOmniAvatarWan._inject_peft_structure_for_meta``.
+        Mirrors the structural transformation rank 0 performs in
+        ``_load_weights``'s ``merge_lora=False`` branch, so all ranks have
+        matching state_dict keys before FSDP's broadcast.
+
+        No-op when ``merge_lora=True`` (full FT — no LoRA layers exist).
+        """
+        if self.merge_lora:
+            return
+
+        from peft import LoraConfig, inject_adapter_in_model
+
+        lora_config = LoraConfig(
+            r=self.lora_rank,
+            lora_alpha=self.lora_alpha,
+            init_lora_weights=True,
+            target_modules=LORA_TARGET_MODULES,
+        )
+        inject_adapter_in_model(lora_config, self.model)
+        self._apply_unfreeze(self.unfreeze_modules)
 
     # ------------------------------------------------------------------
     # Weight loading

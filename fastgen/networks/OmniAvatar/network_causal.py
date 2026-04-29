@@ -1234,10 +1234,57 @@ class CausalOmniAvatarWan(CausalFastGenNetwork):
             )
 
     def _finish_init(self, base_model_paths, omniavatar_ckpt_path):
-        """Load weights and cast to default dtype (called at end of __init__)."""
+        """Load weights and cast to default dtype (called at end of __init__).
+
+        On non-meta-init ranks: full path — load base safetensors + V2V LoRA
+        ckpt, optionally PEFT-inject, apply selective unfreeze, cast to bf16.
+
+        On meta-init ranks: SKIP the disk loads (saves host RAM, that's the
+        whole point of meta-init) but STILL run PEFT structural injection
+        and apply_unfreeze, so the module graph matches rank 0's. Without
+        this, ``set_model_state_dict`` post-FSDP-wrap fails with
+        "Missing key(s) in state_dict: '_core.blocks.0.self_attn.q.weight'"
+        because rank 0 has '...q.base_layer.weight' (LoraLinear-wrapped) but
+        ranks 1+ have plain '...q.weight'.
+        """
         if not self._is_in_meta_context():
             self._load_weights(base_model_paths, omniavatar_ckpt_path)
             self.to(self._default_dtype)
+        else:
+            # Meta-init rank: skip disk loads, but mirror rank 0's structure.
+            self._inject_peft_structure_for_meta()
+
+    def _inject_peft_structure_for_meta(self) -> None:
+        """Apply PEFT injection on meta-init ranks without touching disk.
+
+        Mirrors the structural transformation rank 0 performs in
+        ``_load_weights`` (the merge_lora=False branch), so that all ranks
+        end up with the same module graph and matching state_dict keys
+        before FSDP's set_model_state_dict broadcast.
+
+        Idempotent and a no-op when ``merge_lora=True`` (full FT — no LoRA
+        layers to inject).
+        """
+        if self.merge_lora:
+            return  # full-FT mode: no PEFT layers to inject
+
+        from peft import LoraConfig, inject_adapter_in_model
+
+        lora_config = LoraConfig(
+            r=self.lora_rank,
+            lora_alpha=self.lora_alpha,
+            init_lora_weights=True,
+            target_modules=LORA_TARGET_MODULES,
+        )
+        # Modifies self._core in place to add LoraLinear wrappers around
+        # target_modules.  Operates on meta tensors fine — purely structural.
+        inject_adapter_in_model(lora_config, self._core)
+
+        # Match rank 0's selective unfreeze so the param.requires_grad flags
+        # are consistent across ranks.  Strictly speaking apply_lora_freeze
+        # in build_model will reset these later anyway, but doing it here
+        # keeps the post-construction state symmetric across ranks.
+        self._apply_unfreeze(self.unfreeze_modules)
 
     def load_state_dict(self, state_dict, strict=True, **kwargs):
         """Override to handle legacy checkpoints without ``_core.`` prefix.
