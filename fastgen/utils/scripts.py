@@ -94,10 +94,14 @@ def setup(args: argparse.Namespace, evaluation: bool = False) -> BaseConfig:
         elif evaluation:
             logger.warning("Ignoring fsdp_meta_init for evaluation/inference.")
             config.model.fsdp_meta_init = False
-        elif config.trainer.checkpointer.pretrained_ckpt_path:
-            # TODO: this functionality is not implemented yet
-            logger.warning("Ignoring fsdp_meta_init for loading pretrained checkpoint.")
-            config.model.fsdp_meta_init = False
+        # NOTE: previously, fsdp_meta_init was force-disabled when
+        # pretrained_ckpt_path was set ("TODO: this functionality is not
+        # implemented yet").  As of FSDPCheckpointer.load's meta-tensor skip
+        # (the load path now skips dcp.load on ranks where v.parameters()
+        # contains meta tensors), pretrained_ckpt_path is fully compatible
+        # with meta-init: only rank 0 loads, FSDP wrap broadcasts to others
+        # via sync_module_states.  Disabling meta_init here was the root
+        # cause of cgroup OOMs when 14B SF launched with OMNIAVATAR_DF_CKPT.
 
     # Global batch size
     if getattr(config.trainer, "batch_size_global", None) is not None:
