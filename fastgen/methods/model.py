@@ -271,7 +271,21 @@ class FastGenModel(torch.nn.Module):
         if is_fsdp:
             # Cast fsdp_dict modules to precision_fsdp before FSDP wrapping (when AMP is disabled).
             # This sets the parameter storage dtype that FSDP will preserve for shards and gradient reduction.
+            #
+            # Skip on ranks where parameters are on the meta device (fsdp_meta_init=True,
+            # non-rank-0): the cast on a meta tensor is logically a no-op, but in practice
+            # iterating modules and casting them appears to materialize tensors during the
+            # bf16->fp32 conversion, defeating meta-init's memory savings and pushing the
+            # cgroup over its limit.  After FSDP wrap, sync_module_states broadcasts rank-0's
+            # post-cast fp32 weights into the per-rank shards, which is what we want anyway.
             for net_name, net in self.fsdp_dict.items():
+                has_meta_params = any(p.is_meta for p in net.parameters())
+                if has_meta_params:
+                    logger.info(
+                        f"Skipping pre-FSDP cast for {net_name}: parameters on meta "
+                        f"device (will be filled by FSDP sync_module_states broadcast)"
+                    )
+                    continue
                 logger.debug(f"Casting {net_name} to dtype={self.precision_fsdp} (pre-FSDP).")
                 net.to(dtype=self.precision_fsdp)
                 synchronize()
