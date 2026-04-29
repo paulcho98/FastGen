@@ -464,11 +464,17 @@ class FSDPCheckpointer(Checkpointer):
             #   the load proceeds normally.
             has_meta_params = any(p.is_meta for p in v.parameters())
             if has_meta_params:
+                # Participate in DCP's collective planning protocol with an
+                # empty state_dict so we don't allocate, but rank 0's dcp.load
+                # doesn't deadlock waiting for our all_gather.  An empty dict
+                # tells the planner this rank wants nothing — no allocation,
+                # no disk read.
+                storage_reader = self.get_storage_reader(checkpoint_path=f"{path}.{k}_model")
                 logger.info(
-                    f"[FSDPCheckpointer] {k}_model: skipping load on rank with "
-                    f"meta-device parameters; FSDP wrap will broadcast rank-0 "
-                    f"weights via sync_module_states"
+                    f"[FSDPCheckpointer] {k}_model: meta-rank empty load "
+                    f"(rank-0 broadcasts via sync_module_states later)"
                 )
+                dcp.load(state_dict={}, storage_reader=storage_reader)
                 continue
             model_wrapper = ModelWrapper(model=v)
             model_state_dict = model_wrapper.state_dict()
