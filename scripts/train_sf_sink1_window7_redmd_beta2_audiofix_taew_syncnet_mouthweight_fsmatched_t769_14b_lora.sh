@@ -66,7 +66,16 @@ export RUN_NAME="${RUN_NAME:-sf_sink1_window7_redmd_audiofix_beta2_taew_syncnet_
 # sets fsdp=True and grad_accum_rounds=4, but we mirror the override style
 # from the DF wrapper for parallelism / belt-and-suspenders against any
 # parent cmdline that re-sets these.
-export EXTRA_OVERRIDES="${EXTRA_OVERRIDES:-trainer.ddp=False trainer.fsdp=True trainer.grad_accum_rounds=4 model.sample_t_cfg.t_list=[0.999,0.769,0.0]}"
+#
+# Unlike the DF parent, the SF fsmatched parent does NOT have a
+# `trainer.max_iter=${MAX_ITER}` / `trainer.save_ckpt_iter=${SAVE_EVERY}`
+# cmdline override — its torchrun line only passes resume + log + critic
+# LR.  We add max_iter / save_ckpt_iter to EXTRA_OVERRIDES here so the
+# wrapper-level MAX_ITER and SAVE_EVERY env vars actually reach the
+# trainer.  Defaults: MAX_ITER=2500, SAVE_EVERY=250.
+MAX_ITER="${MAX_ITER:-2500}"
+SAVE_EVERY="${SAVE_EVERY:-250}"
+export EXTRA_OVERRIDES="${EXTRA_OVERRIDES:-trainer.ddp=False trainer.fsdp=True trainer.grad_accum_rounds=4 trainer.max_iter=${MAX_ITER} trainer.save_ckpt_iter=${SAVE_EVERY} model.sample_t_cfg.t_list=[0.999,0.769,0.0]}"
 
 echo "============================================="
 echo "  SF 14B LoRA + unfreeze + t769 launch settings"
@@ -79,6 +88,8 @@ echo "  Output root:     ${FASTGEN_OUTPUT_ROOT}"
 echo "  EXTRA_OVERRIDES: ${EXTRA_OVERRIDES}"
 echo "  Effective batch: 16  (BS=1 x 4 GPUs x GA=4)"
 echo "  Schedule:        t_list=[0.999, 0.769, 0.0], student_sample_steps=2"
+echo "  MAX_ITER:        ${MAX_ITER}"
+echo "  SAVE_EVERY:      ${SAVE_EVERY}"
 echo "============================================="
 
 # Delegate to the fsmatched parent (which will see CONFIG_PATH override).
