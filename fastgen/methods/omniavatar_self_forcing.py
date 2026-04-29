@@ -37,6 +37,39 @@ class OmniAvatarSelfForcingModel(SelfForcingModel):
     def __init__(self, config: ModelConfig):
         super().__init__(config)
 
+    def _setup_grad_requirements(self, iteration: int) -> None:
+        """Override parent's grad-toggle to preserve LoRA freeze.
+
+        The parent dmd2._setup_grad_requirements does
+        ``self.fake_score.train().requires_grad_(True)`` on critic-update
+        steps, which wipes the LoRA freeze and causes the trainable-only
+        checkpoint filter to save the full 14B base.  For LoRA mode, only
+        toggle .train() / .eval() — don't touch requires_grad on fake_score.
+
+        For full-FT mode (no apply_lora_freeze hook, no merge_lora attr,
+        or merge_lora=True), fall back to the parent's behavior so
+        non-LoRA setups are unaffected.
+        """
+        is_lora_mode = (
+            hasattr(self.fake_score, "apply_lora_freeze")
+            and not getattr(self.fake_score, "merge_lora", True)
+        )
+        if not is_lora_mode:
+            return super()._setup_grad_requirements(iteration)
+
+        # LoRA mode: only toggle train/eval mode for BN/Dropout;
+        # leave requires_grad as configured by apply_lora_freeze.
+        if iteration % self.config.student_update_freq == 0:
+            # student step
+            self.fake_score.eval()
+            if self.config.gan_loss_weight_gen > 0:
+                self.discriminator.eval().requires_grad_(False)
+        else:
+            # critic-only step
+            self.fake_score.train()
+            if self.config.gan_loss_weight_gen > 0:
+                self.discriminator.train().requires_grad_(True)
+
     def single_train_step(self, data: Dict[str, Any], iteration: int):
         """Combined fake_score + student update on student steps (1:5 ratio).
 
