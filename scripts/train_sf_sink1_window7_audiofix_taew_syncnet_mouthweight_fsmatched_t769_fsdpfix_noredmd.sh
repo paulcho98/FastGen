@@ -68,7 +68,7 @@ export RUN_NAME="${RUN_NAME:-sf_sink1_window7_audiofix_taew_syncnet_mouthweight_
 # though the parent inherits it from config_sf_sink1_window7_tscfg.py — the
 # fsdpfix sibling sets it explicitly via override and we do the same for
 # parity.
-export EXTRA_OVERRIDES="model.sample_t_cfg.t_list=[0.999,0.769,0.0] model.reward.enabled=False model.reward_beta=0"
+export EXTRA_OVERRIDES="model.sample_t_cfg.t_list=[0.999,0.769,0.0] model.reward.enabled=False model.reward_beta=0 trainer.max_iter=1000"
 
 # Delegate to the fsmatched parent.
 exec "$(dirname "$(readlink -f "$0")")/train_sf_sink1_window7_redmd_beta2_audiofix_taew_syncnet_mouthweight_fsmatched.sh" "$@"

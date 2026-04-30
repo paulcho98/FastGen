@@ -46,13 +46,17 @@ class OmniAvatarSelfForcingModel(SelfForcingModel):
         checkpoint filter to save the full 14B base.  For LoRA mode, only
         toggle .train() / .eval() — don't touch requires_grad on fake_score.
 
-        For full-FT mode (no apply_lora_freeze hook, no merge_lora attr,
-        or merge_lora=True), fall back to the parent's behavior so
-        non-LoRA setups are unaffected.
+        Gated on ``unfreeze_modules`` non-empty so we only override in the
+        explicit "LoRA + selective unfreeze" regime (the 14B convention).
+        1.3B SF runs construct with merge_lora=False but historically
+        train fake_score as full-FT (the requires_grad wipes effectively
+        unfreeze the PEFT base) — gating on unfreeze_modules preserves
+        that.  Otherwise fall back to parent.
         """
         is_lora_mode = (
             hasattr(self.fake_score, "apply_lora_freeze")
             and not getattr(self.fake_score, "merge_lora", True)
+            and bool(getattr(self.fake_score, "unfreeze_modules", []))
         )
         if not is_lora_mode:
             return super()._setup_grad_requirements(iteration)
@@ -192,9 +196,24 @@ class OmniAvatarSelfForcingModel(SelfForcingModel):
         # self.net), but if a future config sets merge_lora=False on
         # fake_score with selective unfreeze, this catches drift from any
         # later mutation.  Idempotent and a no-op when merge_lora=True.
-        if hasattr(self.net, "apply_lora_freeze"):
+        #
+        # Gated on `unfreeze_modules` being non-empty so we only fire the
+        # freeze in the explicit "LoRA + selective unfreeze" regime (the
+        # 14B convention).  1.3B SF runs construct with merge_lora=False
+        # to preserve PEFT structure for adapter-style ckpt loading, but
+        # historically train as full-FT — gating on unfreeze_modules
+        # preserves that regime.  See `apply_lora_freeze` body which
+        # explicitly relies on unfreeze_modules to re-enable specific
+        # submodules; with no unfreeze_modules the call would freeze
+        # everything except the LoRA adapters (a regime we never use for
+        # 1.3B).
+        if hasattr(self.net, "apply_lora_freeze") and getattr(self.net, "unfreeze_modules", []):
             self.net.apply_lora_freeze()
-        if hasattr(self, "fake_score") and hasattr(self.fake_score, "apply_lora_freeze"):
+        if (
+            hasattr(self, "fake_score")
+            and hasattr(self.fake_score, "apply_lora_freeze")
+            and getattr(self.fake_score, "unfreeze_modules", [])
+        ):
             self.fake_score.apply_lora_freeze()
 
         # Load VAE for wandb visual logging (same logic as OmniAvatarDiffusionForcing)
@@ -210,10 +229,18 @@ class OmniAvatarSelfForcingModel(SelfForcingModel):
         requires_grad in some PyTorch versions) that might reset
         requires_grad on frozen params.  apply_lora_freeze is idempotent
         and a no-op when LoRA isn't in use on the network.
+
+        Gated on unfreeze_modules — see build_model for rationale.  1.3B
+        SF runs leave fake_score as full-FT after the requires_grad wipes;
+        only the 14B LoRA + selective-unfreeze regime needs the freeze.
         """
-        if hasattr(self.net, "apply_lora_freeze"):
+        if hasattr(self.net, "apply_lora_freeze") and getattr(self.net, "unfreeze_modules", []):
             self.net.apply_lora_freeze()
-        if hasattr(self, "fake_score") and hasattr(self.fake_score, "apply_lora_freeze"):
+        if (
+            hasattr(self, "fake_score")
+            and hasattr(self.fake_score, "apply_lora_freeze")
+            and getattr(self.fake_score, "unfreeze_modules", [])
+        ):
             self.fake_score.apply_lora_freeze()
         super().init_optimizers()
 
