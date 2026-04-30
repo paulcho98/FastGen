@@ -60,7 +60,7 @@ set -euo pipefail
 export OMNIAVATAR_DF_CKPT="${OMNIAVATAR_DF_CKPT-/home/work/.local/hyunbin/FastGen-redmd/FASTGEN_OUTPUT/OmniAvatar-FastGen/omniavatar_df_audiofix/df_audiofix_syncnet_trained_shift_5_t769_4gpu_bs16_lr1e5_5000iter/checkpoints/0005000.pth}"
 
 # Distinct output dir + RUN_NAME (`_noredmd` suffix).
-export FASTGEN_OUTPUT_ROOT="${FASTGEN_OUTPUT_ROOT:-/tmp/FASTGEN_SF_OUTPUT_AUDIOFIX_TAEW_SYNCNET_MOUTHWEIGHT_FSMATCHED_T769_FSDPFIX_NOREDMD}"
+export FASTGEN_OUTPUT_ROOT="${FASTGEN_OUTPUT_ROOT:-/home/work/.local/hyunbin/FastGen-redmd/FASTGEN_OUTPUT_NOREDMD}"
 export RUN_NAME="${RUN_NAME:-sf_sink1_window7_audiofix_taew_syncnet_mouthweight_fsmatched_t769_fsdpfix_noredmd}"
 
 # EXTRA_OVERRIDES: same t_list as fsdpfix (windowed t769 schedule), plus the
