@@ -61,21 +61,12 @@ export OMNIAVATAR_STUDENT_CKPT_14B="${OMNIAVATAR_STUDENT_CKPT_14B:-/home/work/ou
 export FASTGEN_OUTPUT_ROOT="${FASTGEN_OUTPUT_ROOT:-/tmp/FASTGEN_SF_OUTPUT_BETA2_AUDIOFIX_TAEW_SYNCNET_MOUTHWEIGHT_FSMATCHED_T769_14B_LORA}"
 export RUN_NAME="${RUN_NAME:-sf_sink1_window7_redmd_audiofix_beta2_taew_syncnet_mouthweight_fsmatched_t769_14b_lora}"
 
-# EXTRA_OVERRIDES: same DDP -> FSDP flip as the 14B DF wrapper, plus the
-# t_list override (matches fsmatched_t769_fsdpfix.sh).  The config already
-# sets fsdp=True and grad_accum_rounds=4, but we mirror the override style
-# from the DF wrapper for parallelism / belt-and-suspenders against any
-# parent cmdline that re-sets these.
-#
-# Unlike the DF parent, the SF fsmatched parent does NOT have a
-# `trainer.max_iter=${MAX_ITER}` / `trainer.save_ckpt_iter=${SAVE_EVERY}`
-# cmdline override — its torchrun line only passes resume + log + critic
-# LR.  We add max_iter / save_ckpt_iter to EXTRA_OVERRIDES here so the
-# wrapper-level MAX_ITER and SAVE_EVERY env vars actually reach the
-# trainer.  Defaults: MAX_ITER=2500, SAVE_EVERY=250.
+# EXTRA_OVERRIDES: only operational params (max_iter, save_ckpt_iter)
+# remain here — regime params (ddp/fsdp/grad_accum/t_list) are baked
+# into config_sf_14b_lora_t769.py to prevent silent drift.
 MAX_ITER="${MAX_ITER:-2500}"
 SAVE_EVERY="${SAVE_EVERY:-250}"
-export EXTRA_OVERRIDES="${EXTRA_OVERRIDES:-trainer.ddp=False trainer.fsdp=True trainer.grad_accum_rounds=4 trainer.max_iter=${MAX_ITER} trainer.save_ckpt_iter=${SAVE_EVERY} model.sample_t_cfg.t_list=[0.999,0.769,0.0]}"
+export EXTRA_OVERRIDES="${EXTRA_OVERRIDES:-trainer.max_iter=${MAX_ITER} trainer.save_ckpt_iter=${SAVE_EVERY}}"
 
 echo "============================================="
 echo "  SF 14B LoRA + unfreeze + t769 launch settings"
@@ -92,5 +83,9 @@ echo "  MAX_ITER:        ${MAX_ITER}"
 echo "  SAVE_EVERY:      ${SAVE_EVERY}"
 echo "============================================="
 
-# Delegate to the fsmatched parent (which will see CONFIG_PATH override).
-exec "$(dirname "$(readlink -f "$0")")/train_sf_sink1_window7_redmd_beta2_audiofix_taew_syncnet_mouthweight_fsmatched.sh" "$@"
+# Delegate to the clean parent (which will see CONFIG_PATH set above).
+# Legacy fsmatched.sh parent moved to deprecated_asymmetric/ — replaced
+# by train_sf_parent.sh which does not hardcode the asymmetric 3e-6
+# fake_score LR (config_sf_14b_lora_t769.py inherits matched 2e-6 from
+# config_sf.py, which is correct for symmetric LoRA capacity).
+exec "$(dirname "$(readlink -f "$0")")/train_sf_parent.sh" "$@"

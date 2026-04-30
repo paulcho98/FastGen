@@ -1,4 +1,13 @@
 #!/bin/bash
+# =============================================================================
+# DEPRECATED — ASYMMETRIC TRAINABLE CAPACITY (do not launch new runs)
+# =============================================================================
+# Student trains as full-FT (~1421M); fake_score trains as LoRA-only (~175M).
+# 8x critic-capacity asymmetry — see scripts/deprecated_asymmetric/README.md
+# for full diagnosis.  Replacement scripts: train_sf_full_ft_t769.sh and
+# train_sf_full_ft_t769_no_reward.sh in scripts/.  This file is kept only
+# for reproducibility of past runs.
+# =============================================================================
 # SF training with sliding window attention: sink=1, window=7, dynamic RoPE, 2-step.
 # Uses the stochastic-attention DF checkpoint (step 10000) as initialization.
 #

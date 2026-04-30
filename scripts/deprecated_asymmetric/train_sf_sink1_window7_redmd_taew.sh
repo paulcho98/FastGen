@@ -1,4 +1,13 @@
 #!/bin/bash
+# =============================================================================
+# DEPRECATED — ASYMMETRIC TRAINABLE CAPACITY (do not launch new runs)
+# =============================================================================
+# Student trains as full-FT (~1421M); fake_score trains as LoRA-only (~175M).
+# 8x critic-capacity asymmetry — see scripts/deprecated_asymmetric/README.md
+# for full diagnosis.  Replacement scripts: train_sf_full_ft_t769.sh and
+# train_sf_full_ft_t769_no_reward.sh in scripts/.  This file is kept only
+# for reproducibility of past runs.
+# =============================================================================
 # Re-DMD training with TAEW decoder in the reward path.
 # Same architecture/reward config as train_sf_sink1_window7_redmd.sh;
 # only the reward-path VAE decode is swapped for TAEW.

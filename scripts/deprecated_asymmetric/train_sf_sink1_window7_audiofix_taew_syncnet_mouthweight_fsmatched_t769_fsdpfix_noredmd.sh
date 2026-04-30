@@ -1,5 +1,14 @@
 #!/bin/bash
 # =============================================================================
+# DEPRECATED — ASYMMETRIC TRAINABLE CAPACITY (do not launch new runs)
+# =============================================================================
+# Student trains as full-FT (~1421M); fake_score trains as LoRA-only (~175M).
+# 8x critic-capacity asymmetry — see scripts/deprecated_asymmetric/README.md
+# for full diagnosis.  Replacement scripts: train_sf_full_ft_t769.sh and
+# train_sf_full_ft_t769_no_reward.sh in scripts/.  This file is kept only
+# for reproducibility of past runs.
+# =============================================================================
+# =============================================================================
 # SF fsmatched_t769_fsdpfix — REDMD-OFF ablation
 # =============================================================================
 #
@@ -68,7 +77,7 @@ export RUN_NAME="${RUN_NAME:-sf_sink1_window7_audiofix_taew_syncnet_mouthweight_
 # though the parent inherits it from config_sf_sink1_window7_tscfg.py — the
 # fsdpfix sibling sets it explicitly via override and we do the same for
 # parity.
-export EXTRA_OVERRIDES="model.sample_t_cfg.t_list=[0.999,0.769,0.0] model.reward.enabled=False model.reward_beta=0 trainer.max_iter=1000"
+export EXTRA_OVERRIDES="model.sample_t_cfg.t_list=[0.999,0.769,0.0] model.reward.enabled=False model.reward_beta=0 trainer.max_iter=1000 model.fake_score_net.merge_lora=True"
 
 # Delegate to the fsmatched parent.
 exec "$(dirname "$(readlink -f "$0")")/train_sf_sink1_window7_redmd_beta2_audiofix_taew_syncnet_mouthweight_fsmatched.sh" "$@"

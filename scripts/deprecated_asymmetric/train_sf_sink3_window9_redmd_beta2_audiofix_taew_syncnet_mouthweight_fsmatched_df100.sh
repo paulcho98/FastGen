@@ -1,5 +1,14 @@
 #!/bin/bash
 # =============================================================================
+# DEPRECATED — ASYMMETRIC TRAINABLE CAPACITY (do not launch new runs)
+# =============================================================================
+# Student trains as full-FT (~1421M); fake_score trains as LoRA-only (~175M).
+# 8x critic-capacity asymmetry — see scripts/deprecated_asymmetric/README.md
+# for full diagnosis.  Replacement scripts: train_sf_full_ft_t769.sh and
+# train_sf_full_ft_t769_no_reward.sh in scripts/.  This file is kept only
+# for reproducibility of past runs.
+# =============================================================================
+# =============================================================================
 # SF Re-DMD β=2 TAEW audiofix — fsmatched + lr3e6 — DF-100 init + sink3/window9
 # =============================================================================
 #

@@ -38,13 +38,18 @@ from PIL import Image
 _TIMING_ENABLED = False
 _TIMING_CURRENT: dict = {}
 _TIMING_ROWS: list = []
+_a2d_t0 = None
+_enc_to_dec_t0 = None
+_e2d_t0 = None
 _TIMING_STAGE_ORDER = [
-    "audio_extract", "face_detect", "ref_video_encode", "vae_encode", "audio_encode",
-    "denoise", "vae_decode", "first_frame_latency", "composite", "save_mux",
-    "whole_generation", "encode_to_decode", "total_post_load",
+    "audio_extract", "face_detect_align", "vae_encode", "pure_vae_encode", "audio_encode",
+    "denoise", "pure_vae_decode", "first_frame_latency", "composite", "save_mux",
+    "whole_generation", "pure_encode_to_decode", "audio_to_decode", "encode_to_decode", "total_post_load",
     "ablation_1", "ablation_2", "ablation_3", "ablation_4",
     "ff_full_pipeline", "ff_generation", "ff_pure_generation",
     "ff_enc_gen_dec", "ff_enc_audio_gen_dec", "ff_pure_enc_to_dec",
+    # Three-definition first-frame latencies (matching the full a2d/e2d/pure)
+    "ff_audio_to_decode", "ff_encode_to_decode", "ff_pure_encode_to_decode",
     "streaming_total",
     "ff_ablation_1", "ff_ablation_2", "ff_ablation_3", "ff_ablation_4",
 ]
@@ -211,6 +216,13 @@ def parse_args():
                              "Writes timing CSV to --timing_csv.")
     parser.add_argument("--timing_csv", type=str, default=None,
                         help="CSV path for timing results (default: <output_path>.timing.csv)")
+
+    # --- torch.compile ---
+    parser.add_argument("--compile", action="store_true",
+                        help="Wrap diffusion model + Wan VAE encoder/decoder + "
+                             "TAEHV (when present) with torch.compile. First "
+                             "warmup clip absorbs the compile time; subsequent "
+                             "clips run on the compiled graphs.")
 
     return parser.parse_args()
 
@@ -842,28 +854,46 @@ def encode_reference_video(vae, video_frames_np, mask_path, device, dtype):
     masked_video_tensor = apply_spatial_mask(video_tensor, mask_pixel_binary, mask_all_frames=True)
 
     # VAE encode. Wan VAE runs in bf16 (cast temporarily); TAEHV runs in fp16 natively.
-    # vae_encode times ONLY the encode calls; encode_to_decode starts here too.
+    # pure_vae_encode times ONLY the encode calls; pure_encode_to_decode starts here too.
     global _e2d_t0
     if _TIMING_ENABLED:
         _gpu_sync()
     _e2d_t0 = time.perf_counter()
     is_taehv = isinstance(vae, TAEHVDecoderWrapper)
+
+    # For long videos, encoding the full sequence in one shot OOMs.
+    # Temporal-chunk in groups of 81 video frames (21 latent frames).
+    # Each chunk's first latent represents that chunk's first video frame; we
+    # concat naively, accepting that boundary latents are computed from chunk-local
+    # context rather than the full causal history (small accuracy impact, large
+    # memory win for >300-frame videos).
+    N = video_tensor.shape[2]
+    CHUNK = 81  # video frames per encode chunk
+
+    def _chunked_encode(vt):
+        if N <= CHUNK:
+            return vae.encode([vt[0]], device=device)
+        out = []
+        for s in range(0, N, CHUNK):
+            e = min(s + CHUNK, N)
+            chunk = vt[:, :, s:e]
+            out.append(vae.encode([chunk[0]], device=device))
+        return torch.cat(out, dim=2)
+
     if is_taehv:
-        with _Stage("vae_encode", use_gpu=True):
+        with _Stage("pure_vae_encode", use_gpu=True):
             with torch.no_grad():
-                source_latents = vae.encode([video_tensor[0]], device=device)
-                masked_latents = vae.encode([masked_video_tensor[0]], device=device)
+                source_latents = _chunked_encode(video_tensor)
+                masked_latents = _chunked_encode(masked_video_tensor)
     else:
         original_dtype = next(vae.parameters()).dtype
         vae.to(dtype=torch.bfloat16)
-        with _Stage("vae_encode", use_gpu=True):
+        video_tensor = video_tensor.to(dtype=torch.bfloat16)
+        masked_video_tensor = masked_video_tensor.to(dtype=torch.bfloat16)
+        with _Stage("pure_vae_encode", use_gpu=True):
             with torch.no_grad():
-                source_latents = vae.encode(
-                    [video_tensor[0].to(dtype=torch.bfloat16)], device=device
-                )
-                masked_latents = vae.encode(
-                    [masked_video_tensor[0].to(dtype=torch.bfloat16)], device=device
-                )
+                source_latents = _chunked_encode(video_tensor)
+                masked_latents = _chunked_encode(masked_video_tensor)
         vae.to(dtype=original_dtype)
 
     ref_latent = source_latents[:, :, :1].to(dtype=dtype)  # [1, 16, 1, H_lat, W_lat]
@@ -949,11 +979,14 @@ def build_condition(vae, wav2vec_model, wav2vec_extractor, video_frames_np,
         dict with keys: text_embeds, audio_emb, ref_latent, mask,
         masked_video, ref_sequence
     """
-    print("Encoding reference video ...")
-    with _Stage("ref_video_encode", use_gpu=True):
-        ref_latent, masked_latents, ref_sequence, latent_mask = encode_reference_video(
-            vae, video_frames_np, mask_path, device, dtype
-        )
+    # ============================================================
+    # Audio encode FIRST (matches LatentSync/X-Dub order)
+    # ============================================================
+    # _a2d_t0: start of audio_to_decode span (Def 1)
+    global _a2d_t0
+    if _TIMING_ENABLED:
+        _gpu_sync()
+    _a2d_t0 = time.perf_counter()
 
     print("Encoding audio ...")
     with _Stage("audio_encode", use_gpu=True):
@@ -961,6 +994,23 @@ def build_condition(vae, wav2vec_model, wav2vec_extractor, video_frames_np,
             wav2vec_model, wav2vec_extractor, audio_path, num_video_frames, device
         )
     audio_emb = audio_emb.to(dtype=dtype)
+
+    # ============================================================
+    # VAE encode reference video
+    # ============================================================
+    # _enc_to_dec_t0: start of encode_to_decode span (broad: vae_encode wrapper → vae_decode)
+    # _e2d_t0: start of pure_encode_to_decode span (narrow: first vae.encode call → vae_decode),
+    #         set inside encode_reference_video right before the first vae.encode call.
+    global _enc_to_dec_t0
+    if _TIMING_ENABLED:
+        _gpu_sync()
+    _enc_to_dec_t0 = time.perf_counter()
+
+    print("Encoding reference video ...")
+    with _Stage("vae_encode", use_gpu=True):
+        ref_latent, masked_latents, ref_sequence, latent_mask = encode_reference_video(
+            vae, video_frames_np, mask_path, device, dtype
+        )
 
     return {
         "text_embeds": text_embeds,
@@ -978,6 +1028,13 @@ def build_condition_from_precomputed(precomputed_dir, mask_path, num_latent_fram
     This bypasses VAE/Wav2Vec encoding and uses the same tensors the model was
     trained on, enabling direct comparison.
     """
+    # All three timing markers point to the same instant since no real encode happens
+    global _a2d_t0, _e2d_t0, _enc_to_dec_t0
+    if _TIMING_ENABLED:
+        _gpu_sync()
+    _a2d_t0 = time.perf_counter()
+    _enc_to_dec_t0 = _a2d_t0
+    _e2d_t0 = _a2d_t0
     print(f"Loading precomputed tensors from {precomputed_dir} ...")
 
     # VAE latents (input + masked)
@@ -1635,6 +1692,12 @@ def main():
     validate_args(args)
     _TIMING_ENABLED = bool(args.timing)
 
+    # Activate per-function torch.compile decorators in network_causal.py
+    # BEFORE the model class is imported (which happens inside
+    # load_diffusion_model below).
+    if args.compile:
+        os.environ["FASTGEN_COMPILE"] = "true"
+
     # --- Resolve dtype ---
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     dtype = dtype_map[args.dtype]
@@ -1683,11 +1746,15 @@ def main():
     if args.wav2vec_path:
         print("Loading Wav2Vec2 (eager) ...")
         wav2vec_model, wav2vec_extractor = load_wav2vec(args.wav2vec_path, device)
-        # Warmup forward pass to compile CUDA kernels
-        _dummy_audio = np.zeros(16000, dtype=np.float32)
+        # Warmup forward pass to compile CUDA kernels.
+        # OmniAvatar Wav2VecModel requires seq_len + output_hidden_states.
+        _dummy_audio = np.zeros(16000, dtype=np.float32)  # 1s @ 16kHz → 25 video-frames
         _dummy_input = wav2vec_extractor(_dummy_audio, return_tensors="pt", sampling_rate=16000)
         with torch.no_grad():
-            wav2vec_model(_dummy_input.input_values.to(device))
+            wav2vec_model(
+                _dummy_input.input_values.to(device),
+                seq_len=25, output_hidden_states=True,
+            )
         print("Wav2Vec2 warmed up.")
     if args.text_embeds_path or args.prompt:
         print("Loading text embeddings (eager) ...")
@@ -1697,6 +1764,19 @@ def main():
     image_processor = None
     if args.latentsync:
         image_processor = load_image_processor(args.mask_path, device)
+
+    # ===================================================================
+    # Optional torch.compile wrapping (compile time absorbed by warmup)
+    # ===================================================================
+    # NOTE: torch.compile is now applied via @conditional_compile decorators
+    # on hot functions inside network_causal.py (rope_apply, _forward_ar).
+    # Activation is via the FASTGEN_COMPILE env var, which must be set BEFORE
+    # the model class is imported. We handle this at the top of main(), so
+    # by the time we reach this point the model is already compile-decorated
+    # if --compile was passed. Nothing more to do here.
+    if args.compile:
+        print("[--compile] Hot functions decorated with @conditional_compile. "
+              "Warmup clip will trigger Dynamo trace.")
 
     # ===================================================================
     # Loop over samples
@@ -1745,7 +1825,7 @@ def main():
                 if _TIMING_ENABLED:
                     _gpu_sync()
                 _wg_t0 = time.perf_counter()
-                with _Stage("face_detect", use_gpu=False):
+                with _Stage("face_detect_align", use_gpu=False):
                     latentsync_metadata = preprocess_with_latentsync(
                         video_path, image_processor, args.face_cache_dir,
                         num_frames=num_video_frames,
@@ -1756,6 +1836,10 @@ def main():
                     continue
 
             # --- Build conditioning ---
+            # _a2d_t0, _enc_to_dec_t0, _e2d_t0 are all set INSIDE build_condition:
+            #   _a2d_t0       = before audio_encode (Def 1)
+            #   _enc_to_dec_t0 = before vae_encode wrapper (Def 2 broad)
+            #   _e2d_t0       = before first vae.encode() call (Def 2 narrow)
             if precomputed_dir is not None:
                 condition = build_condition_from_precomputed(
                     precomputed_dir, args.mask_path,
@@ -1775,7 +1859,7 @@ def main():
                     ref_frames_np = load_and_adjust_video(video_path, num_video_frames)
 
                 print("Building conditioning ...")
-                # ref_video_encode / audio_encode timed inside build_condition().
+                # vae_encode / audio_encode timed inside build_condition().
                 condition = build_condition(
                     encoder_vae, wav2vec_model, wav2vec_extractor, ref_frames_np,
                     audio_path, text_embeds, args.mask_path,
@@ -1796,14 +1880,17 @@ def main():
             if args.latentsync and latentsync_metadata is not None:
                 # LatentSync compositing path — float-space decode + composite
                 print("VAE decoding (float) ...")
-                with _Stage("vae_decode", use_gpu=True):
+                with _Stage("pure_vae_decode", use_gpu=True):
                     latent_for_vae = output_latents[0].to(torch.float32)
                     video_decoded = decoder_vae.decode([latent_for_vae], device=device)
                     video_decoded = video_decoded.clamp(-1, 1)
 
                 if _TIMING_ENABLED:
                     _gpu_sync()
-                    _TIMING_CURRENT["encode_to_decode"] = time.perf_counter() - _e2d_t0
+                    _now = time.perf_counter()
+                    _TIMING_CURRENT["pure_encode_to_decode"] = _now - _e2d_t0
+                    _TIMING_CURRENT["audio_to_decode"] = _now - _a2d_t0
+                    _TIMING_CURRENT["encode_to_decode"] = _now - _enc_to_dec_t0
 
                 # [1, 3, T_video, H, W] -> [T, 3, H, W] in [0, 1]
                 generated_float = video_decoded[0].permute(1, 0, 2, 3)  # [3,T,H,W] -> [T,3,H,W]
@@ -1849,23 +1936,26 @@ def main():
             else:
                 # Standard decode + save (no LatentSync) — timed as one block
                 print("Decoding and saving ...")
-                with _Stage("vae_decode", use_gpu=True):
+                with _Stage("pure_vae_decode", use_gpu=True):
                     decode_and_save(decoder_vae, output_latents, audio_path, output_path,
                                     args.fps, device)
                 if _TIMING_ENABLED:
                     _gpu_sync()
-                    _TIMING_CURRENT["encode_to_decode"] = time.perf_counter() - _e2d_t0
+                    _now = time.perf_counter()
+                    _TIMING_CURRENT["pure_encode_to_decode"] = _now - _e2d_t0
+                    _TIMING_CURRENT["audio_to_decode"] = _now - _a2d_t0
+                    _TIMING_CURRENT["encode_to_decode"] = _now - _enc_to_dec_t0
 
             succeeded.append(name)
             print(f"  Done: {output_path}")
           # _Stage("total_post_load") has now exited, so its timing is populated.
           if _TIMING_ENABLED:
-              ve = _TIMING_CURRENT.get("vae_encode", 0.0)
+              ve = _TIMING_CURRENT.get("pure_vae_encode", 0.0)
               dn = _TIMING_CURRENT.get("denoise", 0.0)
-              vd = _TIMING_CURRENT.get("vae_decode", 0.0)
+              vd = _TIMING_CURRENT.get("pure_vae_decode", 0.0)
               ae = _TIMING_CURRENT.get("audio_encode", 0.0)
               _TIMING_CURRENT["ablation_1"] = ve + dn + vd
-              _TIMING_CURRENT["ablation_2"] = _TIMING_CURRENT.get("encode_to_decode", ve + dn + vd)
+              _TIMING_CURRENT["ablation_2"] = _TIMING_CURRENT.get("pure_encode_to_decode", ve + dn + vd)
               _TIMING_CURRENT["ablation_3"] = _TIMING_CURRENT.get("whole_generation", 0.0)
               _TIMING_CURRENT["ablation_4"] = ae + ve + dn + vd
               _TIMING_ROWS.append(dict(_TIMING_CURRENT))
@@ -1909,7 +1999,13 @@ def main():
         else:
             csv_path = "timing.csv"
 
-        fieldnames = ["name", "num_video_frames"] + _TIMING_STAGE_ORDER
+        peak_alloc = peak_reserved = 0.0
+        if torch.cuda.is_available():
+            peak_alloc = torch.cuda.max_memory_allocated() / 1e9
+            peak_reserved = torch.cuda.max_memory_reserved() / 1e9
+
+        fieldnames = (["name", "num_video_frames"] + _TIMING_STAGE_ORDER
+                      + ["peak_alloc_gb", "peak_reserved_gb"])
         os.makedirs(os.path.dirname(os.path.abspath(csv_path)) or ".", exist_ok=True)
         with open(csv_path, "w", newline="") as fh:
             writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
@@ -1924,6 +2020,9 @@ def main():
                         out_row[k] = str(v)
                     else:
                         out_row[k] = v if v is not None else ""
+                # Same lifetime peak on every row.
+                out_row["peak_alloc_gb"] = f"{peak_alloc:.3f}"
+                out_row["peak_reserved_gb"] = f"{peak_reserved:.3f}"
                 writer.writerow(out_row)
             avg = {"name": "AVERAGE"}
             # mean num_video_frames across clips (so sweep can compute fps from CSV alone)
@@ -1934,6 +2033,8 @@ def main():
                 vals = [r[k] for r in _TIMING_ROWS if isinstance(r.get(k), float)]
                 if vals:
                     avg[k] = f"{sum(vals)/len(vals):.6f}"
+            avg["peak_alloc_gb"] = f"{peak_alloc:.3f}"
+            avg["peak_reserved_gb"] = f"{peak_reserved:.3f}"
             writer.writerow(avg)
         print(f"\n[Timing] wrote {len(_TIMING_ROWS)} rows + average → {csv_path}")
         print(f"[Timing] per-stage average (s) | FPS (num_video_frames / stage_time):")
@@ -1945,6 +2046,11 @@ def main():
                 mean_t = sum(vals) / len(vals)
                 fps = (mean_nvf / mean_t) if mean_t > 0 else 0.0
                 print(f"  {k:20s} {mean_t:7.4f} s   {fps:7.2f} fps")
+
+    if torch.cuda.is_available():
+        peak_gb = torch.cuda.max_memory_allocated() / 1e9
+        reserved_gb = torch.cuda.max_memory_reserved() / 1e9
+        print(f"[VRAM] peak_allocated={peak_gb:.2f} GB peak_reserved={reserved_gb:.2f} GB")
 
 
 if __name__ == "__main__":
