@@ -24,8 +24,4 @@ export CONFIG_PATH="fastgen/configs/experiments/OmniAvatar/config_sf_full_ft_t76
 export FASTGEN_OUTPUT_ROOT="${FASTGEN_OUTPUT_ROOT:-/home/work/.local/hyunbin/FastGen-redmd/FASTGEN_OUTPUT_FULL_FT_T769_NO_REWARD}"
 export RUN_NAME="${RUN_NAME:-sf_full_ft_t769_no_reward}"
 
-# Ablation runs are short (1000 iters) — bake into EXTRA_OVERRIDES.
-# This is a non-regime parameter (just iter cap), so cmdline override is fine.
-export EXTRA_OVERRIDES="${EXTRA_OVERRIDES:-trainer.max_iter=1000}"
-
 exec "$(dirname "$(readlink -f "$0")")/train_sf_parent.sh" "$@"

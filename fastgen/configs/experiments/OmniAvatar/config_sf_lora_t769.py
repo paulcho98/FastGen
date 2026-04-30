@@ -98,6 +98,9 @@ def create_config():
         f"fake_score={config.model.fake_score_optimizer.lr}"
     )
 
+    # ---- ITER CAP ----
+    config.trainer.max_iter = 600
+
     config.log_config.name = "sf_lora_t769"
     return config
 

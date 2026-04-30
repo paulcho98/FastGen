@@ -60,6 +60,9 @@ def create_config():
         "apply_lora_freeze fires (per gating in f049693)"
     )
 
+    # ---- ITER CAP ----
+    config.trainer.max_iter = 600
+
     return config
 
 
