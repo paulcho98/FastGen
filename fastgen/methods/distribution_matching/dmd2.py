@@ -196,6 +196,8 @@ class DMD2Model(FastGenModel):
         ts_cfg = self.config.timestep_cfg
         if ts_cfg.enabled:
             in_range = (t >= ts_cfg.t_lo) & (t <= ts_cfg.t_hi)
+            if getattr(ts_cfg, "reverse", False):
+                in_range = ~in_range
             view_shape = [-1] + [1] * (teacher_x0.ndim - 1)
             effective_scale = torch.where(
                 in_range,

@@ -104,10 +104,16 @@ class TimestepCFGConfig:
     When enabled, CFG uses the configured guidance_scale only when t is in [t_lo, t_hi].
     Outside the range, effective guidance_scale is 1.0 (no CFG effect).
     Both teacher forward passes always run for FSDP consistency.
+
+    When ``reverse=True``, the range is inverted: CFG is OFF inside
+    [t_lo, t_hi] and ON outside it.  This tests the hypothesis that
+    CFG helps more at extreme noise levels (very high / very low t)
+    than in the mid-range where the denoiser is already confident.
     """
     enabled: bool = False
     t_lo: float = 0.0
     t_hi: float = 1.0
+    reverse: bool = False
 
 
 @attrs.define(slots=False)
