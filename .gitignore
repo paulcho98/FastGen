@@ -181,4 +181,4 @@ wandb/
 *.err
 
 # vscode
-*.vscode/
+*.vscode/verification_data/*.pt

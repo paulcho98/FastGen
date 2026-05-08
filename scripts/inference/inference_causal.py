@@ -441,18 +441,24 @@ def get_audio_duration(audio_path):
     return duration
 
 
-def compute_generation_length(audio_path, override_frames, chunk_size, fps):
+def compute_generation_length(audio_path, override_frames, chunk_size, fps,
+                              min_latent_frames=21):
     """Compute generation length in both latent and video frames.
 
     The VAE temporal compression is: num_latent = 1 + (num_video - 1) // 4.
     We round DOWN num_latent to the nearest multiple of chunk_size so the AR
     loop produces complete chunks.
 
+    If audio is shorter than min_latent_frames, we pad up to min_latent_frames
+    to match the training sequence length. Audio encoding already handles
+    zero-padding to the requested length.
+
     Args:
         audio_path: path to audio file (for duration)
         override_frames: explicit num_latent_frames (or None)
         chunk_size: AR chunk size in latent frames
         fps: video frames per second
+        min_latent_frames: minimum latent frames (matches training length, default 21)
 
     Returns:
         (num_latent_frames, num_video_frames)
@@ -468,15 +474,17 @@ def compute_generation_length(audio_path, override_frames, chunk_size, fps):
                 f"--num_latent_frames ({num_latent}) must be a multiple of "
                 f"chunk_size ({chunk_size})"
             )
-        if num_latent > num_latent_raw:
-            raise ValueError(
-                f"--num_latent_frames ({num_latent}) exceeds audio-derived max "
-                f"({num_latent_raw}). Audio is {duration:.2f}s."
-            )
     else:
         # Round DOWN to multiple of chunk_size
         num_latent = (num_latent_raw // chunk_size) * chunk_size
         num_latent = max(num_latent, chunk_size)  # at least one chunk
+
+    # Pad to training length if audio is too short (audio encoder zero-pads,
+    # video frames are ping-pong extended in adjust_video_length)
+    if num_latent < min_latent_frames:
+        print(f"  Audio too short ({duration:.2f}s → {num_latent} latent frames), "
+              f"padding to {min_latent_frames}")
+        num_latent = min_latent_frames
 
     # Inverse: num_video = 1 + (num_latent - 1) * 4
     num_video = 1 + (num_latent - 1) * 4
